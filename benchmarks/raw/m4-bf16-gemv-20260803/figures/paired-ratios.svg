@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="676" viewBox="0 0 1200 676" role="img" aria-labelledby="title desc">
+<title id="title">M4 paired elapsed-time ratios</title>
+<desc id="desc">Median candidate divided by baseline elapsed time with unadjusted bootstrap intervals for each preregistered cell.</desc>
+<style>text{font-family:system-ui,sans-serif;fill:#18222d}.title{font-size:22px;font-weight:700}.label{font-size:13px}.small{font-size:11px;fill:#4c5967}.axis{stroke:#778493;stroke-width:1}.baseline{fill:#506d85}.candidate{fill:#d26a3f}.interval{stroke:#202b36;stroke-width:2}.incomplete{fill:#8b949e}</style>
+<text class="title" x="30" y="34">Paired candidate / baseline elapsed time</text>
+<text class="small" x="30" y="56">Lower is better · median and unadjusted 95% percentile-bootstrap interval · no pooling</text>
+<line class="axis" x1="350.00" y1="70" x2="350.00" y2="631"/>
+<text class="small" x="350.00" y="649" text-anchor="middle">0.0</text>
+<line class="axis" x1="547.50" y1="70" x2="547.50" y2="631"/>
+<text class="small" x="547.50" y="649" text-anchor="middle">0.5</text>
+<line class="axis" x1="745.00" y1="70" x2="745.00" y2="631"/>
+<text class="small" x="745.00" y="649" text-anchor="middle">1.0</text>
+<line class="axis" x1="942.50" y1="70" x2="942.50" y2="631"/>
+<text class="small" x="942.50" y="649" text-anchor="middle">1.5</text>
+<line class="axis" x1="1140.00" y1="70" x2="1140.00" y2="631"/>
+<text class="small" x="1140.00" y="649" text-anchor="middle">2.0</text>
+<text class="label" x="30" y="94">avx-natural-tail</text>
+<line class="interval" x1="401.73" y1="90" x2="401.83" y2="90"/>
+<circle class="candidate" cx="401.79" cy="90" r="5"/>
+<text class="label" x="30" y="136">avx-natural-l2</text>
+<line class="interval" x1="391.32" y1="132" x2="398.14" y2="132"/>
+<circle class="candidate" cx="392.77" cy="132" r="5"/>
+<text class="label" x="30" y="178">avx-natural-llc</text>
+<line class="interval" x1="400.07" y1="174" x2="400.61" y2="174"/>
+<circle class="candidate" cx="400.47" cy="174" r="5"/>
+<text class="label" x="30" y="220">avx-natural-stream-expand</text>
+<line class="interval" x1="419.47" y1="216" x2="420.47" y2="216"/>
+<circle class="candidate" cx="419.80" cy="216" r="5"/>
+<text class="label" x="30" y="262">avx-natural-stream-contract</text>
+<line class="interval" x1="419.74" y1="258" x2="424.57" y2="258"/>
+<circle class="candidate" cx="422.36" cy="258" r="5"/>
+<text class="label" x="30" y="304">avx-offset-tail</text>
+<line class="interval" x1="390.74" y1="300" x2="391.10" y2="300"/>
+<circle class="candidate" cx="390.91" cy="300" r="5"/>
+<text class="label" x="30" y="346">avx-offset-stream-expand</text>
+<line class="interval" x1="420.07" y1="342" x2="421.87" y2="342"/>
+<circle class="candidate" cx="421.06" cy="342" r="5"/>
+<text class="label" x="30" y="388">avx-offset-stream-contract</text>
+<line class="interval" x1="419.01" y1="384" x2="421.04" y2="384"/>
+<circle class="candidate" cx="419.56" cy="384" r="5"/>
+<text class="label" x="30" y="430">avx-two-worker-stream-expand</text>
+<line class="interval" x1="415.25" y1="426" x2="420.62" y2="426"/>
+<circle class="candidate" cx="418.47" cy="426" r="5"/>
+<text class="label" x="30" y="472">avx-two-worker-stream-contract</text>
+<line class="interval" x1="420.31" y1="468" x2="424.56" y2="468"/>
+<circle class="candidate" cx="422.64" cy="468" r="5"/>
+<text class="label" x="30" y="514">staged-natural-llc</text>
+<line class="interval" x1="747.75" y1="510" x2="748.99" y2="510"/>
+<circle class="candidate" cx="748.40" cy="510" r="5"/>
+<text class="label" x="30" y="556">staged-natural-stream-expand</text>
+<line class="interval" x1="761.57" y1="552" x2="763.47" y2="552"/>
+<circle class="candidate" cx="762.23" cy="552" r="5"/>
+<text class="label" x="30" y="598">staged-natural-stream-contract</text>
+<line class="interval" x1="766.92" y1="594" x2="773.08" y2="594"/>
+<circle class="candidate" cx="767.94" cy="594" r="5"/>
+<text class="small" x="30" y="668">Source: summary.json regenerated from observations.jsonl · ratios clipped at 2.0 for display</text>
+</svg>

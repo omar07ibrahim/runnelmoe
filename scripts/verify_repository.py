@@ -192,6 +192,14 @@ REQUIRED = {
     "benchmarks/raw/m3-cache-policies-20260803/observations.jsonl",
     "benchmarks/raw/m3-cache-policies-20260803/summary.json",
     "benchmarks/raw/m3-cache-policies-20260803/traces.jsonl",
+    "benchmarks/raw/m4-bf16-gemv-20260803/cases.jsonl",
+    "benchmarks/raw/m4-bf16-gemv-20260803/correctness.jsonl",
+    "benchmarks/raw/m4-bf16-gemv-20260803/environment.json",
+    "benchmarks/raw/m4-bf16-gemv-20260803/experiment.json",
+    "benchmarks/raw/m4-bf16-gemv-20260803/figures/elapsed-time.svg",
+    "benchmarks/raw/m4-bf16-gemv-20260803/figures/paired-ratios.svg",
+    "benchmarks/raw/m4-bf16-gemv-20260803/observations.jsonl",
+    "benchmarks/raw/m4-bf16-gemv-20260803/summary.json",
 }
 
 FORBIDDEN_BYTES = {
