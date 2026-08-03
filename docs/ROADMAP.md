@@ -7,12 +7,12 @@ exists.
 
 ## M0 — contracts and provenance
 
-- [ ] All required governance and design documents pass
+- [x] All required governance and design documents pass
   `python3 scripts/verify_repository.py`.
-- [ ] The project name has a dated availability/conflict check.
-- [ ] A public repository exists under `omar07ibrahim`; default branch is
+- [x] The project name has a dated availability/conflict check.
+- [x] A public repository exists under `omar07ibrahim`; default branch is
   protected by green CI practice.
-- [ ] A reviewer can identify every external source and distinguish targets
+- [x] A reviewer can identify every external source and distinguish targets
   from project measurements.
 
 ## M1 — exact tiny reference runtime

@@ -51,6 +51,7 @@ REQUIRED = {
     "docs/adr/0001-clean-room-and-system-boundaries.md",
     "docs/adr/0002-immutable-tensor-objects.md",
     "docs/diagrams/runtime.dot",
+    "docs/reviews/M0_REVIEW.md",
     "rust-toolchain.toml",
     "scripts/verify_repository.py",
 }

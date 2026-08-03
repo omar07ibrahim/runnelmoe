@@ -6,7 +6,8 @@ available RAM. It is designed to make the hard tradeoffs visible: verified
 storage, bounded memory, asynchronous I/O, cache policy, numerical parity,
 request scheduling, and honest measurement.
 
-> Project status: design baseline (M0). There are no performance claims yet.
+> Project status: M0 design/provenance gate verified; M1 implementation is in
+> progress. There are no performance claims yet.
 > The planned first supported model is a tiny deterministic synthetic adapter
 > created by this project.
 

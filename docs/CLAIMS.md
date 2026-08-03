@@ -9,7 +9,7 @@ Every externally visible claim has one of four states:
 
 | Claim | State | Evidence |
 | --- | --- | --- |
-| Required provenance and the clean-room boundary are documented | target | M0 commit, green CI, and durable independent-review record |
+| Required provenance and the clean-room boundary are documented | verified | baseline `fe2fd0ce…`, [green CI](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30788257437), [M0 review](reviews/M0_REVIEW.md) |
 | The project can run inference | target | M1 |
 | Tiny runtime and PyTorch oracle agree | target | M1 |
 | Reads are bounded by a configured RAM budget | target | M2 |
