@@ -123,9 +123,9 @@ every raw trial, and a generated statistical summary below
 Timing describes the validation command on a shared virtualized host; it is not
 evidence of a performance improvement.
 
-The locally accepted schema-v2 M2 evidence is at
-`benchmarks/raw/m2-data-plane-forced-eviction-20260803/`; publication remains
-pending until protected-branch CI is green. Its clean implementation commit is
+The accepted schema-v2 M2 evidence is committed at
+`benchmarks/raw/m2-data-plane-forced-eviction-20260803/`. Its clean
+implementation commit is
 `99772585e23d8f1ce3459ba6397d93fd1be0fc8a`; the exact recorded invocation is:
 
 ```console

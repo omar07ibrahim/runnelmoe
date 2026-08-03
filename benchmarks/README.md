@@ -7,9 +7,8 @@ directory contains no claimed performance improvement.
 
 ## M2 correctness and observability evidence
 
-`raw/m2-data-plane-forced-eviction-20260803/` is the locally accepted
-schema-v2 clean-commit evidence record for the verified data plane. Publication
-remains pending until protected-branch CI is green:
+`raw/m2-data-plane-forced-eviction-20260803/` is the accepted schema-v2
+clean-commit evidence record for the verified data plane:
 
 - [experiment.json](raw/m2-data-plane-forced-eviction-20260803/experiment.json)
   freezes the hypothesis, fixture and trace digests, release build, exact

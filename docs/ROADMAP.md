@@ -28,12 +28,19 @@ exists.
 
 ## M2 — out-of-core data plane
 
-- [ ] Immutable SHA-256 objects support resumable staging and atomic publish.
-- [ ] Sync and async backends preserve parity under bounded reads.
-- [ ] A byte-capacity DRAM cache exposes hit, miss, admission, eviction,
+- [x] Immutable SHA-256 objects support resumable staging and atomic publish.
+- [x] Sync and async backends preserve parity under bounded reads.
+- [x] A byte-capacity DRAM cache exposes hit, miss, admission, eviction,
   prefetch-usefulness, read-byte, wait-time, and RSS observations.
-- [ ] Truncation, corruption, reordering, cancellation, and low-budget fault
+- [x] Truncation, corruption, reordering, cancellation, and low-budget fault
   tests fail safely.
+
+Evidence: [M2 review](reviews/M2_REVIEW.md),
+[green protected CI](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30797378731),
+and the committed schema-v2
+[experiment contract](../benchmarks/raw/m2-data-plane-forced-eviction-20260803/experiment.json),
+[raw trials](../benchmarks/raw/m2-data-plane-forced-eviction-20260803/observations.jsonl),
+and [generated summary](../benchmarks/raw/m2-data-plane-forced-eviction-20260803/summary.json).
 
 ## M3 — cache policy research
 

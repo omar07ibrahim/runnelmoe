@@ -6,11 +6,14 @@
   publication, sync/async I/O, byte-capacity cache, leases, metrics, traces,
   fault handling, tiny-runtime integration, and evidence harness
 - Local verdict: pass
-- Publication verdict: pending protected-branch CI; this line and the roadmap
-  are updated only after the evidence commit is green
+- Publication verdict: pass; the evidence commit passed all required checks in
+  [protected CI](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30797378731),
+  and this closure commit is subject to the same checks before merge
 - Implementation and measured commit:
   `99772585e23d8f1ce3459ba6397d93fd1be0fc8a`
-- Locally accepted raw evidence:
+- Evidence publication commit:
+  `0fe01325f65e2991b3a683017809a0d98bc2c8a7`
+- Accepted raw evidence:
   [`m2-data-plane-forced-eviction-20260803`](../../benchmarks/raw/m2-data-plane-forced-eviction-20260803/experiment.json)
 - Performance verdict: no improvement claimed
 

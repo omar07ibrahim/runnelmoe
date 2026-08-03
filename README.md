@@ -6,9 +6,9 @@ available RAM. It is designed to make the hard tradeoffs visible: verified
 storage, bounded memory, asynchronous I/O, cache policy, numerical parity,
 request scheduling, and honest measurement.
 
-> Project status: M0 design/provenance and the M1 tiny-reference runtime are
-> verified. The M2 out-of-core data plane is implemented and undergoing its
-> evidence/review gate. No performance improvement is claimed.
+> Project status: M0 design/provenance, the M1 tiny-reference runtime, and the
+> M2 verified out-of-core data plane have passed their milestone gates. M3
+> cache-policy research is next. No performance improvement is claimed.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling
@@ -61,7 +61,9 @@ cargo run --locked -p runnel -- data-plane-demo --json
 
 This command reports exact byte and cache-transition accounting alongside
 volatile I/O-wait and RSS observations. It is a correctness/observability demo,
-not a throughput comparison.
+not a throughput comparison. The committed [M2 review](docs/reviews/M2_REVIEW.md)
+and [schema-v2 raw evidence](benchmarks/raw/m2-data-plane-forced-eviction-20260803/summary.json)
+record the closed gate and its limitations.
 
 ## Architecture contract
 
