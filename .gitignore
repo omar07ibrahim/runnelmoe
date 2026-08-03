@@ -1,0 +1,30 @@
+# Workspace-only instructions and bootstrap prompt
+/AGENTS.md
+/MISSION.md
+/INITIAL_PROMPT.txt
+/.codex/
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+
+# Generated runtime/demo state
+/.runnelmoe/
+/tmp/
+/dist/
+/site/build/
+*.profraw
+*.profdata
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp

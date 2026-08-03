@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible correctness, safety, or runtime problem.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include secrets, private prompts, model data, or security vulnerabilities."
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Observed outcome
+      description: Include the complete sanitized error and what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected outcome
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include exact commands, commit, fixture digest, and configuration.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, compiler/runtime, memory budget, and backend.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I used only a tiny/open synthetic fixture.
+          required: true
+        - label: This is not a confidential security report.
+          required: true

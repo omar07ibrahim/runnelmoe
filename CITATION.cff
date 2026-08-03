@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use RunnelMoE in research, cite the software and the exact release."
+title: "RunnelMoE"
+type: software
+authors:
+  - family-names: Ibrahim
+    given-names: Omar
+repository-code: "https://github.com/omar07ibrahim/runnelmoe"
+license: Apache-2.0
+version: 0.1.0-dev
+keywords:
+  - mixture-of-experts
+  - out-of-core
+  - inference
+  - systems
+  - rust

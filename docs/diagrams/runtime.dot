@@ -1,0 +1,24 @@
+digraph runnelmoe_runtime {
+  graph [rankdir=LR, bgcolor="transparent", pad=0.25, nodesep=0.45, ranksep=0.7];
+  node [shape=box, style="rounded,filled", fontname="sans-serif", fontsize=11,
+        color="#21414a", fontcolor="#102a31", fillcolor="#edf5f3"];
+  edge [color="#53777d", arrowsize=0.75];
+
+  client [label="local client", fillcolor="#f5f0e6"];
+  surface [label="bounded API surface"];
+  adapter [label="model adapter"];
+  scheduler [label="deterministic scheduler"];
+  policy [label="cache policy\n+ trace sink", fillcolor="#eef0f7"];
+  cache [label="verified DRAM pages"];
+  io [label="bounded sync / async I/O"];
+  store [label="immutable SHA-256 objects", shape=cylinder, fillcolor="#f5f0e6"];
+  scalar [label="scalar reference"];
+  simd [label="validated C ABI / AVX2", style="rounded,dashed"];
+
+  client -> surface -> adapter -> scheduler;
+  scheduler -> cache [label="leases", fontsize=9];
+  scheduler -> scalar [label="work", fontsize=9];
+  scheduler -> simd [label="optional", fontsize=9, style=dashed];
+  cache -> policy [dir=both, label="events / decisions", fontsize=9];
+  cache -> io -> store;
+}

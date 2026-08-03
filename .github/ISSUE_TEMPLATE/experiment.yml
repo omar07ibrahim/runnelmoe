@@ -1,0 +1,32 @@
+name: Experiment or optimization
+description: Propose a measurable systems hypothesis.
+title: "experiment: "
+labels: ["experiment"]
+body:
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Falsifiable hypothesis
+      description: State the expected mechanism and direction.
+    validations:
+      required: true
+  - type: input
+    id: baseline
+    attributes:
+      label: Named baseline
+    validations:
+      required: true
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Correctness gate
+      description: Declare tolerances and exact token/routing requirements.
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Measurement plan
+      description: Fixture/trace, warmups, trials, metrics, uncertainty, and raw output.
+    validations:
+      required: true

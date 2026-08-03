@@ -1,0 +1,193 @@
+# System design
+
+## Scope
+
+RunnelMoE is a local inference runtime and research harness that jointly
+schedules sparse-model tokens, expert pages, resident memory, and storage I/O
+under a declared memory budget. “Model-agnostic” means the storage, cache,
+scheduler, and serving layers depend on a versioned adapter interface; it does
+not mean arbitrary checkpoints work without adapter code.
+
+The first supported adapter is deliberately tiny and synthetic. It exists to
+exercise a complete decoder path:
+
+1. a fixed deterministic tokenizer boundary;
+2. token embedding and RMS normalization;
+3. one-head causal attention with explicit prefill/decode state;
+4. stable top-2 routing with deterministic tie-breaking;
+5. independently stored gated-MLP experts and weighted dispatch;
+6. residual composition, final normalization, and LM projection; and
+7. greedy plus seeded sampling generation.
+
+Default fixture dimensions are intentionally hand-inspectable: vocabulary 32,
+hidden width 8, one decoder block, four experts, top two selected, expert width
+12, and a short context cap. The generator is seeded and uses no downloaded
+data.
+
+## Architecture
+
+The source for the architecture figure is
+`docs/diagrams/runtime.dot`; generated images are disposable outputs.
+
+    adapter plan
+         |
+    request scheduler ---- policy / trace
+         |                     |
+    tensor leases <------ verified page cache
+         |                     |
+    scalar or C-ABI kernel   bounded I/O pool
+                               |
+                         immutable RMOA objects
+
+### Boundaries
+
+- **Adapter:** validates topology, maps semantic tensor roles, and owns
+  sequence-state equations. Adapters are compiled versioned code, never
+  untrusted dynamic plugins.
+- **Scheduler:** admits requests against a complete memory ledger, chooses
+  deterministic token-boundary work, groups expert calls, and scatters results
+  without changing per-request order or RNG streams.
+- **Tensor store:** resolves semantic tensor IDs to verified immutable objects.
+  It never receives a filesystem path from a manifest.
+- **Cache:** provides byte-accounted leases over verified fixed-size pages.
+  Its explicit states are `absent`, `loading`, `resident`, and
+  `retiring`. A leased page cannot be evicted.
+- **I/O:** a synchronous positional-read implementation is the reference. The
+  asynchronous implementation uses the same bounded buffer ownership and
+  completion contract.
+- **Compute:** scalar Rust is authoritative. Optimized code crosses a narrow C
+  ABI only after Rust validates shape, dtype, extent, alignment, aliasing, and
+  runtime ISA.
+- **Oracle:** Python/PyTorch evaluates the documented model equations with a
+  different module structure and control flow. It cannot consume production
+  routing decisions or intermediate outputs as inputs.
+- **Serving:** translates a documented HTTP subset into bounded runtime
+  requests. It has no direct tensor, cache-policy, or filesystem access.
+
+## Interfaces
+
+The conceptual adapter interface is intentionally small:
+
+    validate(model_spec, tensor_catalog) -> validated_model
+    new_sequence(prompt_tokens, limits, rng_seed) -> sequence_state
+    plan_prefill(sequence_state, token_chunk) -> tensor_requirements
+    plan_decode(sequence_state, token) -> tensor_requirements
+    apply(sequence_state, leased_tensors, backend) -> logits
+
+Tensor requirements identify semantic IDs, byte ranges, access reason
+(`demand` or `prefetch`), deadline, and priority. Cache policy sees only
+immutable trace events and capacity; it cannot alter numerical execution.
+
+Storage has two equivalent entry points:
+
+    read_verified_page(object_id, page_index, owned_buffer, cancellation)
+    read_verified_page_async(object_id, page_index, owned_buffer, cancellation)
+
+Both read and authenticate one complete logical page, including the short final
+page, or return a typed error. A tensor slice is exposed only after every
+intersecting whole page verifies; physical read amplification is traced.
+Partial unverified bytes never become cache-resident.
+
+## Runtime invariants
+
+1. **Numerical semantics:** stable top-k orders by descending score and then
+   ascending expert ID. Scalar f32 accumulation order is specified. Optimized
+   paths meet the declared tolerance; greedy token IDs match exactly.
+2. **Identity:** every consumed byte belongs to the manifest's root identity
+   and a length-checked SHA-256 object. No mutable path is trusted after open.
+3. **Bounded resources:** admission counts resident pages, in-flight buffers,
+   sequence state, kernel scratch, queued work, and bounded metadata. Cache
+   capacity is never oversubscribed; observed RSS is reported separately.
+4. **Publication:** only complete verified objects are atomically published.
+   Cancellation leaves no addressable partial object.
+5. **Lease safety:** resident storage outlives all consumers. Eviction removes
+   eligibility before reclaiming bytes.
+6. **Determinism:** with identical artifact, request, seed, and backend,
+   scheduling and batching cannot change tokens.
+7. **Fail closed:** unknown versions, required fields, dtypes, flags, adapters,
+   or numeric policies are rejected.
+8. **Evidence:** tracing is observational; disabling it does not change policy
+   decisions or numerical order.
+
+## Artifact contract
+
+RMOA version 1 is specified by [the format contract](FORMAT.md) and ADR-0002.
+The bounded JSON manifest points only to lowercase SHA-256 object IDs in a
+derived `objects/sha256/` namespace. Tensor descriptors have a semantic role,
+dtype, shape, logical length, object digest, and a required digest-bound page
+table. All arithmetic is checked before allocation.
+
+Version 1 excludes compression, sparse aliases, executable metadata, remote
+URLs, manifest paths, host-endian values, implicit strides, and overlapping
+ranges. The artifact ID is the SHA-256 of the exact canonical manifest bytes.
+
+## Memory scheduling
+
+The configured runtime budget is partitioned explicitly:
+
+    total = object_and_policy_metadata + waiter_and_lease_metadata
+          + sequence_state + kernel_scratch + resident_page_capacity
+          + in_flight_buffer_capacity + request_output_trace_queues
+          + admission_reserve
+
+Capacity, including alignment padding, is reserved before every allocation or
+I/O submission and released exactly once by its owner. A shared physical page
+buffer is charged once; each waiter and lease is charged separately.
+Configuration is rejected if the minimum executable operation cannot fit.
+Cache policies operate on fixed-size pages so byte capacity and offline
+optimal comparisons are unambiguous. Large tensors are streamed as ordered
+pages; tensors that share a physical page share its buffer charge.
+
+The I/O backend owns a submitted buffer until completion or acknowledged
+cancellation. Request cancellation becomes terminal only after buffer
+ownership returns. A completed page may publish at exactly one atomic
+state transition from `loading` to `resident`; cancellation that linearizes
+first prevents publication. One in-flight owner serves duplicate waiters, and
+each waiter independently releases its metadata reservation.
+
+The multi-request scheduler will use request-owned RNG state, stable request
+IDs, bounded queues, token-boundary preemption, and deficit-based service.
+Expert coalescing can reorder compute internally only when scatter restores
+the adapter's specified per-sequence semantics.
+
+## Error model
+
+Public operations return stable categories while retaining an internal source
+chain:
+
+| Category | Examples | Retry |
+| --- | --- | --- |
+| `invalid_artifact` | schema, shape, overflow, unknown required value | no |
+| `integrity_failure` | length or digest mismatch, page reordering | only after replacing source |
+| `unsupported` | adapter, dtype, format version, ISA-only request | no |
+| `resource_exhausted` | memory admission, queue, body, context cap | after reducing demand |
+| `io` | open, positional read, sync failure | policy-dependent |
+| `cancelled` | caller cancellation or disconnect | no |
+| `deadline_exceeded` | queue, I/O, or generation deadline | caller choice |
+| `internal` | violated invariant or unexpected backend failure | no automatic retry |
+
+Errors never contain tensor bytes, prompt text, credentials, or unrestricted
+host paths. HTTP mapping will be documented with M6.
+
+## Observability
+
+Trace events use monotonic timestamps, stable request pseudonyms, page/object
+IDs, byte counts, reason, queue/wait/compute durations, cache decision, and
+outcome. Prompt and generated content are absent by default. Metrics use
+bounded labels; object, expert, and request IDs remain in sampled traces rather
+than Prometheus labels.
+
+Required data-plane counters include demand bytes, physical bytes read, cache
+hits/misses/admissions/evictions, in-flight and resident bytes, useful and
+wasted prefetches, I/O wait, compute time, and process RSS samples.
+
+## Non-goals
+
+- training, fine-tuning, distributed inference, GPUs, or public hosting;
+- downloading, redistributing, or initially running Kimi K3 weights;
+- accepting arbitrary code or tokenizer implementations from checkpoints;
+- promising constant RSS independent of allocator/runtime overhead;
+- claiming every MoE family is supported by one adapter;
+- encrypted artifacts, authenticity signatures, or hostile multi-tenant
+  isolation in version 1; and
+- speed claims before repeatable measurements on named hardware.
