@@ -73,8 +73,9 @@ or requests and identify which population they represent.
   runtime divided by completed model tokens;
 - **I/O wait:** wall duration work is ready but blocked on required reads;
 - **peak accounted bytes:** maximum runtime budget ledger total;
-- **peak RSS:** maximum sampled process resident-set size, reported separately
-  because allocators and code pages are outside the logical ledger.
+- **peak RSS:** fresh-child Linux `VmHWM` when available, reported separately
+  because allocators and code pages are outside the logical ledger; sampled
+  `VmRSS` is a diagnostic rather than a substitute.
 
 ### Cache
 
@@ -232,7 +233,52 @@ the outcome location only; the preregistered contract above remains unchanged.
   service lag; both are reported because one aggregate can hide starvation;
 - **queue delay:** admission enqueue to first scheduled model work;
 - **cancellation cleanup:** cancellation to release of all request-owned
-  accounted bytes.
+  accounted bytes;
+- **worker quiescence:** cancellation to return of shared worker-owned scratch,
+  reported separately from request cleanup.
+
+M5 uses only three primary outcomes: homogeneous-burst end-to-end emitted-token
+throughput, mixed-prefill within-run p95 TTFT, and homogeneous exact maximum
+service lag. Single-long-control prefill/decode throughput, mixed prefill
+completion rate, ITL p50/p95, queue-delay p50/p95, Jain's index, batch occupancy,
+expert-group calls, coalescing factor, page utilization, and deadline goodput
+are drivers or diagnostics. Exact route/token parity, tolerance-bound
+continuous values, deterministic RNG/output/trace digests, balanced memory
+ledgers, cancellation/backpressure/deadline behavior, and the starvation bound
+are guardrails. Favorable timing is not a completion gate.
+
+The named baseline is FIFO single-request run-to-completion. The candidate is
+equal-weight one-position-quantum DRR with up to eight distinct sequences per
+wave and stable expert-aware grouping. Both use identical tiny-v3 scalar
+weights, paged state, streaming attention, output sink, budget, and workload.
+Five frozen cells cover a 896-token single-request control, a homogeneous
+16-request burst, a mixed 16-request long-prefill burst, deterministic queue
+and deadline pressure, and four cancellation ownership points. The exact
+prompt generator, request order, limits, fairness horizon, and cancellation
+hooks are fixed in [ADR-0007](adr/0007-transactional-paged-scheduling.md).
+
+Each cell uses five excluded warmup pairs and 30 measured pairs. Variant order
+is balanced, cell/pair order is a frozen SHA-256 permutation, failures remain
+in their original rows, and no outlier or failed pair is replaced. Each run's
+request percentile is one experimental unit; with 16 requests the nearest-rank
+p95 is the maximum. Timing comparisons use paired ratios with a deterministic
+10,000-resample median percentile-bootstrap 95% interval. Service lag, runnable
+gap, and Jain are exact replayed schedule properties with identical digests
+required across repetitions, not bootstrap outcomes. Cells are not pooled and
+timing intervals are exploratory and unadjusted.
+
+The fairness guardrail is stronger than Jain's index. Across the candidate's
+fixed 16-commit continuously runnable horizon, every request must receive
+service, the maximum gap must be at most 15 other commits, and maximum positive
+fluid-share lag must stay below one quantum. The complete ordered service log
+is committed so the evidence verifier can recompute every prefix.
+
+The logical scheduler ledger charges declared payload capacities and fixed
+bounded metadata before allocation. Fresh-child Linux `VmHWM` is reported
+separately because allocator/runtime overhead and system page cache are not
+logical ledger bytes. No scheduler result may be described as constant RSS,
+production traffic, large-model long-context performance, weighted fairness,
+or storage-device throughput.
 
 ## Host controls and limitations
 

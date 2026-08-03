@@ -53,6 +53,11 @@ The cross-milestone system invariants are:
 | NaN/Inf or unstable routing | finite checks and specified score/tie policy | special-value and tie tests | M1 |
 | Compression bomb | compression absent from and rejected by RMOA v1 | exact-schema tests | M1 |
 | Memory/queue denial of service | eager metadata caps; 64-byte-quantized page-pool ledger; bounded entries, loads, workers, queues, waiters, leases, and traces | exact budget, queue saturation, hostile configuration, and failed-admission tests | M1/M2/M5 |
+| Cross-request state or stale completion | generation-tagged request/state identities; contribution identity includes position, rank, expert, revision, and transaction | missing/duplicate/foreign contribution, slot-reuse ABA, completion-permutation, and sibling-cancellation tests | M5 |
+| Cancellation/deadline partial token | prepared state is immutable; K/V, RNG, and output commit at one actor boundary after the final control check | fault/cancel/expiry injection at every token phase and exact before/after-commit outcome matrix | M5 |
+| Output or command backpressure deadlock | bounded channels; full output blocks only its owner; independently reserved terminal slot; disconnect cancellation does not depend on command capacity | deterministic saturation, stalled receiver, sibling progress, disconnect, and shutdown ownership tests | M5/M6 |
+| Scheduler starvation | equal-weight token-quantum DRR, stable order, reactivation credit cap, blocked requests consume no service | every-prefix maximum service lag, runnable-gap bound, independent reference trace, and continuous-arrival stress | M5 |
+| RNG stream corruption across batching | request-owned versioned stream; preview advances only with token commit; stable probability/tie order | independent Python vectors plus batch/chunk/cancel/retry permutation tests | M5 |
 | Cache-trace allocation or oracle explosion | canonical closed JSONL schema; file/line/page/event/prediction caps; complete validation before replay; uniform-geometry MIN; explicit state cap on variable-byte DP | adversarial parser corpus, deterministic arbitrary-byte smoke, oversized configuration tests, and exhaustive tiny differentials | M3 |
 | Slow client or abandoned SSE | deadlines, bounded output channel, disconnect cancellation | stalled/disconnect black-box tests | M6 |
 | High-cardinality telemetry | bounded metric labels; IDs only in sampled traces | metrics cardinality test | M6 |
@@ -99,6 +104,21 @@ descriptors; classifies every entry; sums all declared lengths before reading;
 and performs bounded reads with final metadata checks. Capture builds in a
 private tmpfs child and revalidates clean HEAD, the historical harness blob,
 and the executable digest before the staged directory is renamed into place.
+
+M5 request validation additionally rejects empty/oversized prompts, invalid
+token IDs, context and prompt-plus-generation overflow, zero or excessive page,
+chunk, queue, batch, output, worker, and trace caps, arithmetic overflow in
+every semantic charge, invalid temperature/top-k/top-p values, deadline
+overflow, duplicate external identity when exposed, and unsupported sampling
+versions. Rejection precedes prompt copying and cannot mutate queue order,
+deficits, RNG, high-water counters, or another request's admission plan.
+
+M5's logical ledger is exact only for declared semantic payload capacities and
+fixed metadata charges. Allocator control blocks, executor internals, code
+pages, and filesystem page cache remain outside it; fresh-child `VmHWM` and a
+configured reserve are separate evidence. When implemented, the generated
+width-8, 1,024-position adapter-v3 fixture demonstrates page/streaming
+mechanics, not hostile tenant isolation or production long-context behavior.
 
 ## Abuse cases for later serving
 

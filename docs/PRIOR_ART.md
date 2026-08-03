@@ -169,6 +169,31 @@ remains credited above only as prior art for the broader constrained-memory
 inference problem. Results from another implementation are never accepted as
 RunnelMoE measurements.
 
+## Scheduler and fairness sources
+
+M5 independently specializes published scheduling and measurement definitions
+to unit-cost model-position service:
+
+- M. Shreedhar and G. Varghese,
+  [“Efficient Fair Queueing Using Deficit Round
+  Robin,”](https://doi.org/10.1145/217382.217453) *ACM SIGCOMM*, 1995 — the
+  primary deficit-round-robin source; publisher-controlled article, citation
+  only. RunnelMoE freezes its own equal-weight unit-cost ring, blocking,
+  reactivation, cancellation, and batching rules in ADR-0007 rather than
+  importing an implementation.
+- R. Jain, D.-M. Chiu, and W. R. Hawe,
+  [“A Quantitative Measure of Fairness and Discrimination for Resource
+  Allocation in Shared Computer
+  Systems,”](https://www.cs.wustl.edu/~jain/papers/ftp/fairness.pdf) DEC
+  Research Report TR-301, 1984 — the primary source for the reported bounded
+  fairness index; author-hosted report, citation only. RunnelMoE also requires
+  every-prefix service lag and runnable-gap bounds because one aggregate index
+  does not prove absence of starvation.
+
+SplitMix64 transition/mixing provenance is recorded with the cache-policy
+random generators above. M5 reuses only that algorithm identity and public
+constants for a separately written request-owned sampling stream.
+
 ## Kernel and numeric-format sources
 
 M4 uses specifications and vendor/compiler documentation as primary sources:

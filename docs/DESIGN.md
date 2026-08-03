@@ -206,10 +206,23 @@ waiter owns only its waiter and prospective-lease reservations, so it may
 return after withdrawing them; any now-unwanted cache-owned physical load stays
 charged until its worker completion releases the page-pool reservation.
 
-The multi-request scheduler will use request-owned RNG state, stable request
-IDs, bounded queues, token-boundary preemption, and deficit-based service.
-Expert coalescing can reorder compute internally only when scatter restores
-the adapter's specified per-sequence semantics.
+The planned M5 scheduler contract is frozen in
+[ADR-0007](adr/0007-transactional-paged-scheduling.md). When implemented it
+uses request-owned SplitMix64 state, stable generation-tagged request slots, bounded queues,
+token-boundary equal-weight deficit service, and a pure step-able core beneath
+a thin bounded Tokio actor. Each token is prepared without mutation, grouped
+by expert with stable transaction identity, scattered and reduced in router
+rank order, then committed with RNG and output at one non-yielding boundary.
+Cancellation or expiry before that boundary publishes none of the three.
+
+Planned tiny adapter v3 retains the generated tiny equations and compact BF16
+experts but raises the frozen synthetic context cap to 1,024. Its token-major
+K/V state uses 16-token pages charged at full admitted capacity. Stable three-pass
+streaming attention allocates no score vector proportional to context. The
+fixture will exercise multi-page mechanics only. Adapter v3 remains unsupported
+until M5 implementation lands; versions 1 and 2 are the currently supported
+profiles in [the format contract](FORMAT.md). Weights remain eagerly resident
+in M5, so live cache-leased expert execution remains an explicit system gap.
 
 ## Error model
 
