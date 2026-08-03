@@ -243,10 +243,7 @@ fn data_plane_demo_reports_deterministic_parity_and_accounting() {
                 .as_str()
                 .unwrap()
         };
-        assert_eq!(
-            event["object_digest"],
-            expected_digest
-        );
+        assert_eq!(event["object_digest"], expected_digest);
         assert_eq!(event["page_size"], 65_536);
         assert_eq!(event["page_index"], 0);
         assert_eq!(event["logical_bytes"], logical_bytes);
