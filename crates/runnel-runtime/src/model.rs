@@ -10,10 +10,14 @@ use runnel_kernels::{
     PreparedGemv, select_backend,
 };
 
-use crate::{EOS_TOKEN, Result, RuntimeError, Tensor, TensorCatalog};
+use crate::{
+    EOS_TOKEN, Result, RuntimeError, StateLayout, Tensor, TensorCatalog,
+    attention::streaming_causal_attention, state::SequenceState,
+};
 
 const RMS_EPSILON: f32 = 1.0 / 4096.0;
-static NEXT_MODEL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+const COMPATIBILITY_PAGE_TOKENS: usize = 16;
+static NEXT_MODEL_INSTANCE_ID: CheckedModelIdCounter = CheckedModelIdCounter::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TinyConfig {
@@ -42,7 +46,17 @@ impl TinyConfig {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Frozen adapter-v3 geometry. Tensor equations and topology are otherwise
+    /// identical to the compact BF16 adapter-v2 profile.
+    #[must_use]
+    pub const fn reference_v3() -> Self {
+        Self {
+            context_length: 1_024,
+            ..Self::reference()
+        }
+    }
+
+    fn validate_for(&self, profile: AdapterProfile) -> Result<()> {
         if self.context_length == 0
             || self.expert_hidden_size == 0
             || self.hidden_size == 0
@@ -76,12 +90,50 @@ impl TinyConfig {
                 "top-k cannot exceed expert count".into(),
             ));
         }
-        if self != &Self::reference() {
-            return Err(RuntimeError::InvalidConfig(
-                "the tiny adapter requires the frozen reference dimensions".into(),
-            ));
+        if self != &profile.expected_config() {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "tiny adapter version {} requires its frozen reference dimensions",
+                profile.version()
+            )));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdapterProfile {
+    V1,
+    V2,
+    V3,
+}
+
+impl AdapterProfile {
+    fn from_version(version: u64) -> Option<Self> {
+        match version {
+            1 => Some(Self::V1),
+            2 => Some(Self::V2),
+            3 => Some(Self::V3),
+            _ => None,
+        }
+    }
+
+    const fn version(self) -> u64 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+            Self::V3 => 3,
+        }
+    }
+
+    const fn expected_config(self) -> TinyConfig {
+        match self {
+            Self::V1 | Self::V2 => TinyConfig::reference(),
+            Self::V3 => TinyConfig::reference_v3(),
+        }
+    }
+
+    const fn uses_bf16_experts(self) -> bool {
+        matches!(self, Self::V2 | Self::V3)
     }
 }
 
@@ -105,40 +157,6 @@ pub struct Generation {
     pub steps: Vec<StepOutput>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct SequenceState {
-    model_instance_id: Option<u64>,
-    keys: Vec<Vec<f32>>,
-    values: Vec<Vec<f32>>,
-}
-
-impl SequenceState {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            model_instance_id: None,
-            keys: Vec::new(),
-            values: Vec::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-}
-
-impl Default for SequenceState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Debug)]
 pub struct TinyModel {
     config: TinyConfig,
@@ -151,10 +169,11 @@ impl TinyModel {
         Self::from_artifact_with_backend(artifact, BackendRequest::Auto)
     }
 
-    /// Builds a model while explicitly choosing the adapter-v2 expert backend.
+    /// Builds a model while explicitly choosing a compact-expert backend.
     ///
     /// Adapter v1 accepts only [`BackendRequest::Auto`] because it retains its
-    /// original f32 implementation and has no BF16 backend to select.
+    /// original f32 implementation. Adapters v2 and v3 use compact BF16
+    /// experts and accept automatic or explicit dispatch.
     pub fn from_artifact_with_backend(
         artifact: &Artifact,
         request: BackendRequest,
@@ -173,7 +192,7 @@ impl TinyModel {
     }
 
     /// Builds a supported tiny adapter from an authenticated manifest and
-    /// caller-supplied tensor bytes, using automatic adapter-v2 dispatch.
+    /// caller-supplied tensor bytes, using automatic compact-expert dispatch.
     ///
     /// This is the adapter boundary used by the out-of-core store: the caller
     /// retains responsibility for byte authentication, while this method
@@ -186,7 +205,7 @@ impl TinyModel {
         Self::from_verified_tensor_bytes_with_backend(manifest, BackendRequest::Auto, tensor_bytes)
     }
 
-    /// Builds a supported tiny adapter with an explicit adapter-v2 backend
+    /// Builds a supported tiny adapter with an explicit compact-expert backend
     /// request from independently authenticated tensor bytes.
     pub fn from_verified_tensor_bytes_with_backend<F>(
         manifest: &Manifest,
@@ -197,12 +216,15 @@ impl TinyModel {
         F: FnMut(&TensorRecord) -> Result<Vec<u8>>,
     {
         let adapter_version = manifest.adapter.version;
-        if manifest.adapter.id != "runnel.tiny-causal-moe" || !matches!(adapter_version, 1 | 2) {
+        if manifest.adapter.id != "runnel.tiny-causal-moe" {
             return Err(RuntimeError::InvalidArtifact(
                 "unsupported adapter identity".into(),
             ));
         }
-        if adapter_version == 1 && request != BackendRequest::Auto {
+        let profile = AdapterProfile::from_version(adapter_version).ok_or_else(|| {
+            RuntimeError::InvalidArtifact(format!("unsupported adapter version {adapter_version}"))
+        })?;
+        if profile == AdapterProfile::V1 && request != BackendRequest::Auto {
             return Err(RuntimeError::BackendIncompatibleWithAdapter {
                 adapter_version,
                 request,
@@ -228,9 +250,9 @@ impl TinyModel {
             top_k: dimension(model.top_k, "top_k")?,
             vocab_size: dimension(model.vocab_size, "vocab_size")?,
         };
-        config.validate()?;
+        config.validate_for(profile)?;
 
-        let expected = expected_tensors(&config, adapter_version);
+        let expected = expected_tensors(&config, profile);
         if manifest.tensors.len() != expected.len() {
             return Err(RuntimeError::InvalidArtifact(format!(
                 "adapter version {adapter_version} requires exactly {} tensors, found {}",
@@ -267,7 +289,7 @@ impl TinyModel {
             }
         }
 
-        let dispatch = if adapter_version == 2 {
+        let dispatch = if profile.uses_bf16_experts() {
             let capabilities = Capabilities::detected();
             let backend = select_backend(request, capabilities).map_err(|source| {
                 RuntimeError::ExpertKernel {
@@ -353,10 +375,10 @@ impl TinyModel {
             }
         }
 
-        match (adapter_version, dispatch) {
-            (1, None) => Self::from_catalog(config, f32_tensors),
-            (2, Some(dispatch)) => {
-                Self::from_bf16_catalog(config, f32_tensors, bf16_tensors, dispatch)
+        match (profile, dispatch) {
+            (AdapterProfile::V1, None) => Self::from_catalog(config, f32_tensors),
+            (AdapterProfile::V2 | AdapterProfile::V3, Some(dispatch)) => {
+                Self::from_bf16_catalog(config, f32_tensors, bf16_tensors, dispatch, profile)
             }
             _ => unreachable!("supported adapter versions have a fixed representation"),
         }
@@ -364,7 +386,7 @@ impl TinyModel {
 
     /// Builds adapter v1 directly from finite f32 tensors.
     pub fn from_catalog(config: TinyConfig, mut tensors: TensorCatalog) -> Result<Self> {
-        config.validate()?;
+        config.validate_for(AdapterProfile::V1)?;
 
         let mut experts = Vec::with_capacity(config.num_experts);
         for expert in 0..config.num_experts {
@@ -394,8 +416,10 @@ impl TinyModel {
         tensors: TensorCatalog,
         mut bf16_tensors: BTreeMap<String, Bf16Matrix>,
         dispatch: ExpertDispatch,
+        profile: AdapterProfile,
     ) -> Result<Self> {
-        config.validate()?;
+        debug_assert!(profile.uses_bf16_experts());
+        config.validate_for(profile)?;
         let mut experts = Vec::with_capacity(config.num_experts);
         for expert in 0..config.num_experts {
             experts.push(Bf16ExpertWeights {
@@ -463,7 +487,7 @@ impl TinyModel {
 
         Ok(Self {
             config,
-            instance_id: NEXT_MODEL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            instance_id: NEXT_MODEL_INSTANCE_ID.next()?,
             weights: Weights {
                 token_embedding,
                 attn_norm,
@@ -485,7 +509,7 @@ impl TinyModel {
         &self.config
     }
 
-    /// Reports the selected compact expert backend for adapter v2.
+    /// Reports the selected compact expert backend for adapters v2 and v3.
     /// Adapter v1 returns `None` because it always executes its f32 path.
     #[must_use]
     pub fn expert_backend(&self) -> Option<BackendKind> {
@@ -493,6 +517,22 @@ impl TinyModel {
             Experts::F32(_) => None,
             Experts::Bf16 { dispatch, .. } => Some(dispatch.backend),
         }
+    }
+
+    /// Checks request-bounded state geometry without exposing model identity.
+    pub fn state_layout(&self, max_tokens: usize, page_tokens: usize) -> Result<StateLayout> {
+        if max_tokens > self.config.context_length {
+            return Err(RuntimeError::ContextLimit {
+                limit: self.config.context_length,
+            });
+        }
+        StateLayout::new(max_tokens, page_tokens, self.config.hidden_size)
+    }
+
+    /// Eagerly allocates a state whose complete layout was checked for this model.
+    pub fn new_sequence_state(&self, layout: StateLayout) -> Result<SequenceState> {
+        self.validate_state_layout(layout)?;
+        SequenceState::try_new(layout, self.instance_id)
     }
 
     pub fn forward_token(&self, state: &mut SequenceState, token: u32) -> Result<StepOutput> {
@@ -506,29 +546,72 @@ impl TinyModel {
                 vocab_size: self.config.vocab_size,
             });
         }
-        if state.len() >= self.config.context_length {
+
+        if state.layout().is_none() {
+            if state.model_instance_id().is_some()
+                || state.state_id().is_some()
+                || state.revision() != 0
+                || !state.is_empty()
+            {
+                return Err(RuntimeError::InvalidState(
+                    "unbound sequence shell is internally inconsistent",
+                ));
+            }
+            let layout =
+                self.state_layout(self.config.context_length, COMPATIBILITY_PAGE_TOKENS)?;
+            let mut candidate = self.new_sequence_state(layout)?;
+            let output = self.forward_token_bound(&mut candidate, token, token_index)?;
+            *state = candidate;
+            return Ok(output);
+        }
+
+        self.forward_token_bound(state, token, token_index)
+    }
+
+    fn forward_token_bound(
+        &self,
+        state: &mut SequenceState,
+        token: u32,
+        token_index: usize,
+    ) -> Result<StepOutput> {
+        let layout = state.layout().ok_or(RuntimeError::InvalidState(
+            "sequence state must have a bound layout",
+        ))?;
+        match state.model_instance_id() {
+            Some(instance_id) if instance_id == self.instance_id => {}
+            Some(_) => return Err(RuntimeError::StateMismatch),
+            None => {
+                return Err(RuntimeError::InvalidState(
+                    "bound sequence state is missing its model identity",
+                ));
+            }
+        }
+        self.validate_state_layout(layout)?;
+        let state_id = state.state_id().ok_or(RuntimeError::InvalidState(
+            "bound sequence state is missing its state identity",
+        ))?;
+        let position = state.len();
+        if position >= layout.max_tokens() {
             return Err(RuntimeError::ContextLimit {
-                limit: self.config.context_length,
+                limit: layout.max_tokens(),
             });
         }
-        if state
-            .model_instance_id
-            .is_some_and(|instance_id| instance_id != self.instance_id)
-        {
-            return Err(RuntimeError::StateMismatch);
-        }
+        let revision = state.revision();
 
         let mut residual = self.weights.token_embedding.row(token_index).to_vec();
         let normalized = rms_norm(&residual, &self.weights.attn_norm)?;
         let query = linear(&self.weights.attn_q, &normalized);
         let key = linear(&self.weights.attn_k, &normalized);
         let value = linear(&self.weights.attn_v, &normalized);
-        let mut pending_state = state.clone();
-        pending_state.model_instance_id = Some(self.instance_id);
-        pending_state.keys.push(key);
-        pending_state.values.push(value);
-
-        let attended = causal_attention(&query, &pending_state, self.config.num_heads)?;
+        let mut attended = vec![0.0_f32; self.config.hidden_size];
+        streaming_causal_attention(
+            &query,
+            state.history(),
+            &key,
+            &value,
+            self.config.num_heads,
+            &mut attended,
+        )?;
         let attention_output = linear(&self.weights.attn_out, &attended);
         add_in_place(&mut residual, &attention_output);
         ensure_finite(&residual, "attention residual")?;
@@ -568,7 +651,12 @@ impl TinyModel {
         let normalized = rms_norm(&residual, &self.weights.final_norm)?;
         let logits = linear(&self.weights.lm_head, &normalized);
         ensure_finite(&logits, "lm head")?;
-        *state = pending_state;
+
+        // This is the final fallible operation. Applying the validated permit
+        // only copies into preallocated pages and publishes length/revision.
+        let permit = state.validate_append(state_id, revision, position, &key, &value)?;
+        let committed_position = permit.apply();
+        debug_assert_eq!(committed_position, position);
 
         Ok(StepOutput {
             input_token: token,
@@ -579,6 +667,20 @@ impl TinyModel {
                 weights,
             },
         })
+    }
+
+    fn validate_state_layout(&self, layout: StateLayout) -> Result<()> {
+        if layout.hidden_size() != self.config.hidden_size {
+            return Err(RuntimeError::InvalidStateLayout(
+                "state hidden size does not match the model",
+            ));
+        }
+        if layout.max_tokens() > self.config.context_length {
+            return Err(RuntimeError::ContextLimit {
+                limit: self.config.context_length,
+            });
+        }
+        Ok(())
     }
 
     pub fn run_tokens(&self, tokens: &[u32]) -> Result<Vec<StepOutput>> {
@@ -645,6 +747,37 @@ fn dimension(value: u64, name: &str) -> Result<usize> {
     })
 }
 
+struct CheckedModelIdCounter {
+    next: AtomicU64,
+}
+
+impl CheckedModelIdCounter {
+    const fn new(first: u64) -> Self {
+        Self {
+            next: AtomicU64::new(first),
+        }
+    }
+
+    fn next(&self) -> Result<u64> {
+        let mut candidate = self.next.load(Ordering::Relaxed);
+        loop {
+            if candidate == 0 {
+                return Err(RuntimeError::ModelIdentityExhausted);
+            }
+            let successor = candidate.checked_add(1).unwrap_or(0);
+            match self.next.compare_exchange_weak(
+                candidate,
+                successor,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(candidate),
+                Err(observed) => candidate = observed,
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ExpectedTensor {
     role: String,
@@ -660,7 +793,7 @@ fn expected_tensor(role: impl Into<String>, shape: Vec<usize>, dtype: DType) -> 
     }
 }
 
-fn expected_tensors(config: &TinyConfig, adapter_version: u64) -> Vec<ExpectedTensor> {
+fn expected_tensors(config: &TinyConfig, profile: AdapterProfile) -> Vec<ExpectedTensor> {
     let hidden = config.hidden_size;
     let expert_hidden = config.expert_hidden_size;
     let mut tensors = vec![
@@ -681,7 +814,7 @@ fn expected_tensors(config: &TinyConfig, adapter_version: u64) -> Vec<ExpectedTe
             DType::F32Le,
         ),
     ];
-    let expert_dtype = if adapter_version == 2 {
+    let expert_dtype = if profile.uses_bf16_experts() {
         DType::Bf16Le
     } else {
         DType::F32Le
@@ -753,34 +886,6 @@ fn greedy_token(logits: &[f32]) -> u32 {
         }
     }
     u32::try_from(best).expect("vocabulary fits u32")
-}
-
-fn causal_attention(query: &[f32], state: &SequenceState, num_heads: usize) -> Result<Vec<f32>> {
-    let hidden = query.len();
-    let head_size = hidden / num_heads;
-    let scale = 1.0_f32 / (head_size as f32).sqrt();
-    let mut output = vec![0.0_f32; hidden];
-
-    for head in 0..num_heads {
-        let start = head * head_size;
-        let end = start + head_size;
-        let mut scores = Vec::with_capacity(state.len());
-        for key in &state.keys {
-            let mut score = 0.0_f32;
-            for index in start..end {
-                score += query[index] * key[index];
-            }
-            scores.push(score * scale);
-        }
-        let probabilities = softmax(&scores)?;
-        for (probability, value) in probabilities.iter().zip(&state.values) {
-            for index in start..end {
-                output[index] += *probability * value[index];
-            }
-        }
-    }
-    ensure_finite(&output, "attention")?;
-    Ok(output)
 }
 
 fn rms_norm(input: &[f32], weight: &Tensor) -> Result<Vec<f32>> {
@@ -1070,6 +1175,10 @@ mod tests {
         Artifact::from_bytes(fixture.to_parts(), Limits::default()).unwrap()
     }
 
+    fn fixture_v3_artifact() -> Artifact {
+        Artifact::from_bytes(FixtureArtifact::build_v3().to_parts(), Limits::default()).unwrap()
+    }
+
     fn v2_model_with_mutation<F>(request: BackendRequest, mut mutate: F) -> Result<TinyModel>
     where
         F: FnMut(&TensorRecord, &mut Vec<u8>),
@@ -1110,15 +1219,18 @@ mod tests {
         let inverse = (1.0_f32 + RMS_EPSILON).sqrt().recip();
         assert_eq!(normalized, [2.0 * inverse, 3.0 * inverse]);
 
-        let state = SequenceState {
-            model_instance_id: None,
-            keys: vec![vec![0.0; 4]],
-            values: vec![vec![1.0, 2.0, 3.0, 4.0]],
-        };
-        assert_eq!(
-            causal_attention(&[7.0, 8.0, 9.0, 10.0], &state, 2).unwrap(),
-            [1.0, 2.0, 3.0, 4.0]
-        );
+        let state = SequenceState::try_new(StateLayout::new(1, 1, 4).unwrap(), 91).unwrap();
+        let mut attended = [0.0; 4];
+        streaming_causal_attention(
+            &[7.0, 8.0, 9.0, 10.0],
+            state.history(),
+            &[0.0; 4],
+            &[1.0, 2.0, 3.0, 4.0],
+            2,
+            &mut attended,
+        )
+        .unwrap();
+        assert_eq!(attended, [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(softmax(&[0.0, 0.0]).unwrap(), [0.5, 0.5]);
     }
 
@@ -1201,6 +1313,38 @@ mod tests {
     }
 
     #[test]
+    fn adapter_profiles_are_closed_before_any_tensor_callback() {
+        let version_two = fixture_artifact(true);
+        let mut v2_with_v3_context = version_two.manifest().clone();
+        v2_with_v3_context.model.context_length = 1_024;
+
+        let version_three = fixture_v3_artifact();
+        let mut v3_with_v2_context = version_three.manifest().clone();
+        v3_with_v2_context.model.context_length = 16;
+        let mut unsupported_version = version_three.manifest().clone();
+        unsupported_version.adapter.version = 4;
+
+        for manifest in [v2_with_v3_context, v3_with_v2_context] {
+            let error = TinyModel::from_verified_tensor_bytes(&manifest, |_| -> Result<Vec<u8>> {
+                panic!("profile rejection must precede tensor loading")
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("frozen reference"), "{error}");
+        }
+        let error =
+            TinyModel::from_verified_tensor_bytes(&unsupported_version, |_| -> Result<Vec<u8>> {
+                panic!("version rejection must precede tensor loading")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported adapter version 4"));
+
+        assert!(matches!(
+            TinyModel::from_catalog(TinyConfig::reference_v3(), TensorCatalog::new()),
+            Err(RuntimeError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
     fn artifact_adapter_boundary_rejects_unsupported_dtype() {
         let fixture = FixtureArtifact::build();
         let mut parts = fixture.to_parts();
@@ -1240,16 +1384,59 @@ mod tests {
         let mut catalog = TensorCatalog::new();
         for recipe in tensor_recipes() {
             let mut values = recipe.values();
-            if recipe.id == 2 {
-                values.fill(f32::MAX);
+            if recipe.id == 0 {
+                let poisoned_row = 2 * TinyConfig::reference().hidden_size;
+                values[poisoned_row..poisoned_row + TinyConfig::reference().hidden_size]
+                    .fill(f32::MAX);
             }
             let tensor = Tensor::new(&recipe.role, recipe.shape, values).unwrap();
             catalog.insert(recipe.role, tensor);
         }
         let model = TinyModel::from_catalog(TinyConfig::reference(), catalog).unwrap();
         let mut state = SequenceState::new();
-        assert!(model.forward_token(&mut state, 1).is_err());
-        assert!(state.is_empty());
+        model.forward_token(&mut state, 1).unwrap();
+        let before_id = state.state_id();
+        let before_revision = state.revision();
+        let before_layout = state.layout();
+        let before_key = state.history().key_at(0).unwrap().to_vec();
+        let before_value = state.history().value_at(0).unwrap().to_vec();
+        assert!(model.forward_token(&mut state, 2).is_err());
+        assert_eq!(state.state_id(), before_id);
+        assert_eq!(state.revision(), before_revision);
+        assert_eq!(state.layout(), before_layout);
+        assert_eq!(state.len(), 1);
+        assert_eq!(state.history().key_at(0).unwrap(), before_key);
+        assert_eq!(state.history().value_at(0).unwrap(), before_value);
+    }
+
+    #[test]
+    fn nonfinite_logits_leave_an_eager_bound_state_uncommitted() {
+        let mut catalog = TensorCatalog::new();
+        for recipe in tensor_recipes() {
+            let mut values = recipe.values();
+            if recipe.id == 21 {
+                values.fill(f32::MAX);
+            }
+            let tensor = Tensor::new(&recipe.role, recipe.shape, values).unwrap();
+            catalog.insert(recipe.role, tensor);
+        }
+        let model = TinyModel::from_catalog(TinyConfig::reference(), catalog).unwrap();
+        let layout = model.state_layout(16, 16).unwrap();
+        let mut state = model.new_sequence_state(layout).unwrap();
+        let identity = state.state_id();
+        let payload = state.accounted_payload_bytes();
+        let charge = state.accounted_charge_bytes();
+
+        assert_eq!(
+            model.forward_token(&mut state, 1).unwrap_err(),
+            RuntimeError::NonFinite("lm head")
+        );
+        assert_eq!(state.state_id(), identity);
+        assert_eq!(state.layout(), Some(layout));
+        assert_eq!(state.revision(), 0);
+        assert_eq!(state.len(), 0);
+        assert_eq!(state.accounted_payload_bytes(), payload);
+        assert_eq!(state.accounted_charge_bytes(), charge);
     }
 
     #[test]
@@ -1390,6 +1577,15 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("requires f32-le"), "{error}");
+
+        let mut version_three_expert = fixture_v3_artifact().manifest().clone();
+        version_three_expert.tensors[8].dtype = DType::F32Le;
+        let error =
+            TinyModel::from_verified_tensor_bytes(&version_three_expert, |_| -> Result<Vec<u8>> {
+                panic!("metadata rejection must precede tensor loading")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("requires bf16-le"), "{error}");
     }
 
     #[test]
@@ -1426,13 +1622,30 @@ mod tests {
             })
             .unwrap();
             let mut state = SequenceState::new();
-            let before = state.clone();
             assert!(matches!(
                 model.forward_token(&mut state, 1),
                 Err(RuntimeError::ExpertKernel { .. })
             ));
-            assert_eq!(state, before);
+            assert_eq!(state.state_id(), None);
+            assert_eq!(state.model_instance_id(), None);
+            assert_eq!(state.layout(), None);
+            assert_eq!(state.revision(), 0);
+            assert!(state.is_empty());
         }
+    }
+
+    #[test]
+    fn model_identities_are_nonzero_and_exhaust_instead_of_wrapping() {
+        let ids = CheckedModelIdCounter::new(u64::MAX);
+        assert_eq!(ids.next().unwrap(), u64::MAX);
+        assert_eq!(
+            ids.next().unwrap_err(),
+            RuntimeError::ModelIdentityExhausted
+        );
+        assert_eq!(
+            ids.next().unwrap_err(),
+            RuntimeError::ModelIdentityExhausted
+        );
     }
 
     #[test]

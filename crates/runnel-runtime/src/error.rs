@@ -26,6 +26,23 @@ pub enum RuntimeError {
     ContextLimit { limit: usize },
     #[error("sequence state belongs to a different model instance")]
     StateMismatch,
+    #[error("model instance identity space is exhausted")]
+    ModelIdentityExhausted,
+    #[error("invalid paged-state layout: {0}")]
+    InvalidStateLayout(&'static str),
+    #[error("paged-state identity space is exhausted")]
+    StateIdentityExhausted,
+    #[error("paged-state revision space is exhausted")]
+    StateRevisionExhausted,
+    #[error("expected state revision {expected}, found {actual}")]
+    StateRevisionMismatch { expected: u64, actual: u64 },
+    #[error("invalid paged state: {0}")]
+    InvalidState(&'static str),
+    #[error("resource exhausted while reserving {resource} ({bytes} bytes)")]
+    ResourceExhausted {
+        resource: &'static str,
+        bytes: usize,
+    },
     #[error("non-finite value produced by {0}")]
     NonFinite(&'static str),
     #[error(

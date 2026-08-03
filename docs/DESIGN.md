@@ -206,23 +206,23 @@ waiter owns only its waiter and prospective-lease reservations, so it may
 return after withdrawing them; any now-unwanted cache-owned physical load stays
 charged until its worker completion releases the page-pool reservation.
 
-The planned M5 scheduler contract is frozen in
-[ADR-0007](adr/0007-transactional-paged-scheduling.md). When implemented it
-uses request-owned SplitMix64 state, stable generation-tagged request slots, bounded queues,
-token-boundary equal-weight deficit service, and a pure step-able core beneath
-a thin bounded Tokio actor. Each token is prepared without mutation, grouped
-by expert with stable transaction identity, scattered and reduced in router
-rank order, then committed with RNG and output at one non-yielding boundary.
-Cancellation or expiry before that boundary publishes none of the three.
+The M5 scheduler contract is frozen in
+[ADR-0007](adr/0007-transactional-paged-scheduling.md) and is being implemented
+in independently testable vertical slices. The completed state slice supports
+adapter v3, checked request-bounded page layouts, eager fallible page
+allocation, nonwrapping model/state identities, and allocation-free K/V commit
+permits. Compatibility calls compute against an unpublished bound candidate,
+so a failed first token leaves the caller's unbound shell unchanged.
 
-Planned tiny adapter v3 retains the generated tiny equations and compact BF16
-experts but raises the frozen synthetic context cap to 1,024. Its token-major
-K/V state uses 16-token pages charged at full admitted capacity. Stable three-pass
+Tiny adapter v3 retains the generated tiny equations and compact BF16 experts
+but raises the frozen synthetic context cap to 1,024. Its token-major K/V state
+uses 16-token pages charged at full admitted capacity. Stable three-pass
 streaming attention allocates no score vector proportional to context. The
-fixture will exercise multi-page mechanics only. Adapter v3 remains unsupported
-until M5 implementation lands; versions 1 and 2 are the currently supported
-profiles in [the format contract](FORMAT.md). Weights remain eagerly resident
-in M5, so live cache-leased expert execution remains an explicit system gap.
+fixture and boundary tests exercise multi-page mechanics only; this is not a
+large-model performance claim. Continuous batching, expert-task transactions,
+RNG/output composition, and the bounded actor remain incomplete until the
+rest of M5 lands. Weights remain eagerly resident in M5, so live cache-leased
+expert execution remains an explicit system gap.
 
 ## Error model
 
