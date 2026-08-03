@@ -62,12 +62,31 @@ runtime-performance evidence.
 
 ## M4 — kernels and portability
 
-- [ ] A narrow C ABI provides runtime-dispatched AVX2 on this host while scalar
-  remains independently testable.
-- [ ] Sanitizer and differential tests cover alignment, tails, special values,
+- [x] Tiny adapter v2 retains compact BF16 expert matrices; a narrow C ABI
+  provides runtime-dispatched AVX2 while safe Rust scalar remains independently
+  testable and tiny v1 remains unchanged.
+- [x] Sanitizer and differential tests cover alignment, tails, special values,
   compact representation decoding, and unsupported ISA fallback.
-- [ ] Any speedup claim has warmups, repetitions, dispersion, machine metadata,
-  raw data, and token/logit parity.
+- [x] Append-only evidence retains paired warmups/repetitions, uncertainty,
+  machine metadata, raw data, and token/logit parity; any speedup claim meets
+  the preregistered cell-specific threshold.
+
+The accepted architecture, numerical bounds, sanitizer gate, fixed benchmark
+cells, and no-speedup fallback are frozen in
+[ADR-0006](adr/0006-bf16-avx2-expert-kernel.md). A favorable timing is not
+required to close M4.
+
+Evidence: [M4 review](reviews/M4_REVIEW.md),
+[green evidence CI](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30817508436),
+the accepted [experiment contract](../benchmarks/raw/m4-bf16-gemv-20260803/experiment.json),
+[five case rows](../benchmarks/raw/m4-bf16-gemv-20260803/cases.jsonl),
+[16 correctness rows](../benchmarks/raw/m4-bf16-gemv-20260803/correctness.jsonl),
+[780 timing rows](../benchmarks/raw/m4-bf16-gemv-20260803/observations.jsonl),
+and [generated summary](../benchmarks/raw/m4-bf16-gemv-20260803/summary.json).
+All thirteen cells completed 30 pairs and the two preregistered primary cells
+met the frozen general rule. Timing remains specific to fixed synthetic GEMV
+batches on the recorded shared host; favorable timing was not required to
+close the implementation, correctness, and custody gates.
 
 ## M5 — state and multi-request scheduling
 

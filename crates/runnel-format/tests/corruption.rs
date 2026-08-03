@@ -283,6 +283,57 @@ fn rejects_schema_extensions_and_invalid_adapter_invariants() {
 }
 
 #[test]
+fn adapter_versions_are_closed_independently_of_the_rmoa_version() {
+    let version_one = String::from_utf8(fixture().manifest).unwrap();
+    assert_eq!(
+        Manifest::parse(version_one.as_bytes())
+            .unwrap()
+            .adapter
+            .version,
+        1
+    );
+
+    let version_two = version_one.replacen(
+        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":1}",
+        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":2}",
+        1,
+    );
+    assert_eq!(
+        Manifest::parse(version_two.as_bytes())
+            .unwrap()
+            .adapter
+            .version,
+        2
+    );
+
+    let zero = version_one.replacen(
+        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":1}",
+        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":0}",
+        1,
+    );
+    assert!(matches!(
+        Manifest::parse(zero.as_bytes()),
+        Err(FormatError::Schema { ref path, .. }) if path == "$.adapter.version"
+    ));
+
+    let unsupported = version_one.replacen(
+        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":1}",
+        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":3}",
+        1,
+    );
+    assert!(matches!(
+        Manifest::parse(unsupported.as_bytes()),
+        Err(FormatError::Schema { ref path, .. }) if path == "$.adapter.version"
+    ));
+
+    let format_two = version_one.replacen("\"version\":1}\n", "\"version\":2}\n", 1);
+    assert!(matches!(
+        Manifest::parse(format_two.as_bytes()),
+        Err(FormatError::Schema { ref path, .. }) if path == "$.version"
+    ));
+}
+
+#[test]
 fn digest_parser_requires_exact_lowercase_sha256_form() {
     let digest = Digest::of(b"x");
     assert_eq!(digest.to_string().parse::<Digest>().unwrap(), digest);

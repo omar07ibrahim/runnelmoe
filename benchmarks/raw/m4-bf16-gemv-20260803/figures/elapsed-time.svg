@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="754" viewBox="0 0 1200 754" role="img" aria-labelledby="title desc">
+<title id="title">M4 median elapsed time</title>
+<desc id="desc">Median baseline and candidate batch elapsed times for every complete preregistered cell.</desc>
+<style>text{font-family:system-ui,sans-serif;fill:#18222d}.title{font-size:22px;font-weight:700}.label{font-size:13px}.small{font-size:11px;fill:#4c5967}.axis{stroke:#778493;stroke-width:1}.baseline{fill:#506d85}.candidate{fill:#d26a3f}.interval{stroke:#202b36;stroke-width:2}.incomplete{fill:#8b949e}</style>
+<text class="title" x="30" y="34">Median batch elapsed time by implementation</text>
+<text class="small" x="30" y="56">Absolute times are cell-specific shared-host measurements; bar lengths are not comparable workloads</text>
+<text class="label" x="30" y="96">avx-natural-tail</text>
+<rect class="baseline" x="350.00" y="82" width="727.84" height="12"/>
+<rect class="candidate" x="350.00" y="98" width="95.47" height="12"/>
+<text class="label" x="30" y="144">avx-natural-l2</text>
+<rect class="baseline" x="350.00" y="130" width="704.96" height="12"/>
+<rect class="candidate" x="350.00" y="146" width="75.05" height="12"/>
+<text class="label" x="30" y="192">avx-natural-llc</text>
+<rect class="baseline" x="350.00" y="178" width="726.57" height="12"/>
+<rect class="candidate" x="350.00" y="194" width="92.89" height="12"/>
+<text class="label" x="30" y="240">avx-natural-stream-expand</text>
+<rect class="baseline" x="350.00" y="226" width="730.10" height="12"/>
+<rect class="candidate" x="350.00" y="242" width="129.36" height="12"/>
+<text class="label" x="30" y="288">avx-natural-stream-contract</text>
+<rect class="baseline" x="350.00" y="274" width="730.45" height="12"/>
+<rect class="candidate" x="350.00" y="290" width="134.44" height="12"/>
+<text class="label" x="30" y="336">avx-offset-tail</text>
+<rect class="baseline" x="350.00" y="322" width="703.32" height="12"/>
+<rect class="candidate" x="350.00" y="338" width="72.84" height="12"/>
+<text class="label" x="30" y="384">avx-offset-stream-expand</text>
+<rect class="baseline" x="350.00" y="370" width="727.16" height="12"/>
+<rect class="candidate" x="350.00" y="386" width="130.96" height="12"/>
+<text class="label" x="30" y="432">avx-offset-stream-contract</text>
+<rect class="baseline" x="350.00" y="418" width="726.07" height="12"/>
+<rect class="candidate" x="350.00" y="434" width="127.75" height="12"/>
+<text class="label" x="30" y="480">avx-two-worker-stream-expand</text>
+<rect class="baseline" x="350.00" y="466" width="756.66" height="12"/>
+<rect class="candidate" x="350.00" y="482" width="133.37" height="12"/>
+<text class="label" x="30" y="528">avx-two-worker-stream-contract</text>
+<rect class="baseline" x="350.00" y="514" width="749.89" height="12"/>
+<rect class="candidate" x="350.00" y="530" width="136.24" height="12"/>
+<text class="label" x="30" y="576">staged-natural-llc</text>
+<rect class="baseline" x="350.00" y="562" width="730.70" height="12"/>
+<rect class="candidate" x="350.00" y="578" width="736.26" height="12"/>
+<text class="label" x="30" y="624">staged-natural-stream-expand</text>
+<rect class="baseline" x="350.00" y="610" width="719.25" height="12"/>
+<rect class="candidate" x="350.00" y="626" width="750.73" height="12"/>
+<text class="label" x="30" y="672">staged-natural-stream-contract</text>
+<rect class="baseline" x="350.00" y="658" width="743.11" height="12"/>
+<rect class="candidate" x="350.00" y="674" width="790.00" height="12"/>
+<text class="small" x="30" y="746">Source: summary.json regenerated from observations.jsonl · blue baseline · orange candidate</text>
+</svg>

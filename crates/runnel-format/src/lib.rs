@@ -1,16 +1,15 @@
-//! Strict RMOA v1 parsing and byte verification for the tiny M1 adapter.
+//! Strict RMOA v1 parsing and byte verification for supported tiny adapters.
 //!
 //! The crate accepts only the ASCII schema subset used by M1, for which its
 //! canonical writer is exactly the RFC 8785 representation. It rejects
 //! duplicate keys, null, floating point numbers, non-canonical bytes, unsafe
 //! integer arithmetic, malformed tables, and every unverified object/page.
 //!
-//! M1 intentionally uses an independently budgeted eager loader for tiny CI
-//! artifacts. M2 will add bounded asynchronous reads and Linux descriptor-
-//! relative `openat2`/portable `openat` traversal, no-replace CAS publication,
-//! cancellation, deadlines, reserve-aware disk preflight, and orphan GC. Those
-//! filesystem controls are not claimed here; byte-level validation is complete
-//! before this crate exposes tensor slices.
+//! Tiny CI artifacts may use the independently budgeted eager loader. The M2
+//! data plane adds bounded asynchronous reads and Linux descriptor-relative
+//! traversal, no-replace CAS publication, cancellation, deadlines,
+//! reserve-aware disk preflight, and orphan GC. Byte-level validation is
+//! complete before this crate exposes tensor slices.
 
 #![forbid(unsafe_code)]
 

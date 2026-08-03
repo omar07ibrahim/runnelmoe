@@ -111,3 +111,69 @@ objects, including 432 deterministic 10,000-resample intervals, with no
 mismatch. These are deterministic synthetic modeled-traffic results. They
 measure no storage latency, overlap, throughput, TTFT, or production-policy
 effect.
+
+## M4 compact-BF16 GEMV evidence
+
+`raw/m4-bf16-gemv-20260803/` is the accepted schema-v1 record for the
+compact-BF16 adapter and kernel study. It contains the frozen
+[experiment contract](raw/m4-bf16-gemv-20260803/experiment.json),
+[allowlisted environment](raw/m4-bf16-gemv-20260803/environment.json),
+[five fixture cases](raw/m4-bf16-gemv-20260803/cases.jsonl),
+[16 correctness checks](raw/m4-bf16-gemv-20260803/correctness.jsonl),
+[780 unaggregated timing rows](raw/m4-bf16-gemv-20260803/observations.jsonl),
+and [generated summary](raw/m4-bf16-gemv-20260803/summary.json). The generated
+figures show [median batch elapsed times](raw/m4-bf16-gemv-20260803/figures/elapsed-time.svg)
+and [paired candidate/scalar ratios](raw/m4-bf16-gemv-20260803/figures/paired-ratios.svg).
+The summary, not the figures, is authoritative.
+
+All thirteen cells completed 30 paired repetitions without an unsuccessful,
+unsupported, censored, or missing timing row. Thirteen kernel checks and three
+complete-model checks passed before timing. Tiny-v1 preservation and tiny-v2
+scalar/forced-AVX2 paths retained exact selected experts and tokens and passed
+the declared router-score, route-weight, and logit tolerances against the
+independent goldens.
+
+The preregistered primary result is deliberately narrow:
+
+| Natural one-thread cell | Median paired AVX2/scalar batch-time ratio | Unadjusted 95% paired-bootstrap interval |
+| --- | ---: | ---: |
+| streaming expand, `8,192 x 2,048` | 0.176712 | `[0.175869, 0.178408]` |
+| streaming contract, `2,048 x 8,192` | 0.183190 | `[0.176564, 0.188793]` |
+
+Both observed medians are below the frozen 0.95 threshold and both interval
+upper bounds are below one, so the conjunction satisfies the preregistered
+general rule. The rule does not provide a confidence-bounded minimum 5%
+effect. Cells are not pooled, intervals are unadjusted, and no omnibus result
+is permitted.
+
+The secondary safe-Rust staging diagnostic was unfavorable in this capture:
+candidate/scalar-BF16 medians were 1.008619 for LLC, 1.043614 for streaming
+expand, and 1.058083 for streaming contract, with all three intervals above
+one. This includes the widening pass and a simultaneous source-plus-scratch
+footprint three times the BF16 source; it is not a universal storage-strategy
+result. Offset and two-worker cells remain exploratory diagnostics only.
+
+The clean measured implementation commit is
+`035d217baf0901809fa02bf0a5c11c1a490198c2`; the evidence publication commit
+is `ae69481def4b320ff619090ce7793ef3d65ace33`. The canonical commands are:
+
+```console
+python3 scripts/run_m4_experiment.py capture \
+  --build-root /dev/shm \
+  --output benchmarks/raw/m4-bf16-gemv-20260803 \
+  --commit 035d217baf0901809fa02bf0a5c11c1a490198c2
+
+python3 scripts/run_m4_experiment.py verify \
+  --input benchmarks/raw/m4-bf16-gemv-20260803 --check
+```
+
+The verifier recreates `summary.json` and both SVGs byte-for-byte from the raw
+rows. The recorded four-vCPU shared VM was busy: its one-, five-, and
+fifteen-minute load averages were 3.88, 3.76, and 11.28, frequency/governor
+data were unavailable, and swap was nearly exhausted. Balanced paired order,
+fixed CPU affinity, raw context-switch counts, zero timed major faults, stable
+MXCSR, and full-row retention make the run auditable, but the interval
+describes within-run paired resampling rather than run-to-run or host-to-host
+uncertainty. These measurements are fixed synthetic kernel batches, not
+end-to-end inference, token throughput, TTFT, storage I/O, hardware bandwidth,
+arbitrary-model, other-ISA, or multi-NUMA evidence.

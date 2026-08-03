@@ -13,6 +13,7 @@ class TensorSpec:
     tensor_id: int
     role: str
     shape: tuple[int, ...]
+    storage_dtype: str
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,10 @@ class FixtureSpec:
     def recipe(self) -> dict[str, Any]:
         return self.raw["tensor_recipe"]
 
+    @property
+    def fixture_version(self) -> int:
+        return self.raw["fixture_version"]
+
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
@@ -47,20 +52,38 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
 
     spec_path = Path(path)
     raw = json.loads(spec_path.read_text(encoding="utf-8"))
-    _require(raw.get("fixture_version") == 1, "fixture_version must be 1")
+    fixture_version = raw.get("fixture_version")
+    _require(
+        isinstance(fixture_version, int)
+        and not isinstance(fixture_version, bool)
+        and fixture_version in {1, 2},
+        "fixture_version must be 1 or 2",
+    )
+
+    expected_identity = f"runnel-tiny-causal-moe-v{fixture_version}"
+    _require(raw.get("identity") == expected_identity, "fixture identity is not canonical")
 
     artifact = raw.get("artifact")
     _require(isinstance(artifact, dict), "artifact must be an object")
-    _require(
-        artifact
-        == {
+    expected_artifacts = {
+        1: {
             "artifact_id": "sha256:e49321cefc980ab59cd449341edfc624ccfc4b0b703cd175184e056d296d9ed3",
             "object_digest": "sha256:6b2b8a1bbb2854084b1e1fe1e5787a9cfdb021b397e774fc7dbef79ac9d24bf6",
             "object_length": 7904,
             "page_table_digest": "sha256:29383b56a150f9e5705f3666ca7707f21bc3fbd663ffd7249f4ecb938da6a62d",
             "page_table_length": 96,
         },
-        "artifact identity differs from tiny-v1",
+        2: {
+            "artifact_id": "sha256:606baa0c1082b369632b5dd000d30dc51ae20321b2c032ef3395aaa0bfd7c76c",
+            "object_digest": "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab",
+            "object_length": 5600,
+            "page_table_digest": "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
+            "page_table_length": 96,
+        },
+    }
+    _require(
+        artifact == expected_artifacts[fixture_version],
+        f"artifact identity differs from tiny-v{fixture_version}",
     )
 
     model = raw.get("model")
@@ -75,11 +98,30 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
         "top_k": 2,
         "vocab_size": 32,
     }
-    _require(model == expected_model, "model dimensions differ from tiny-v1")
+    _require(
+        model == expected_model,
+        f"model dimensions differ from tiny-v{fixture_version}",
+    )
 
     numeric = raw.get("numeric")
     _require(isinstance(numeric, dict), "numeric must be an object")
     _require(numeric.get("dtype") == "float32", "only float32 is supported")
+    if fixture_version == 1:
+        _require(
+            "expert_storage_dtype" not in numeric
+            and "expert_storage_conversion" not in numeric,
+            "tiny-v1 must not declare compact expert storage",
+        )
+    else:
+        _require(
+            numeric.get("expert_storage_dtype") == "bfloat16",
+            "tiny-v2 expert storage dtype must be bfloat16",
+        )
+        _require(
+            numeric.get("expert_storage_conversion")
+            == "float32-to-bfloat16-rne-to-float32",
+            "tiny-v2 expert conversion must be the frozen BF16 round trip",
+        )
     _require(
         numeric.get("rms_norm_epsilon_power_of_two") == -12,
         "RMS epsilon must be 2^-12",
@@ -135,6 +177,13 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
     tensors: list[TensorSpec] = []
     for expected_id, item in enumerate(tensors_raw):
         _require(isinstance(item, dict), f"tensor {expected_id} must be an object")
+        expected_keys = {"id", "role", "shape"}
+        if fixture_version == 2:
+            expected_keys.add("dtype")
+        _require(
+            set(item) == expected_keys,
+            f"tensor {expected_id} keys differ from tiny-v{fixture_version}",
+        )
         _require(item.get("id") == expected_id, "tensor IDs must be contiguous")
         role = item.get("role")
         shape = item.get("shape")
@@ -145,11 +194,23 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
             and all(isinstance(dim, int) and dim > 0 for dim in shape),
             f"tensor {expected_id} has an invalid shape",
         )
-        tensors.append(TensorSpec(expected_id, role, tuple(shape)))
-    _require(len(tensors) == 22, "tiny-v1 requires exactly 22 tensors")
+        storage_dtype = item.get("dtype", "f32-le")
+        expected_dtype = "bf16-le" if fixture_version == 2 and 8 <= expected_id <= 19 else "f32-le"
+        _require(
+            storage_dtype == expected_dtype,
+            f"tensor {expected_id} storage dtype differs from tiny-v{fixture_version}",
+        )
+        tensors.append(TensorSpec(expected_id, role, tuple(shape), storage_dtype))
+    _require(
+        len(tensors) == 22,
+        f"tiny-v{fixture_version} requires exactly 22 tensors",
+    )
     _require(len({tensor.role for tensor in tensors}) == 22, "tensor roles must be unique")
     actual_tensors = [(tensor.role, tensor.shape) for tensor in tensors]
-    _require(actual_tensors == expected_tensors, "tensor role or shape table differs from tiny-v1")
+    _require(
+        actual_tensors == expected_tensors,
+        f"tensor role or shape table differs from tiny-v{fixture_version}",
+    )
 
     tokenizer = raw.get("tokenizer")
     expected_tokens = [
@@ -162,7 +223,10 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
         "?",
     ]
     _require(isinstance(tokenizer, dict), "tokenizer must be an object")
-    _require(tokenizer.get("tokens") == expected_tokens, "token table differs from tiny-v1")
+    _require(
+        tokenizer.get("tokens") == expected_tokens,
+        f"token table differs from tiny-v{fixture_version}",
+    )
     _require(tokenizer.get("encode_prepends_bos") is True, "encoder must prepend BOS")
     _require(tokenizer.get("eos_token_id") == 0, "EOS ID must be 0")
     _require(tokenizer.get("bos_token_id") == 1, "BOS ID must be 1")

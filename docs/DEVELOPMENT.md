@@ -193,3 +193,56 @@ routes and digest, then records the 18 policy/capacity observations. It checks
 clean HEAD, the historical harness blob, and the executable hash again before
 atomic publication. The resulting intervals are unadjusted exploratory
 per-cell descriptions and support no omnibus “any policy wins” claim.
+
+## M4 compact-BF16 kernel verification
+
+M4 adds a native object only for a native Linux x86-64 GNU build. The safe
+scalar backend remains available with default features disabled. No command
+downloads a model; both adapter fixtures are formula-generated. Run the disk
+guard before compiling, then use:
+
+```console
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+cargo test --workspace --all-targets --locked --offline
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --offline
+cargo clippy -p runnel-kernels --all-targets --no-default-features --locked --offline -- -D warnings
+cargo test -p runnel-kernels --all-targets --no-default-features --locked --offline
+cargo clippy -p runnel-runtime --all-targets --no-default-features --locked --offline -- -D warnings
+cargo test -p runnel-runtime --all-targets --no-default-features --locked --offline
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s oracle/tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_run_m4_experiment -v
+cargo run --locked --offline -p runnel --bin runnel-m4-model-check
+```
+
+CI additionally compiles and runs the direct C ABI harness under AddressSanitizer
+and UndefinedBehaviorSanitizer, checks scalar-only Rust targets for native
+objects, and verifies that the default-feature AArch64 cross target stays
+scalar-only. The model-check command emits correctness JSONL; it is not a
+timing benchmark.
+
+### Capture and verify the M4 kernel matrix
+
+Capture requires clean `HEAD`, a Linux tmpfs build root, at least 2 GiB plus
+the evidence reserve free there, and at least 32 MiB free on the repository
+filesystem. It creates a private two-job, locked/offline, nonincremental
+release build and refuses caller-supplied binaries:
+
+```console
+python3 scripts/run_m4_experiment.py capture \
+  --build-root /dev/shm \
+  --output benchmarks/raw/m4-bf16-gemv-YYYYMMDD \
+  --commit <full-40-character-HEAD>
+
+python3 scripts/run_m4_experiment.py verify \
+  --input benchmarks/raw/m4-bf16-gemv-YYYYMMDD --check
+```
+
+The accepted record is `benchmarks/raw/m4-bf16-gemv-20260803/`. It was
+captured from clean implementation commit
+`035d217baf0901809fa02bf0a5c11c1a490198c2` and published in commit
+`ae69481def4b320ff619090ce7793ef3d65ace33`. Its exact command, hashes,
+independent reviews, host caveats, and claim boundaries are in the
+[M4 review](reviews/M4_REVIEW.md). CI byte-regenerates the summary and both
+figures. Preserve the implementation commit with a merge commit; squashing or
+rebasing would break historical harness custody.

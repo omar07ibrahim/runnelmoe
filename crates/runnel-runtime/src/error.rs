@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use runnel_kernels::{BackendRequest, KernelError};
+
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
 #[derive(Debug, Error, PartialEq)]
@@ -26,4 +28,23 @@ pub enum RuntimeError {
     StateMismatch,
     #[error("non-finite value produced by {0}")]
     NonFinite(&'static str),
+    #[error(
+        "expert backend request {request:?} is incompatible with adapter version {adapter_version}"
+    )]
+    BackendIncompatibleWithAdapter {
+        adapter_version: u64,
+        request: BackendRequest,
+    },
+    #[error("BF16 tensor {role} is invalid: {source}")]
+    InvalidBf16Tensor {
+        role: String,
+        #[source]
+        source: KernelError,
+    },
+    #[error("expert kernel failed during {operation}: {source}")]
+    ExpertKernel {
+        operation: &'static str,
+        #[source]
+        source: KernelError,
+    },
 }

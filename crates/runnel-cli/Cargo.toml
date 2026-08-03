@@ -12,10 +12,15 @@ repository.workspace = true
 name = "runnel"
 path = "src/main.rs"
 
+[[bin]]
+name = "runnel-m4-model-check"
+path = "src/bin/runnel-m4-model-check.rs"
+
 [dependencies]
 clap.workspace = true
 runnel-fixture = { path = "../runnel-fixture" }
 runnel-format = { path = "../runnel-format" }
+runnel-kernels = { path = "../runnel-kernels", default-features = false }
 runnel-runtime = { path = "../runnel-runtime" }
 runnel-store = { path = "../runnel-store" }
 serde.workspace = true

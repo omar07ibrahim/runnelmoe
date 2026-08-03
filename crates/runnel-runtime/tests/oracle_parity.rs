@@ -2,7 +2,8 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use runnel_fixture::FixtureArtifact;
 use runnel_format::{Artifact, Limits};
-use runnel_runtime::{TinyModel, TinyTokenizer};
+use runnel_kernels::Capabilities;
+use runnel_runtime::{BackendRequest, TinyModel, TinyTokenizer};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -71,23 +72,24 @@ struct ArtifactGolden {
     page_table_length: u64,
 }
 
-fn fixture_path(filename: &str) -> PathBuf {
+fn fixture_path(directory: &str, filename: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/tiny")
+        .join("../../fixtures")
+        .join(directory)
         .join(filename)
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(filename: &str) -> T {
-    let bytes = fs::read(fixture_path(filename)).unwrap();
+fn read_json<T: for<'de> Deserialize<'de>>(directory: &str, filename: &str) -> T {
+    let bytes = fs::read(fixture_path(directory, filename)).unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
-fn fixture_model() -> TinyModel {
+fn fixture_model(fixture: &FixtureArtifact, request: BackendRequest) -> TinyModel {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("rmoa");
-    FixtureArtifact::build().write_new(&root).unwrap();
+    fixture.write_new(&root).unwrap();
     let artifact = Artifact::open(root, Limits::default()).unwrap();
-    TinyModel::from_artifact(&artifact).unwrap()
+    TinyModel::from_artifact_with_backend(&artifact, request).unwrap()
 }
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: &Comparison, label: &str) {
@@ -102,13 +104,16 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: &Comparison, label:
     }
 }
 
-#[test]
-fn scalar_runtime_matches_committed_pytorch_oracle() {
-    let tokens: TokenGolden = read_json("golden_tokens.json");
-    let routes: RoutesGolden = read_json("golden_routes.json");
-    let logits: LogitsGolden = read_json("golden_logits.json");
-    let metadata: MetadataGolden = read_json("golden_metadata.json");
-    let identity = FixtureArtifact::build().identity();
+fn assert_runtime_matches_committed_oracle(
+    directory: &str,
+    fixture: &FixtureArtifact,
+    request: BackendRequest,
+) {
+    let tokens: TokenGolden = read_json(directory, "golden_tokens.json");
+    let routes: RoutesGolden = read_json(directory, "golden_routes.json");
+    let logits: LogitsGolden = read_json(directory, "golden_logits.json");
+    let metadata: MetadataGolden = read_json(directory, "golden_metadata.json");
+    let identity = fixture.identity();
     assert_eq!(
         identity.artifact_id.to_string(),
         metadata.artifact.artifact_id
@@ -126,7 +131,7 @@ fn scalar_runtime_matches_committed_pytorch_oracle() {
         identity.page_table_length,
         metadata.artifact.page_table_length
     );
-    let model = fixture_model();
+    let model = fixture_model(fixture, request);
 
     assert_eq!(
         TinyTokenizer.encode(&tokens.prompt).unwrap(),
@@ -198,4 +203,34 @@ fn scalar_runtime_matches_committed_pytorch_oracle() {
         }
         assert_eq!(selected as u32, expected.next_token_id);
     }
+}
+
+#[test]
+fn scalar_v1_runtime_matches_committed_pytorch_oracle() {
+    assert_runtime_matches_committed_oracle(
+        "tiny",
+        &FixtureArtifact::build(),
+        BackendRequest::Auto,
+    );
+}
+
+#[test]
+fn scalar_v2_runtime_matches_committed_bf16_pytorch_oracle() {
+    assert_runtime_matches_committed_oracle(
+        "tiny-v2",
+        &FixtureArtifact::build_v2(),
+        BackendRequest::Scalar,
+    );
+}
+
+#[test]
+fn avx2_v2_runtime_matches_committed_bf16_pytorch_oracle_when_available() {
+    if !Capabilities::detected().avx2_available() {
+        return;
+    }
+    assert_runtime_matches_committed_oracle(
+        "tiny-v2",
+        &FixtureArtifact::build_v2(),
+        BackendRequest::Avx2,
+    );
 }

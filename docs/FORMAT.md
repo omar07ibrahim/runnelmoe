@@ -7,7 +7,8 @@ Implementation status matters: M1 implements the canonical manifest schema,
 limits, eager memory budget, whole-object/page-table/page verification, and a
 small local-filesystem convenience reader. M2 implements the separate internal
 CAS, descriptor-safe bounded reads, resumable publication, asynchronous
-dispatch, and verified page cache described below.
+dispatch, and verified page cache described below. M4 adds the second version
+of the tiny executable adapter without changing this version-1 container.
 
 ## Layout and identity
 
@@ -67,11 +68,13 @@ Adapter/tokenizer versions and vocabulary size are positive. Their IDs match
 most 128 unique ASCII identifier keys and unsigned-integer values. An adapter
 must reject unknown, missing, zero, inconsistent, or over-limit dimensions.
 
-The M1 adapter ID is `runnel.tiny-causal-moe`, version 1. Its model map has
-exactly `context_length`, `expert_hidden_size`, `hidden_size`,
-`num_experts`, `num_heads`, `num_layers`, `top_k`, and `vocab_size`.
-All are positive; `top_k <= num_experts`,
-`hidden_size % num_heads == 0`, and both vocabulary values are equal.
+The supported adapter ID is `runnel.tiny-causal-moe`, versions 1 and 2. Both
+versions have a model map containing exactly `context_length`,
+`expert_hidden_size`, `hidden_size`, `num_experts`, `num_heads`, `num_layers`,
+`top_k`, and `vocab_size`. All are positive; `top_k <= num_experts`,
+`hidden_size % num_heads == 0`, and both vocabulary values are equal. Both
+versions use the frozen tiny topology: context length 16, expert width 12,
+hidden width 8, four experts, two heads, one layer, top two, and vocabulary 32.
 
 ## Object records and page tables
 
@@ -129,8 +132,37 @@ the checked product of dimensions and dtype width. Roles match
 
 Every tensor range fits its object. Ranges in one object do not overlap and,
 when sorted by offset, cover bytes 0 through object length exactly with no
-gaps, padding, aliases, or trailing data. Version 1 has no compression,
+gaps, padding, aliases, or trailing data. RMOA version 1 has no compression,
 implicit strides, executable metadata, remote URLs, or quantization metadata.
+
+### Tiny-adapter dtype profiles
+
+The executable adapter validates its complete 22-role catalog after structural
+RMOA validation. Adapter version 1 requires every tensor to be `f32-le`.
+Adapter version 2 changes only these twelve routed-expert matrices to
+`bf16-le`:
+
+```text
+layers.0.experts.{0,1,2,3}.{gate,up,down}
+```
+
+Token embeddings, attention matrices, normalization weights, the router,
+final normalization, and the LM head remain `f32-le`. A dtype in the wrong
+role or adapter version is rejected before executable model state is exposed.
+The byte-format reader remains responsible for the generic dtype width,
+alignment, range, and coverage invariants; this adapter-specific catalog check
+is deliberately performed at the adapter boundary.
+
+A BF16 element is one little-endian unsigned 16-bit word. Its exact widening
+is `f32_bits = u32(bf16_bits) << 16`. The adapter rejects every NaN and infinity
+encoding before compute, while preserving signed zeros, finite subnormals, and
+all other finite encodings. Fixture generation converts finite source values
+with round-to-nearest, ties-to-even.
+
+The deterministic conformance fixture has one 7,904-byte object in adapter v1
+and one 5,600-byte object in adapter v2. The v2 expert payload is 2,304 bytes
+rather than 4,608; no padding is inserted. These are generated storage
+identities, not runtime-performance measurements.
 
 ## Format ceilings and operational defaults
 

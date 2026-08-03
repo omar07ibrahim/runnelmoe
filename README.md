@@ -7,9 +7,12 @@ storage, bounded memory, asynchronous I/O, cache policy, numerical parity,
 request scheduling, and honest measurement.
 
 > Project status: M0 design/provenance, the M1 tiny-reference runtime, the M2
-> verified out-of-core data plane, and M3 cache-policy research have passed
-> their milestone gates. M3 closes a synthetic modeled-traffic gate, not a
-> runtime speedup gate; it makes no production-policy recommendation.
+> verified out-of-core data plane, M3 cache-policy research, and the M4
+> compact-BF16/AVX2 kernel have passed their milestone gates. M3 closes a
+> synthetic modeled-traffic gate, not a runtime speedup gate. M4 verifies one
+> narrow kernel and tiny adapter, with timing limited to fixed synthetic GEMV
+> batches on one recorded host; neither milestone is an end-to-end inference
+> speedup claim.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling
@@ -55,6 +58,20 @@ one, and 22 above one. The workload-sensitive
 M2 cache remains independently testable and is not silently replaced by a
 research policy.
 
+M4 adds a 5,600-byte adapter-v2 synthetic object whose twelve routed-expert
+matrices remain compact BF16, an independently callable safe-Rust scalar
+reference, and one runtime-dispatched C AVX2 GEMV behind a small validated ABI.
+Scalar and forced-AVX2 tiny-model paths preserve selected expert IDs and tokens
+exactly and pass the declared router-score, route-weight, and logit tolerances
+against independently generated PyTorch vectors. On the recorded AMD EPYC
+7R13 VM, the two preregistered one-thread streaming cells had AVX2/scalar
+paired median batch-time ratios of
+0.1767 and 0.1832, with both unadjusted 95% bootstrap intervals below one.
+These fixed synthetic results satisfy the preregistered M4 rule; they do not
+measure token throughput, serving latency, storage I/O, or other hardware.
+See the [raw summary](benchmarks/raw/m4-bf16-gemv-20260803/summary.json) and
+[M4 review](docs/reviews/M4_REVIEW.md).
+
 Run the complete artifact-to-token demo after fetching the locked Rust
 dependencies once:
 
@@ -90,12 +107,24 @@ a deterministic functional smoke test, not the 30-seed accepted experiment or
 a timing benchmark. Cache-policy semantics are frozen in
 [ADR-0005](docs/adr/0005-cache-policy-research.md).
 
+Emit the M4 tiny-model correctness ledger:
+
+```console
+cargo run --locked -p runnel --bin runnel-m4-model-check
+```
+
+This produces three JSONL correctness records for tiny-v1 preservation and
+tiny-v2 scalar/AVX2 execution. It is not a timing benchmark. The accepted
+AVX2 record is typed `unsupported` on a host without that ISA. The accepted
+performance procedure is frozen in
+[ADR-0006](docs/adr/0006-bf16-avx2-expert-kernel.md).
+
 ## Architecture contract
 
-- Rust owns parsing, verified storage/cache, and the scalar reference runtime;
-  later milestones add scheduling, optimized kernels, and serving.
-- A narrow C ABI will contain measured SIMD kernels; scalar Rust will stay the
-  correctness baseline.
+- Rust owns parsing, verified storage/cache, the scalar reference runtime, and
+  dispatch; later milestones add multi-request scheduling and serving.
+- A narrow C ABI contains the measured AVX2 GEMV; scalar Rust remains the
+  independently callable correctness baseline.
 - Python/PyTorch is used only as an independently structured oracle, golden
   vector generator, and analysis environment.
 - CI and demos will use tiny generated data. No proprietary or multi-gigabyte

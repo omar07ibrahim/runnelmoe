@@ -1,0 +1,31 @@
+[package]
+name = "runnel-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Auditable compact BF16 expert kernels for RunnelMoE"
+build = "build.rs"
+
+[features]
+default = ["native-avx2"]
+native-avx2 = []
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[[bin]]
+name = "runnel-kernel-bench"
+path = "src/bin/runnel-kernel-bench.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

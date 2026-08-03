@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from .runnel_oracle import TinyMoEOracle, TinyTokenizer, load_fixture_spec
+from .runnel_oracle import TinyMoEOracle, TinyTokenizer, formula_tensor, load_fixture_spec
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +145,36 @@ def build_vectors(spec_path: Path) -> dict[str, dict[str, Any]]:
             "text": "abcdefghijklmnopqrstuvwxyz .,?",
         },
     }
+    if spec.fixture_version == 2:
+        bf16_tensors = [tensor for tensor in spec.tensors if tensor.storage_dtype == "bf16-le"]
+        f32_tensors = [tensor for tensor in spec.tensors if tensor.storage_dtype == "f32-le"]
+        changed_elements = 0
+        for tensor in bf16_tensors:
+            source = formula_tensor(spec, tensor)
+            changed_elements += int(
+                torch.count_nonzero(source != model.weights[tensor.role]).item()
+            )
+        bf16_elements = sum(math.prod(tensor.shape) for tensor in bf16_tensors)
+        f32_elements = sum(math.prod(tensor.shape) for tensor in f32_tensors)
+        metadata["adapter"] = {
+            "id": "runnel.tiny-causal-moe",
+            "version": 2,
+        }
+        metadata["oracle"]["expert_storage_dtype"] = "bfloat16"
+        metadata["oracle"]["expert_storage_round_trip"] = (
+            "float32-to-bfloat16-rne-to-float32"
+        )
+        metadata["storage"] = {
+            "bf16_expert_bytes": bf16_elements * 2,
+            "bf16_expert_elements": bf16_elements,
+            "bf16_expert_tensor_count": len(bf16_tensors),
+            "f32_nonexpert_bytes": f32_elements * 4,
+            "f32_nonexpert_elements": f32_elements,
+            "f32_nonexpert_tensor_count": len(f32_tensors),
+            "round_trip_changed_elements": changed_elements,
+            "rounding": "round-to-nearest-ties-to-even",
+            "widening": "exact-bf16-to-float32",
+        }
     return {
         "golden_logits.json": logits,
         "golden_metadata.json": metadata,
