@@ -80,6 +80,8 @@ nor any M5 command downloads model weights.
 `DecoderAdapter` trait owns these associated types and phases:
 
 ```text
+vocabulary_size() -> fixed token count
+is_stop_token(token) -> terminal policy
 state_layout(limits, page_tokens) -> StateLayout
 new_state(layout) -> State
 prepare_token(state, token, workspace) -> PreparedToken
@@ -88,13 +90,19 @@ execute_expert(task, workspace) -> ExpertContribution
 finish_token(prepared, contributions, workspace) -> PendingStateCommit
 pending_logits(pending) -> logits
 with_validated_state_commit(state, pending, scoped_apply) -> result
-apply_state_commit(permit) -> committed position
+apply_state_commit(permit)
 ```
 
 `TinyModel` implements the trait. Existing `forward_token`, `run_tokens`, and
 `generate_greedy` remain compatibility compositions of the same phases, so
 the original public path and scheduler path cannot silently acquire different
-model equations.
+model equations. The trait is an externally implementable, trusted extension
+boundary: implementations own model work, identities, and permits, while the
+scheduler validates every observable envelope. Adapter identities have a
+checked public constructor and are validation tags rather than capabilities.
+Their fields remain private; conforming adapters keep the tag binding inside
+model-derived payloads opaque, and the scheduler never treats possession of a
+tag as authorization.
 
 `PreparedToken` is immutable and contains the pending key/value vectors,
 normalized expert input, stable router result, model identity, state identity,
@@ -129,7 +137,9 @@ single-use `StateCommitPermit` holding exclusive state access. The callback's
 result cannot depend on the fresh permit lifetime, so safe code cannot return
 the permit in a future or retain it across an outer asynchronous yield.
 Adapter `apply_state_commit` is allocation-free, has no public error path, and
-only copies into already validated slices before updating revision.
+only copies into already validated slices before updating revision. It returns
+no position or status that a caller could discover was inconsistent only after
+the state linearization point.
 
 The scheduler separately validates control state, sampler preview, output
 reservation, and request phase before entering the scoped callback. Inside the
@@ -359,6 +369,13 @@ Greedy
 Sample { seed: u64, temperature: finite f32 > 0,
          top_k: 1..=vocab_size, top_p: finite f32 in (0, 1] }
 ```
+
+The reusable sampling workspace has one target-stable 32-byte candidate slot
+per vocabulary item. Its checked preallocation contract is
+`payload = vocab_size * 32` and `charge = round_up(payload, 64)`; multiplication,
+rounding, and the host `isize::MAX` allocation bound are validated without
+allocating. The workspace reserves exactly that candidate count once and does
+not grow during preview.
 
 Greedy chooses the lowest token ID at the greatest finite logit and does not
 advance RNG. Sampled candidates are ordered by descending scaled logit then

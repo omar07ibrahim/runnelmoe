@@ -10,8 +10,7 @@ use runnel_kernels::{
 };
 
 use crate::{
-    DecoderAdapter, EOS_TOKEN, Result, RuntimeError, StateLayout, Tensor, TensorCatalog,
-    state::SequenceState,
+    DecoderAdapter, Result, RuntimeError, StateLayout, Tensor, TensorCatalog, state::SequenceState,
 };
 
 #[cfg(test)]
@@ -873,7 +872,7 @@ impl TinyModel {
             let last = steps.last().ok_or(RuntimeError::EmptySequence)?;
             let next = greedy_token(&last.logits)?;
             generated_tokens.push(next);
-            if next == EOS_TOKEN || index + 1 == max_new_tokens {
+            if <Self as DecoderAdapter>::is_stop_token(self, next) || index + 1 == max_new_tokens {
                 break;
             }
             steps.push(self.forward_token_bound(&mut state, next, &mut workspace)?);

@@ -232,16 +232,24 @@ fixture and boundary tests exercise multi-page mechanics only; this is not a
 large-model performance claim. A fallibly preallocated Rust sampler now
 implements the frozen SplitMix64/top-k/top-p arithmetic and is checked against
 an independently generated Python vector set; preview does not publish RNG
-state. The sealed `DecoderAdapter` now splits token work into prepare, owned
-expert tasks, validated contributions, deterministic rank-order finish, and a
-single-use state commit. Complete model/state/revision/position/transaction
-identity follows every phase. A higher-ranked synchronous callback prevents a
-validated commit capability from escaping into an outer future; all fallible
-work precedes its allocation-free apply. The fixed 192-byte tiny-adapter scratch
-is reused through the full 1,024-position context without growth. Continuous
-batching, the scheduler's composite RNG/output commit, and the bounded actor
-remain incomplete until the rest of M5 lands. Weights remain eagerly resident
-in M5, so live cache-leased expert execution remains an explicit system gap.
+state. Its public layout reports exact candidate payload and one rounded
+ledger charge without exposing the private candidate representation. The
+public `DecoderAdapter` is a trusted model-extension boundary that splits token
+work into prepare, owned expert tasks, validated contributions, deterministic
+rank-order finish, and a single-use state commit. It exposes fixed vocabulary
+and stop-token policy, and its task iterator contract requires contiguous
+router ranks. Complete model/state/revision/position/transaction identity
+follows every phase; external implementations construct checked, nonzero
+identity tags, but those tags are not capabilities. Conforming adapters keep
+their binding inside model-derived task and contribution payloads opaque, and
+the scheduler still validates the complete envelope at every boundary. A
+higher-ranked synchronous callback prevents a validated commit capability from
+escaping into an outer future; all fallible work precedes its allocation-free,
+return-free apply. The fixed 192-byte tiny-adapter scratch is reused through
+the full 1,024-position context without growth. Continuous batching, the
+scheduler's composite RNG/output commit, and the bounded actor remain
+incomplete until the rest of M5 lands. Weights remain eagerly resident in M5,
+so live cache-leased expert execution remains an explicit system gap.
 
 ## Error model
 

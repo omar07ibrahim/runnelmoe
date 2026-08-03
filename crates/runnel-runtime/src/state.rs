@@ -150,11 +150,19 @@ impl StateLayout {
     }
 }
 
-/// A process-unique, nonzero identity for one successfully allocated state.
+/// A nonzero identity for adapter state.
+///
+/// Runtime-allocated `SequenceState` values are process-unique. External
+/// decoder adapters that construct work identities are responsible for the
+/// same no-reuse property within each model instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StateId(NonZeroU64);
 
 impl StateId {
+    pub(crate) const fn from_nonzero(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
     #[must_use]
     pub fn get(self) -> u64 {
         self.0.get()
@@ -534,13 +542,12 @@ impl StateAppendPermit<'_, '_> {
     /// `validate_append`, so apply cannot substitute different bytes or fail a
     /// length check. A later outer transaction permit must therefore borrow a
     /// separately stored pending commit rather than form a self-reference.
-    pub(crate) fn apply(self) -> usize {
+    pub(crate) fn apply(self) {
         let page = &mut self.state.pages[self.page_index];
         page.keys[self.start..self.end].copy_from_slice(self.key);
         page.values[self.start..self.end].copy_from_slice(self.value);
         self.state.len = self.position + 1;
         self.state.revision = self.next_revision;
-        self.position
     }
 }
 
@@ -850,7 +857,7 @@ mod tests {
         let permit = state.validate_append(state_id, 0, 0, &key, &value).unwrap();
         assert_eq!(unrelated_key, [9.0, 9.0]);
         assert_eq!(unrelated_value, [8.0, 8.0]);
-        assert_eq!(permit.apply(), 0);
+        permit.apply();
         assert_eq!(state.history().key_at(0).unwrap(), key);
         assert_eq!(state.history().value_at(0).unwrap(), value);
     }

@@ -23,7 +23,7 @@ pub use model::{
 pub use runnel_kernels::{BackendKind, BackendRequest};
 pub use sampling::{
     RetainedCandidate, SampleConfig, SamplingError, SamplingPolicy, SamplingPreview,
-    SamplingResult, SamplingWorkspace,
+    SamplingResult, SamplingWorkspace, SamplingWorkspaceLayout,
 };
 pub use state::{KvHistory, SequenceState, StateId, StateLayout};
 pub use tensor::{Tensor, TensorCatalog};

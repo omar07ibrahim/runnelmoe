@@ -13,8 +13,8 @@ use runnel_kernels::{
 
 use super::{Experts, TinyModel};
 use crate::{
-    AdapterExecutionLayout, AdapterTransactionId, AdapterWorkIdentity, DecoderAdapter, Result,
-    RuntimeError, StateLayout, Tensor,
+    AdapterExecutionLayout, AdapterTransactionId, AdapterWorkIdentity, DecoderAdapter, EOS_TOKEN,
+    Result, RuntimeError, StateLayout, Tensor,
     attention::streaming_causal_attention,
     state::{SequenceState, StateAppendPermit},
 };
@@ -194,8 +194,6 @@ impl fmt::Debug for Redacted {
     }
 }
 
-impl crate::adapter::sealed::Sealed for TinyModel {}
-
 impl DecoderAdapter for TinyModel {
     type StateLayout = StateLayout;
     type State = SequenceState;
@@ -221,6 +219,14 @@ impl DecoderAdapter for TinyModel {
             WORKSPACE_F32_ELEMENTS * size_of::<f32>(),
             model_resident_payload_bytes(self)?,
         )
+    }
+
+    fn vocabulary_size(&self) -> usize {
+        VOCAB_SIZE
+    }
+
+    fn is_stop_token(&self, token: u32) -> bool {
+        token == EOS_TOKEN
     }
 
     fn state_layout(&self, max_tokens: usize, page_tokens: usize) -> Result<StateLayout> {
@@ -260,13 +266,13 @@ impl DecoderAdapter for TinyModel {
         validate_frozen_geometry(self)?;
         let token_index = validate_token(token)?;
         let (state_id, state_revision, position) = validate_state_for_prepare(self, state)?;
-        let identity = AdapterWorkIdentity {
-            transaction_id: NEXT_ADAPTER_TRANSACTION_ID.next()?,
-            model_instance_id: self.instance_id,
-            state_id,
+        let identity = AdapterWorkIdentity::try_new(
+            NEXT_ADAPTER_TRANSACTION_ID.next()?.get(),
+            self.instance_id,
+            state_id.get(),
             state_revision,
             position,
-        };
+        )?;
 
         let mut attention_residual = [0.0; HIDDEN_SIZE];
         attention_residual.copy_from_slice(tensor_row::<HIDDEN_SIZE>(
@@ -617,8 +623,8 @@ impl DecoderAdapter for TinyModel {
         Ok(apply(TinyStateCommitPermit { append }))
     }
 
-    fn apply_state_commit<'a>(permit: TinyStateCommitPermit<'a>) -> usize {
-        permit.append.apply()
+    fn apply_state_commit<'a>(permit: TinyStateCommitPermit<'a>) {
+        permit.append.apply();
     }
 }
 
@@ -1148,7 +1154,7 @@ mod tests {
         model: &TinyModel,
         state: &mut SequenceState,
         pending: &TinyPendingStateCommit,
-    ) -> Result<usize> {
+    ) -> Result<()> {
         model.with_validated_state_commit(state, pending, TinyModel::apply_state_commit)
     }
 
@@ -1261,10 +1267,7 @@ mod tests {
             let pending = finish_one(&model, &state, *token, &mut workspace, false);
             assert_eq!(state.test_fingerprint(), before);
             assert_pending_matches_step(&pending, expected);
-            assert_eq!(
-                apply_pending(&model, &mut state, &pending).unwrap(),
-                position
-            );
+            apply_pending(&model, &mut state, &pending).unwrap();
             assert_eq!(state.len(), position + 1);
             assert_eq!(state.revision(), (position + 1) as u64);
         }
@@ -1418,7 +1421,7 @@ mod tests {
             assert_eq!(ordered.expert_ids, reversed.expert_ids);
             assert_eq!(ordered.route_weights, reversed.route_weights);
 
-            assert_eq!(apply_pending(&model, &mut state, &ordered).unwrap(), 0);
+            apply_pending(&model, &mut state, &ordered).unwrap();
             let committed = state.test_fingerprint();
             assert_commit_rejected(
                 &model,
@@ -1650,6 +1653,32 @@ mod tests {
     }
 
     #[test]
+    fn tiny_adapter_exposes_stable_vocabulary_stop_and_task_contracts() {
+        for version in [1, 2, 3] {
+            let model = fixture_model(version);
+            assert_eq!(model.vocabulary_size(), VOCAB_SIZE);
+            assert!(model.is_stop_token(EOS_TOKEN));
+            for token in 1..VOCAB_SIZE as u32 {
+                assert!(!model.is_stop_token(token));
+            }
+
+            let layout = model.execution_layout().unwrap();
+            let state_layout = model.state_layout(1, 1).unwrap();
+            let state = model.new_state(state_layout).unwrap();
+            let mut workspace = model.new_workspace().unwrap();
+            let prepared = model.prepare_token(&state, 1, &mut workspace).unwrap();
+            let identity = model.prepared_identity(&prepared);
+            let tasks = model.expert_tasks(&prepared);
+            assert!(tasks.len() >= 1);
+            assert!(tasks.len() <= layout.max_tasks_per_token());
+            for (rank, task) in tasks.enumerate() {
+                assert_eq!(model.task_identity(&task), identity);
+                assert_eq!(usize::from(model.task_router_rank(&task)), rank);
+            }
+        }
+    }
+
+    #[test]
     fn malformed_pending_commits_fail_with_exact_rollback() {
         let model = fixture_model(2);
         let layout = model.state_layout(16, 16).unwrap();
@@ -1812,7 +1841,7 @@ mod tests {
 
         let first = finish_one(&model, &state, 1, &mut workspace, false);
         let stale = finish_one(&model, &state, 1, &mut workspace, false);
-        assert_eq!(apply_pending(&model, &mut state, &first).unwrap(), 0);
+        apply_pending(&model, &mut state, &first).unwrap();
         let committed = state.test_fingerprint();
         assert_commit_rejected(
             &model,
@@ -1849,10 +1878,7 @@ mod tests {
             assert_eq!(workspace.gemv.max_rows(), EXPERT_HIDDEN_SIZE);
             assert_eq!(workspace.gemv.rows(), HIDDEN_SIZE);
             assert_eq!(workspace.gemv.capacity(), capacity);
-            assert_eq!(
-                apply_pending(&model, &mut state, &pending).unwrap(),
-                position
-            );
+            apply_pending(&model, &mut state, &pending).unwrap();
             if [0, 14, 15, 16, 254, 255, 256, 1_022, 1_023].contains(&position) {
                 assert_eq!(state.len(), position + 1);
                 assert_eq!(state.revision(), (position + 1) as u64);

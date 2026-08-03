@@ -4,7 +4,7 @@
 //! a surrounding token transaction may commit, but never mutates committed RNG
 //! state itself.
 
-use std::{cmp::Ordering, fmt};
+use std::{cmp::Ordering, fmt, mem::size_of};
 
 use thiserror::Error;
 
@@ -12,6 +12,8 @@ const SPLITMIX64_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 const SPLITMIX64_MIX_1: u64 = 0xbf58_476d_1ce4_e5b9;
 const SPLITMIX64_MIX_2: u64 = 0x94d0_49bb_1331_11eb;
 const TWO_POW_NEGATIVE_53: f64 = 1.0 / 9_007_199_254_740_992.0;
+const SAMPLING_LEDGER_ALIGNMENT: usize = 64;
+const CANDIDATE_SLOT_BYTES: usize = 32;
 
 pub type SamplingResult<T> = std::result::Result<T, SamplingError>;
 
@@ -38,6 +40,8 @@ pub enum SamplingError {
     UnexpectedGreedyRngState,
     #[error("sampling workspace allocation failed for {vocab_size} candidates")]
     WorkspaceAllocation { vocab_size: usize },
+    #[error("sampling workspace size overflows for vocabulary {vocab_size}")]
+    WorkspaceSizeOverflow { vocab_size: usize },
     #[error("non-finite or invalid sampling arithmetic during {stage}")]
     InvalidArithmetic { stage: &'static str },
 }
@@ -160,22 +164,56 @@ pub struct RetainedCandidate {
     pub probability: f64,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
     token: u32,
+    reserved: u32,
     scaled_logit: f64,
     weight: f64,
     probability: f64,
 }
 
+const _: [(); CANDIDATE_SLOT_BYTES] = [(); size_of::<Candidate>()];
+
 impl Default for Candidate {
     fn default() -> Self {
         Self {
             token: 0,
+            reserved: 0,
             scaled_logit: 0.0,
             weight: 0.0,
             probability: 0.0,
         }
+    }
+}
+
+/// Checked candidate-storage geometry for one sampling workspace.
+///
+/// `payload_bytes` is the semantic byte capacity of the fixed candidate
+/// array. `charge_bytes` rounds that complete payload once to the scheduler's
+/// 64-byte logical-ledger unit; it is not an allocator or RSS estimate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamplingWorkspaceLayout {
+    vocab_size: usize,
+    payload_bytes: usize,
+    charge_bytes: usize,
+}
+
+impl SamplingWorkspaceLayout {
+    #[must_use]
+    pub fn vocab_size(self) -> usize {
+        self.vocab_size
+    }
+
+    #[must_use]
+    pub fn payload_bytes(self) -> usize {
+        self.payload_bytes
+    }
+
+    #[must_use]
+    pub fn charge_bytes(self) -> usize {
+        self.charge_bytes
     }
 }
 
@@ -200,14 +238,32 @@ impl fmt::Debug for SamplingWorkspace {
 }
 
 impl SamplingWorkspace {
+    /// Computes fixed candidate storage and logical charge without allocating.
+    pub fn layout(vocab_size: usize) -> SamplingResult<SamplingWorkspaceLayout> {
+        validate_vocab_size(vocab_size)?;
+        let payload_bytes = vocab_size
+            .checked_mul(CANDIDATE_SLOT_BYTES)
+            .ok_or(SamplingError::WorkspaceSizeOverflow { vocab_size })?;
+        if !workspace_payload_fits_host(payload_bytes) {
+            return Err(SamplingError::WorkspaceSizeOverflow { vocab_size });
+        }
+        let charge_bytes = round_workspace_charge(payload_bytes)
+            .ok_or(SamplingError::WorkspaceSizeOverflow { vocab_size })?;
+        Ok(SamplingWorkspaceLayout {
+            vocab_size,
+            payload_bytes,
+            charge_bytes,
+        })
+    }
+
     /// Allocates all sampling scratch space for `vocab_size` candidates.
     pub fn new(vocab_size: usize) -> SamplingResult<Self> {
-        validate_vocab_size(vocab_size)?;
+        let layout = Self::layout(vocab_size)?;
         let mut candidates = Vec::new();
         candidates
-            .try_reserve_exact(vocab_size)
+            .try_reserve_exact(layout.vocab_size())
             .map_err(|_| SamplingError::WorkspaceAllocation { vocab_size })?;
-        candidates.resize(vocab_size, Candidate::default());
+        candidates.resize(layout.vocab_size(), Candidate::default());
         Ok(Self {
             candidates,
             retained_len: 0,
@@ -274,6 +330,7 @@ impl SamplingWorkspace {
         let token = token_id(best)?;
         self.candidates[0] = Candidate {
             token,
+            reserved: 0,
             scaled_logit: f64::from(logits[best]),
             weight: 1.0,
             probability: 1.0,
@@ -300,6 +357,7 @@ impl SamplingWorkspace {
             }
             *candidate = Candidate {
                 token: token_id(index)?,
+                reserved: 0,
                 scaled_logit,
                 weight: 0.0,
                 probability: 0.0,
@@ -393,6 +451,16 @@ impl SamplingWorkspace {
             next_rng_state,
         ))
     }
+}
+
+fn round_workspace_charge(payload_bytes: usize) -> Option<usize> {
+    payload_bytes
+        .checked_add(SAMPLING_LEDGER_ALIGNMENT - 1)
+        .map(|bytes| bytes / SAMPLING_LEDGER_ALIGNMENT * SAMPLING_LEDGER_ALIGNMENT)
+}
+
+fn workspace_payload_fits_host(payload_bytes: usize) -> bool {
+    payload_bytes <= isize::MAX as usize
 }
 
 /// Selects from already-normalized candidates in visit order.
@@ -692,6 +760,56 @@ mod tests {
     }
 
     #[test]
+    fn workspace_layout_reports_exact_payload_and_64_byte_charge() {
+        assert_eq!(size_of::<Candidate>(), CANDIDATE_SLOT_BYTES);
+        let cases = [
+            (1, 32, 64),
+            (2, 64, 64),
+            (3, 96, 128),
+            (4, 128, 128),
+            (5, 160, 192),
+        ];
+
+        for (vocab_size, payload_bytes, charge_bytes) in cases {
+            let layout = SamplingWorkspace::layout(vocab_size).unwrap();
+            assert_eq!(layout.vocab_size(), vocab_size);
+            assert_eq!(layout.payload_bytes(), payload_bytes);
+            assert_eq!(layout.charge_bytes(), charge_bytes);
+
+            let workspace = SamplingWorkspace::new(vocab_size).unwrap();
+            assert_eq!(workspace.vocab_size(), layout.vocab_size());
+            assert_eq!(
+                workspace.candidates.len() * size_of::<Candidate>(),
+                layout.payload_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_layout_rejects_invalid_vocabularies_without_payload_details() {
+        assert_eq!(
+            SamplingWorkspace::layout(0).unwrap_err(),
+            SamplingError::EmptyVocabulary
+        );
+
+        if let Ok(too_large) = usize::try_from(u64::from(u32::MAX) + 2) {
+            let error = SamplingWorkspace::layout(too_large).unwrap_err();
+            assert_eq!(
+                error,
+                SamplingError::VocabularyTooLarge {
+                    vocab_size: too_large
+                }
+            );
+            let debug = format!("{error:?}");
+            assert!(!debug.contains("candidate"));
+            assert!(!debug.contains("payload"));
+        }
+
+        assert_eq!(round_workspace_charge(usize::MAX), None);
+        assert!(!workspace_payload_fits_host(isize::MAX as usize + 1));
+    }
+
+    #[test]
     fn splitmix64_matches_exact_version_one_vectors() {
         let vectors = [
             (
@@ -952,6 +1070,7 @@ mod tests {
                 .iter()
                 .map(|(token, weight)| Candidate {
                     token: *token,
+                    reserved: 0,
                     scaled_logit: 0.0,
                     weight: *weight,
                     probability: *weight / total,

@@ -10,10 +10,6 @@ use crate::{Result, RuntimeError, StateId, StateLayout};
 
 const LEDGER_ALIGNMENT: usize = 64;
 
-pub(crate) mod sealed {
-    pub trait Sealed {}
-}
-
 /// Exact semantic accounting required from an adapter-owned state layout.
 pub trait StateLayoutAccounting: Copy {
     fn payload_bytes(self) -> usize;
@@ -35,6 +31,18 @@ impl StateLayoutAccounting for StateLayout {
 pub struct AdapterTransactionId(pub(crate) NonZeroU64);
 
 impl AdapterTransactionId {
+    /// Constructs an adapter-owned transaction identity.
+    ///
+    /// External adapters are responsible for issuing each value at most once
+    /// and for permanently exhausting their counter instead of wrapping.
+    pub fn try_new(value: u64) -> Result<Self> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(RuntimeError::InvalidAdapterWork(
+                "adapter transaction identity must be nonzero",
+            ))
+    }
+
     #[must_use]
     pub fn get(self) -> u64 {
         self.0.get()
@@ -43,8 +51,10 @@ impl AdapterTransactionId {
 
 /// Complete runtime identity carried by prepared work and every completion.
 ///
-/// Fields are private to callers so a validated task or contribution cannot be
-/// retagged while retaining its model-derived payload.
+/// This is a validation tag, not an unforgeable capability. Private fields
+/// prevent in-place mutation of the tag; conforming adapters must also keep
+/// the identity binding inside task and contribution payloads opaque. A
+/// scheduler validates the complete tag at every phase boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AdapterWorkIdentity {
     pub(crate) transaction_id: AdapterTransactionId,
@@ -55,6 +65,38 @@ pub struct AdapterWorkIdentity {
 }
 
 impl AdapterWorkIdentity {
+    /// Constructs the immutable identity carried through one adapter token
+    /// transaction.
+    ///
+    /// Adapter implementations must keep model-instance and state identities
+    /// unique within their own lifetime and must never reuse a transaction
+    /// identity. Constructing a tag does not authorize work or provide access
+    /// to an adapter-owned task or contribution payload.
+    pub fn try_new(
+        transaction_id: u64,
+        model_instance_id: u64,
+        state_id: u64,
+        state_revision: u64,
+        position: usize,
+    ) -> Result<Self> {
+        let transaction_id = AdapterTransactionId::try_new(transaction_id)?;
+        if model_instance_id == 0 {
+            return Err(RuntimeError::InvalidAdapterWork(
+                "adapter model identity must be nonzero",
+            ));
+        }
+        let state_id = NonZeroU64::new(state_id).map(StateId::from_nonzero).ok_or(
+            RuntimeError::InvalidAdapterWork("adapter state identity must be nonzero"),
+        )?;
+        Ok(Self {
+            transaction_id,
+            model_instance_id,
+            state_id,
+            state_revision,
+            position,
+        })
+    }
+
     #[must_use]
     pub fn transaction_id(self) -> AdapterTransactionId {
         self.transaction_id
@@ -188,11 +230,17 @@ fn round_up_ledger(bytes: usize, resource: &'static str) -> Result<usize> {
 
 /// Synchronous decoder phases consumed by a generic scheduler engine.
 ///
-/// The commit permit is deliberately lifetime-bound to the exact mutable state
-/// and immutable pending value validated by `with_validated_state_commit`.
-/// Its higher-ranked callback prevents safe code from returning the permit in
-/// a future or otherwise retaining it across an outer asynchronous yield.
-pub trait DecoderAdapter: sealed::Sealed + Send + Sync {
+/// Implementations must lifetime-bind the commit permit to the exact mutable
+/// state and immutable pending value validated by
+/// `with_validated_state_commit`. For a conforming implementation, its
+/// higher-ranked callback prevents safe scheduler code from returning the
+/// permit in a future or otherwise retaining it across an outer asynchronous
+/// yield.
+///
+/// This is a trusted model-extension boundary. Implementations must honor the
+/// documented task ordering, identity, allocation, and commit contracts; a
+/// scheduler still validates all observable envelopes before publication.
+pub trait DecoderAdapter: Send + Sync {
     type StateLayout: StateLayoutAccounting + Send + Sync;
     type State: Send;
     type Workspace: Send;
@@ -206,6 +254,15 @@ pub trait DecoderAdapter: sealed::Sealed + Send + Sync {
         Self: 'a;
 
     fn execution_layout(&self) -> Result<AdapterExecutionLayout>;
+
+    /// Returns the fixed, nonzero vocabulary size accepted by this adapter.
+    /// The largest valid token ID must fit in `u32`. The value must remain
+    /// stable for the adapter's lifetime.
+    fn vocabulary_size(&self) -> usize;
+
+    /// Reports whether an already vocabulary-validated token ends generation.
+    /// The answer must be deterministic and stable for the adapter's lifetime.
+    fn is_stop_token(&self, token: u32) -> bool;
 
     fn state_layout(&self, max_tokens: usize, page_tokens: usize) -> Result<Self::StateLayout>;
 
@@ -222,6 +279,13 @@ pub trait DecoderAdapter: sealed::Sealed + Send + Sync {
 
     fn prepared_identity(&self, prepared: &Self::PreparedToken) -> AdapterWorkIdentity;
 
+    /// Returns one or more tasks in contiguous router-rank order.
+    ///
+    /// The exact iterator length must be in
+    /// `1..=execution_layout().max_tasks_per_token()`. Its ranks must be
+    /// unique and exactly `0..len`, in iteration order, and every task identity
+    /// must equal `prepared_identity(prepared)`. A scheduler validates this
+    /// contract before indexing its preallocated scatter lanes.
     fn expert_tasks(&self, prepared: &Self::PreparedToken) -> Self::ExpertTasks;
 
     fn task_identity(&self, task: &Self::ExpertTask) -> AdapterWorkIdentity;
@@ -236,11 +300,14 @@ pub trait DecoderAdapter: sealed::Sealed + Send + Sync {
         workspace: &mut Self::Workspace,
     ) -> Result<Self::ExpertContribution>;
 
+    /// Returns the complete identity copied from the input expert task.
     fn contribution_identity(&self, contribution: &Self::ExpertContribution)
     -> AdapterWorkIdentity;
 
+    /// Returns the router rank copied from the input expert task.
     fn contribution_router_rank(&self, contribution: &Self::ExpertContribution) -> u16;
 
+    /// Returns the expert ID copied from the input expert task.
     fn contribution_expert_id(&self, contribution: &Self::ExpertContribution) -> u16;
 
     fn finish_token(
@@ -252,6 +319,9 @@ pub trait DecoderAdapter: sealed::Sealed + Send + Sync {
 
     fn pending_identity(&self, pending: &Self::PendingStateCommit) -> AdapterWorkIdentity;
 
+    /// Returns finite logits whose length is exactly `vocabulary_size()`.
+    /// `pending_identity(pending)` must equal the prepared identity used to
+    /// create this pending value.
     fn pending_logits<'a>(&self, pending: &'a Self::PendingStateCommit) -> &'a [f32];
 
     /// Validates state and invokes `apply` with a non-escaping, single-use
@@ -274,7 +344,7 @@ pub trait DecoderAdapter: sealed::Sealed + Send + Sync {
 
     /// Applies a previously validated state transition without allocation or
     /// another replaceable model, state, or pending-data argument.
-    fn apply_state_commit<'a>(permit: Self::StateCommitPermit<'a>) -> usize;
+    fn apply_state_commit<'a>(permit: Self::StateCommitPermit<'a>);
 }
 
 #[cfg(test)]
@@ -305,5 +375,28 @@ mod tests {
         assert!(AdapterExecutionLayout::new(usize::from(u16::MAX) + 2, 0, 0, 0, 0, 0, 0).is_err());
         assert!(AdapterExecutionLayout::new(1, 0, 0, 0, 0, usize::MAX, 0).is_err());
         assert!(AdapterExecutionLayout::new(1, 0, 0, 0, 0, 0, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn public_adapter_identities_are_checked_and_preserve_fields() {
+        let identity = AdapterWorkIdentity::try_new(11, 22, 33, 44, 55).unwrap();
+        assert_eq!(identity.transaction_id().get(), 11);
+        assert_eq!(identity.model_instance_id(), 22);
+        assert_eq!(identity.state_id().get(), 33);
+        assert_eq!(identity.state_revision(), 44);
+        assert_eq!(identity.position(), 55);
+
+        assert_eq!(
+            AdapterTransactionId::try_new(0).unwrap_err(),
+            RuntimeError::InvalidAdapterWork("adapter transaction identity must be nonzero")
+        );
+        assert_eq!(
+            AdapterWorkIdentity::try_new(1, 0, 1, 0, 0).unwrap_err(),
+            RuntimeError::InvalidAdapterWork("adapter model identity must be nonzero")
+        );
+        assert_eq!(
+            AdapterWorkIdentity::try_new(1, 1, 0, 0, 0).unwrap_err(),
+            RuntimeError::InvalidAdapterWork("adapter state identity must be nonzero")
+        );
     }
 }
