@@ -145,7 +145,7 @@ def build_vectors(spec_path: Path) -> dict[str, dict[str, Any]]:
             "text": "abcdefghijklmnopqrstuvwxyz .,?",
         },
     }
-    if spec.fixture_version == 2:
+    if spec.fixture_version in {2, 3}:
         bf16_tensors = [tensor for tensor in spec.tensors if tensor.storage_dtype == "bf16-le"]
         f32_tensors = [tensor for tensor in spec.tensors if tensor.storage_dtype == "f32-le"]
         changed_elements = 0
@@ -158,7 +158,7 @@ def build_vectors(spec_path: Path) -> dict[str, dict[str, Any]]:
         f32_elements = sum(math.prod(tensor.shape) for tensor in f32_tensors)
         metadata["adapter"] = {
             "id": "runnel.tiny-causal-moe",
-            "version": 2,
+            "version": spec.fixture_version,
         }
         metadata["oracle"]["expert_storage_dtype"] = "bfloat16"
         metadata["oracle"]["expert_storage_round_trip"] = (

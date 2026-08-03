@@ -56,8 +56,8 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
     _require(
         isinstance(fixture_version, int)
         and not isinstance(fixture_version, bool)
-        and fixture_version in {1, 2},
-        "fixture_version must be 1 or 2",
+        and fixture_version in {1, 2, 3},
+        "fixture_version must be 1, 2, or 3",
     )
 
     expected_identity = f"runnel-tiny-causal-moe-v{fixture_version}"
@@ -80,6 +80,13 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
             "page_table_digest": "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
             "page_table_length": 96,
         },
+        3: {
+            "artifact_id": "sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c",
+            "object_digest": "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab",
+            "object_length": 5600,
+            "page_table_digest": "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
+            "page_table_length": 96,
+        },
     }
     _require(
         artifact == expected_artifacts[fixture_version],
@@ -89,7 +96,7 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
     model = raw.get("model")
     _require(isinstance(model, dict), "model must be an object")
     expected_model = {
-        "context_length": 16,
+        "context_length": 1024 if fixture_version == 3 else 16,
         "expert_hidden_size": 12,
         "hidden_size": 8,
         "num_experts": 4,
@@ -115,12 +122,12 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
     else:
         _require(
             numeric.get("expert_storage_dtype") == "bfloat16",
-            "tiny-v2 expert storage dtype must be bfloat16",
+            f"tiny-v{fixture_version} expert storage dtype must be bfloat16",
         )
         _require(
             numeric.get("expert_storage_conversion")
             == "float32-to-bfloat16-rne-to-float32",
-            "tiny-v2 expert conversion must be the frozen BF16 round trip",
+            f"tiny-v{fixture_version} expert conversion must be the frozen BF16 round trip",
         )
     _require(
         numeric.get("rms_norm_epsilon_power_of_two") == -12,
@@ -178,7 +185,7 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
     for expected_id, item in enumerate(tensors_raw):
         _require(isinstance(item, dict), f"tensor {expected_id} must be an object")
         expected_keys = {"id", "role", "shape"}
-        if fixture_version == 2:
+        if fixture_version in {2, 3}:
             expected_keys.add("dtype")
         _require(
             set(item) == expected_keys,
@@ -195,7 +202,11 @@ def load_fixture_spec(path: str | Path) -> FixtureSpec:
             f"tensor {expected_id} has an invalid shape",
         )
         storage_dtype = item.get("dtype", "f32-le")
-        expected_dtype = "bf16-le" if fixture_version == 2 and 8 <= expected_id <= 19 else "f32-le"
+        expected_dtype = (
+            "bf16-le"
+            if fixture_version in {2, 3} and 8 <= expected_id <= 19
+            else "f32-le"
+        )
         _require(
             storage_dtype == expected_dtype,
             f"tensor {expected_id} storage dtype differs from tiny-v{fixture_version}",

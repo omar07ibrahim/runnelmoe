@@ -25,6 +25,7 @@ pub const NUM_EXPERTS: usize = 4;
 pub const TOP_K: usize = 2;
 pub const EXPERT_HIDDEN_SIZE: usize = 12;
 pub const CONTEXT_LENGTH: usize = 16;
+pub const V3_CONTEXT_LENGTH: usize = 1_024;
 pub const RMS_EPSILON: f32 = 1.0 / 4096.0;
 pub const ATTENTION_SCALE: f32 = 0.5;
 pub const PAGE_SIZE: u32 = 65_536;
@@ -87,6 +88,7 @@ pub struct TensorRecipe {
 enum TinyAdapterVersion {
     V1,
     V2,
+    V3,
 }
 
 impl TinyAdapterVersion {
@@ -94,14 +96,22 @@ impl TinyAdapterVersion {
         match self {
             Self::V1 => 1,
             Self::V2 => 2,
+            Self::V3 => 3,
         }
     }
 
     const fn tensor_dtype(self, tensor_id: u64) -> FixtureDType {
-        if matches!(self, Self::V2) && matches!(tensor_id, 8..=19) {
+        if matches!(self, Self::V2 | Self::V3) && matches!(tensor_id, 8..=19) {
             FixtureDType::Bf16
         } else {
             FixtureDType::F32
+        }
+    }
+
+    const fn context_length(self) -> usize {
+        match self {
+            Self::V1 | Self::V2 => CONTEXT_LENGTH,
+            Self::V3 => V3_CONTEXT_LENGTH,
         }
     }
 }
@@ -187,6 +197,12 @@ impl FixtureArtifact {
         Self::build_for(TinyAdapterVersion::V2)
     }
 
+    /// Builds tiny-v3 with compact BF16 experts and a 1,024-token context cap.
+    #[must_use]
+    pub fn build_v3() -> Self {
+        Self::build_for(TinyAdapterVersion::V3)
+    }
+
     fn build_for(adapter_version: TinyAdapterVersion) -> Self {
         let recipes = tensor_recipes();
         let mut object = Vec::new();
@@ -214,6 +230,7 @@ impl FixtureArtifact {
             page_table_digest,
             page_table.len(),
             adapter_version.number(),
+            adapter_version.context_length(),
         );
 
         Self {
@@ -469,6 +486,7 @@ fn build_manifest(
     page_table_digest: Digest,
     page_table_length: usize,
     adapter_version: u64,
+    context_length: usize,
 ) -> Vec<u8> {
     let mut tensor_json = String::new();
     for (index, tensor) in tensors.iter().enumerate() {
@@ -500,7 +518,7 @@ fn build_manifest(
             "\"adapter\":{{\"id\":\"runnel.tiny-causal-moe\",\"version\":{}}},",
             "\"format\":\"rmoa\",",
             "\"model\":{{",
-            "\"context_length\":16,",
+            "\"context_length\":{},",
             "\"expert_hidden_size\":12,",
             "\"hidden_size\":8,",
             "\"num_experts\":4,",
@@ -522,6 +540,7 @@ fn build_manifest(
             "}}\n"
         ),
         adapter_version,
+        context_length,
         object_digest,
         object_length,
         page_table_digest,
@@ -781,6 +800,55 @@ mod tests {
         assert_eq!(version_two.manifest().tensors[20].offset, 4_544);
         assert_eq!(version_two.manifest().tensors[21].offset, 4_576);
         assert_eq!(version_two.manifest().tensors[21].length, 1_024);
+    }
+
+    #[test]
+    fn tiny_v3_changes_only_adapter_identity_and_context_cap() {
+        let version_two_fixture = FixtureArtifact::build_v2();
+        let fixture = FixtureArtifact::build_v3();
+        let identity = fixture.identity();
+
+        assert_eq!(fixture.manifest_bytes().len(), 4_502);
+        assert_eq!(identity.object_length, 5_600);
+        assert_eq!(identity.page_table_length, 96);
+        assert_eq!(
+            identity.artifact_id.to_string(),
+            "sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c"
+        );
+        assert_eq!(
+            identity.object_digest.to_string(),
+            "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab"
+        );
+        assert_eq!(
+            identity.page_table_digest.to_string(),
+            "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c"
+        );
+
+        assert_eq!(version_two_fixture.object, fixture.object);
+        assert_eq!(version_two_fixture.page_table, fixture.page_table);
+
+        let version_two =
+            Artifact::from_bytes(version_two_fixture.to_parts(), Limits::default()).unwrap();
+        let version_three = Artifact::from_bytes(fixture.to_parts(), Limits::default()).unwrap();
+        assert_eq!(version_three.artifact_id(), identity.artifact_id);
+        assert_eq!(version_three.manifest().adapter.version, 3);
+        assert_eq!(
+            version_three.manifest().model.context_length,
+            V3_CONTEXT_LENGTH as u64
+        );
+        for (version_two_tensor, version_three_tensor) in version_two
+            .manifest()
+            .tensors
+            .iter()
+            .zip(&version_three.manifest().tensors)
+        {
+            assert_eq!(version_three_tensor.id, version_two_tensor.id);
+            assert_eq!(version_three_tensor.role, version_two_tensor.role);
+            assert_eq!(version_three_tensor.shape, version_two_tensor.shape);
+            assert_eq!(version_three_tensor.dtype, version_two_tensor.dtype);
+            assert_eq!(version_three_tensor.offset, version_two_tensor.offset);
+            assert_eq!(version_three_tensor.length, version_two_tensor.length);
+        }
     }
 
     #[test]

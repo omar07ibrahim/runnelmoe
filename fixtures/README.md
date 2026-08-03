@@ -11,6 +11,12 @@ the twelve expert gate/up/down matrices use BF16, producing a generated
 5,600-byte object. The v1 fixture, its identity, and its goldens remain
 immutable. Neither generated object is committed as model data.
 
+M5 adds adapter v3 as the compact-BF16 measurement fixture. Its tensor recipe,
+object bytes, page table, and short `moe` oracle outputs are identical to v2;
+only the adapter identity and declared context cap change. The 1,024-token cap
+supports preregistered long-context scheduler measurements without changing
+the frozen v1 or v2 contracts. The generated object is still not committed.
+
 M3 also commits three tiny canonical
 [cache-policy traces](cache/README.md). They are hand-inspectable correctness
 inputs; the larger stochastic experiment traces are regenerated from the

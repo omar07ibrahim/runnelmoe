@@ -158,6 +158,12 @@ REQUIRED = {
     "fixtures/tiny-v2/golden_routes.json",
     "fixtures/tiny-v2/golden_tokens.json",
     "fixtures/tiny-v2/spec.json",
+    "fixtures/tiny-v3/README.md",
+    "fixtures/tiny-v3/golden_logits.json",
+    "fixtures/tiny-v3/golden_metadata.json",
+    "fixtures/tiny-v3/golden_routes.json",
+    "fixtures/tiny-v3/golden_tokens.json",
+    "fixtures/tiny-v3/spec.json",
     "oracle/README.md",
     "oracle/__init__.py",
     "oracle/cache_policy.py",
@@ -389,7 +395,9 @@ def main() -> int:
             failures.append(f"symbolic links are not allowed in source: {relative}")
             continue
         if (
-            relative.parts[:2] == ("fixtures", "tiny")
+            len(relative.parts) >= 2
+            and relative.parts[0] == "fixtures"
+            and relative.parts[1] in {"tiny", "tiny-v2", "tiny-v3"}
             and any(part in {"objects", "page-tables"} for part in relative.parts)
         ):
             failures.append(

@@ -1176,24 +1176,26 @@ mod tests {
 
     #[test]
     fn artifact_adapter_boundary_rejects_incompatible_metadata() {
-        for (from, to, expected) in [
-            (
-                "runnel.ascii32",
-                "runnel.ascii31",
-                "requires runnel.ascii32",
-            ),
-            ("\"hidden_size\":8", "\"hidden_size\":4", "frozen reference"),
-            ("final_norm", "extra_norm", "must have role final_norm"),
-            ("[32,8]", "[16,16]", "must have shape [32, 8]"),
+        let artifact = fixture_artifact(false);
+        let mut wrong_tokenizer = artifact.manifest().clone();
+        wrong_tokenizer.tokenizer.id = "runnel.ascii31".into();
+        let mut wrong_hidden_size = artifact.manifest().clone();
+        wrong_hidden_size.model.hidden_size = 4;
+        let mut wrong_role = artifact.manifest().clone();
+        wrong_role.tensors[20].role = "extra_norm".into();
+        let mut wrong_shape = artifact.manifest().clone();
+        wrong_shape.tensors[21].shape = vec![16, 16];
+
+        for (manifest, expected) in [
+            (wrong_tokenizer, "requires runnel.ascii32"),
+            (wrong_hidden_size, "frozen reference"),
+            (wrong_role, "must have role final_norm"),
+            (wrong_shape, "must have shape [32, 8]"),
         ] {
-            let fixture = FixtureArtifact::build();
-            let mut parts = fixture.to_parts();
-            let manifest = String::from_utf8(parts.manifest).unwrap();
-            let replaced = manifest.replacen(from, to, 1);
-            assert_ne!(manifest, replaced);
-            parts.manifest = replaced.into_bytes();
-            let artifact = Artifact::from_bytes(parts, Limits::default()).unwrap();
-            let error = TinyModel::from_artifact(&artifact).unwrap_err();
+            let error = TinyModel::from_verified_tensor_bytes(&manifest, |descriptor| {
+                Ok(artifact.tensor_bytes(descriptor.id).unwrap().to_vec())
+            })
+            .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
         }
     }
