@@ -102,6 +102,7 @@ REQUIRED = {
     "docs/diagrams/runtime.dot",
     "docs/reviews/M0_REVIEW.md",
     "docs/reviews/M1_REVIEW.md",
+    "docs/reviews/M2_REVIEW.md",
     "fixtures/README.md",
     "fixtures/tiny/README.md",
     "fixtures/tiny/golden_logits.json",
@@ -123,6 +124,14 @@ REQUIRED = {
     "scripts/verify_repository.py",
     "scripts/run_m2_experiment.py",
     "scripts/tests/test_run_m2_experiment.py",
+    "benchmarks/raw/m2-data-plane-20260803/environment.json",
+    "benchmarks/raw/m2-data-plane-20260803/experiment.json",
+    "benchmarks/raw/m2-data-plane-20260803/observations.jsonl",
+    "benchmarks/raw/m2-data-plane-20260803/summary.json",
+    "benchmarks/raw/m2-data-plane-forced-eviction-20260803/environment.json",
+    "benchmarks/raw/m2-data-plane-forced-eviction-20260803/experiment.json",
+    "benchmarks/raw/m2-data-plane-forced-eviction-20260803/observations.jsonl",
+    "benchmarks/raw/m2-data-plane-forced-eviction-20260803/summary.json",
 }
 
 FORBIDDEN_BYTES = {

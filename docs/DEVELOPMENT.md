@@ -110,7 +110,7 @@ Evidence must name a clean commit. Confirm `git status --short` is empty and
 choose a new lowercase ID:
 
 ```console
-python3 scripts/run_m2_experiment.py m2-data-plane-YYYYMMDD
+python3 scripts/run_m2_experiment.py m2-data-plane-forced-eviction-YYYYMMDD
 ```
 
 The standard-library harness performs the recorded two-job, nonincremental,
@@ -122,3 +122,18 @@ every raw trial, and a generated statistical summary below
 `benchmarks/raw/<id>/`.
 Timing describes the validation command on a shared virtualized host; it is not
 evidence of a performance improvement.
+
+The locally accepted schema-v2 M2 evidence is at
+`benchmarks/raw/m2-data-plane-forced-eviction-20260803/`; publication remains
+pending until protected-branch CI is green. Its clean implementation commit is
+`99772585e23d8f1ce3459ba6397d93fd1be0fc8a`; the exact recorded invocation is:
+
+```console
+python3 scripts/run_m2_experiment.py m2-data-plane-forced-eviction-20260803 --warmups 3 --repetitions 30 --timeout-seconds 30 --bootstrap-seed 20260803 --bootstrap-resamples 10000
+```
+
+Calling the harness with only a new experiment ID uses those same default
+parameters, but the record always preserves the fully expanded invocation.
+The schema-v1 `benchmarks/raw/m2-data-plane-20260803/` run is retained as a
+preliminary append-only record; it does not combine full-generation parity with
+forced eviction. Use a new experiment ID when reproducing either procedure.

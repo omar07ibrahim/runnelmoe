@@ -1,0 +1,227 @@
+{
+  "cache_and_rss_distributions": {
+    "cache_io_nanoseconds": {
+      "missing_sample_count": 0,
+      "observed_sample_count": 30,
+      "statistics": {
+        "maximum": 150150.0,
+        "mean": 93119.73333333334,
+        "median": 95142.0,
+        "median_bootstrap_95_percent_ci": {
+          "confidence_level": 0.95,
+          "lower": 91317.0,
+          "method": "seeded nonparametric percentile bootstrap of the median",
+          "resamples": 10000,
+          "seed": 20260803,
+          "upper": 103037.5
+        },
+        "minimum": 52493.0,
+        "p50": 95142.0,
+        "p95": 132989.1499999999,
+        "percentile_method": "type-7 linear interpolation",
+        "sample_count": 30,
+        "sample_standard_deviation": 24589.778035953706
+      },
+      "unit": "nanoseconds"
+    },
+    "cache_wait_nanoseconds": {
+      "missing_sample_count": 0,
+      "observed_sample_count": 30,
+      "statistics": {
+        "maximum": 4318241.0,
+        "mean": 728725.3333333334,
+        "median": 402426.0,
+        "median_bootstrap_95_percent_ci": {
+          "confidence_level": 0.95,
+          "lower": 387635.0,
+          "method": "seeded nonparametric percentile bootstrap of the median",
+          "resamples": 10000,
+          "seed": 20260803,
+          "upper": 473645.5
+        },
+        "minimum": 269628.0,
+        "p50": 402426.0,
+        "p95": 2396269.999999997,
+        "percentile_method": "type-7 linear interpolation",
+        "sample_count": 30,
+        "sample_standard_deviation": 858234.6510117122
+      },
+      "unit": "nanoseconds"
+    },
+    "observed_rss_peak_bytes": {
+      "missing_sample_count": 0,
+      "observed_sample_count": 30,
+      "statistics": {
+        "maximum": 4669440.0,
+        "mean": 4579191.466666667,
+        "median": 4591616.0,
+        "median_bootstrap_95_percent_ci": {
+          "confidence_level": 0.95,
+          "lower": 4562944.0,
+          "method": "seeded nonparametric percentile bootstrap of the median",
+          "resamples": 10000,
+          "seed": 20260803,
+          "upper": 4595712.0
+        },
+        "minimum": 4464640.0,
+        "p50": 4591616.0,
+        "p95": 4663910.4,
+        "percentile_method": "type-7 linear interpolation",
+        "sample_count": 30,
+        "sample_standard_deviation": 50687.36393424202
+      },
+      "unit": "bytes"
+    },
+    "observed_rss_resident_bytes": {
+      "missing_sample_count": 0,
+      "observed_sample_count": 30,
+      "statistics": {
+        "maximum": 4669440.0,
+        "mean": 4579191.466666667,
+        "median": 4591616.0,
+        "median_bootstrap_95_percent_ci": {
+          "confidence_level": 0.95,
+          "lower": 4562944.0,
+          "method": "seeded nonparametric percentile bootstrap of the median",
+          "resamples": 10000,
+          "seed": 20260803,
+          "upper": 4595712.0
+        },
+        "minimum": 4464640.0,
+        "p50": 4591616.0,
+        "p95": 4663910.4,
+        "percentile_method": "type-7 linear interpolation",
+        "sample_count": 30,
+        "sample_standard_deviation": 50687.36393424202
+      },
+      "unit": "bytes"
+    }
+  },
+  "child_page_faults": {
+    "major": {
+      "maximum": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "median_bootstrap_95_percent_ci": {
+        "confidence_level": 0.95,
+        "lower": 0.0,
+        "method": "seeded nonparametric percentile bootstrap of the median",
+        "resamples": 10000,
+        "seed": 20260803,
+        "upper": 0.0
+      },
+      "minimum": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "percentile_method": "type-7 linear interpolation",
+      "sample_count": 30,
+      "sample_standard_deviation": 0.0
+    },
+    "minor": {
+      "maximum": 265.0,
+      "mean": 246.63333333333333,
+      "median": 249.5,
+      "median_bootstrap_95_percent_ci": {
+        "confidence_level": 0.95,
+        "lower": 247.5,
+        "method": "seeded nonparametric percentile bootstrap of the median",
+        "resamples": 10000,
+        "seed": 20260803,
+        "upper": 250.5
+      },
+      "minimum": 232.0,
+      "p50": 249.5,
+      "p95": 253.0,
+      "percentile_method": "type-7 linear interpolation",
+      "sample_count": 30,
+      "sample_standard_deviation": 7.876124258373108
+    }
+  },
+  "correctness": {
+    "all_measured_trials_match_gate": true,
+    "all_successful_trials_have_observability": true,
+    "binary_unchanged_during_experiment": true,
+    "exact_generation_bytes_per_token": {
+      "all_successful_trials_equal": true,
+      "bytes_per_generated_token": 1976.0,
+      "denominator_generated_tokens": 4,
+      "numerator_physical_read_bytes": 7904
+    },
+    "gate_projection_digest": "sha256:e5f1e605cd7a64177c4965a00ee24e2adcac16314e1c4b09d6de5015ea8bfa6e",
+    "outcome": "pass",
+    "parity_pass_fraction": {
+      "denominator": 30,
+      "numerator": 30,
+      "value": 1.0
+    },
+    "projection_match_fraction": {
+      "denominator": 30,
+      "numerator": 30,
+      "value": 1.0
+    }
+  },
+  "deterministic_cache_metrics": {
+    "admissions": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 4
+    },
+    "demand_bytes": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 196642
+    },
+    "evictions": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 3
+    },
+    "hits": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 1
+    },
+    "misses": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 4
+    },
+    "physical_read_bytes": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 196625
+    }
+  },
+  "experiment_id": "m2-data-plane-20260803",
+  "interpretation": {
+    "performance_claim": "none; wall time characterizes this validation command only",
+    "scope": "M2 parity, verified I/O accounting, and fixed-trace cache behavior",
+    "shared_host_caveat": "virtualized-host timing is noisy and uncontrolled"
+  },
+  "schema_version": 1,
+  "source_observations_sha256": "sha256:7c3fe4408b5c0c0da5ce693c90a8f7a8150ae80e902cd26939067e0a1412ddcc",
+  "status_counts": {
+    "ok": 30
+  },
+  "successful_trial_count": 30,
+  "trial_count": 30,
+  "wall_time_nanoseconds": {
+    "maximum": 21445781.0,
+    "mean": 12595501.3,
+    "median": 11284557.0,
+    "median_bootstrap_95_percent_ci": {
+      "confidence_level": 0.95,
+      "lower": 10446922.5,
+      "method": "seeded nonparametric percentile bootstrap of the median",
+      "resamples": 10000,
+      "seed": 20260803,
+      "upper": 12292138.5
+    },
+    "minimum": 9632209.0,
+    "p50": 11284557.0,
+    "p95": 20800832.349999998,
+    "percentile_method": "type-7 linear interpolation",
+    "sample_count": 30,
+    "sample_standard_deviation": 3569145.0055477754
+  }
+}

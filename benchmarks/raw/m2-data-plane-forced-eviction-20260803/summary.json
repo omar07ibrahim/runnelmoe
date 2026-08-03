@@ -1,0 +1,271 @@
+{
+  "cache_and_rss_distributions": {
+    "cache_io_nanoseconds": {
+      "missing_sample_count": 0,
+      "observed_sample_count": 30,
+      "statistics": {
+        "maximum": 103527.0,
+        "mean": 62355.73333333333,
+        "median": 58204.0,
+        "median_bootstrap_95_percent_ci": {
+          "confidence_level": 0.95,
+          "lower": 55868.0,
+          "method": "seeded nonparametric percentile bootstrap of the median",
+          "resamples": 10000,
+          "seed": 20260803,
+          "upper": 61494.5
+        },
+        "minimum": 48343.0,
+        "p50": 58204.0,
+        "p95": 91705.54999999997,
+        "percentile_method": "type-7 linear interpolation",
+        "sample_count": 30,
+        "sample_standard_deviation": 13403.832701837582
+      },
+      "unit": "nanoseconds"
+    },
+    "cache_wait_nanoseconds": {
+      "missing_sample_count": 0,
+      "observed_sample_count": 30,
+      "statistics": {
+        "maximum": 381075.0,
+        "mean": 328257.43333333335,
+        "median": 322111.5,
+        "median_bootstrap_95_percent_ci": {
+          "confidence_level": 0.95,
+          "lower": 314795.5,
+          "method": "seeded nonparametric percentile bootstrap of the median",
+          "resamples": 10000,
+          "seed": 20260803,
+          "upper": 326996.0
+        },
+        "minimum": 303549.0,
+        "p50": 322111.5,
+        "p95": 377931.95,
+        "percentile_method": "type-7 linear interpolation",
+        "sample_count": 30,
+        "sample_standard_deviation": 23618.554933580817
+      },
+      "unit": "nanoseconds"
+    },
+    "observed_rss_peak_bytes": {
+      "missing_sample_count": 0,
+      "observed_sample_count": 30,
+      "statistics": {
+        "maximum": 4808704.0,
+        "mean": 4695517.866666666,
+        "median": 4691968.0,
+        "median_bootstrap_95_percent_ci": {
+          "confidence_level": 0.95,
+          "lower": 4683776.0,
+          "method": "seeded nonparametric percentile bootstrap of the median",
+          "resamples": 10000,
+          "seed": 20260803,
+          "upper": 4696064.0
+        },
+        "minimum": 4612096.0,
+        "p50": 4691968.0,
+        "p95": 4766720.0,
+        "percentile_method": "type-7 linear interpolation",
+        "sample_count": 30,
+        "sample_standard_deviation": 44772.41076264322
+      },
+      "unit": "bytes"
+    },
+    "observed_rss_resident_bytes": {
+      "missing_sample_count": 0,
+      "observed_sample_count": 30,
+      "statistics": {
+        "maximum": 4808704.0,
+        "mean": 4695517.866666666,
+        "median": 4691968.0,
+        "median_bootstrap_95_percent_ci": {
+          "confidence_level": 0.95,
+          "lower": 4683776.0,
+          "method": "seeded nonparametric percentile bootstrap of the median",
+          "resamples": 10000,
+          "seed": 20260803,
+          "upper": 4696064.0
+        },
+        "minimum": 4612096.0,
+        "p50": 4691968.0,
+        "p95": 4766720.0,
+        "percentile_method": "type-7 linear interpolation",
+        "sample_count": 30,
+        "sample_standard_deviation": 44772.41076264322
+      },
+      "unit": "bytes"
+    }
+  },
+  "child_page_faults": {
+    "major": {
+      "maximum": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "median_bootstrap_95_percent_ci": {
+        "confidence_level": 0.95,
+        "lower": 0.0,
+        "method": "seeded nonparametric percentile bootstrap of the median",
+        "resamples": 10000,
+        "seed": 20260803,
+        "upper": 0.0
+      },
+      "minimum": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "percentile_method": "type-7 linear interpolation",
+      "sample_count": 30,
+      "sample_standard_deviation": 0.0
+    },
+    "minor": {
+      "maximum": 284.0,
+      "mean": 264.3666666666667,
+      "median": 263.0,
+      "median_bootstrap_95_percent_ci": {
+        "confidence_level": 0.95,
+        "lower": 262.0,
+        "method": "seeded nonparametric percentile bootstrap of the median",
+        "resamples": 10000,
+        "seed": 20260803,
+        "upper": 264.0
+      },
+      "minimum": 261.0,
+      "p50": 263.0,
+      "p95": 274.79999999999995,
+      "percentile_method": "type-7 linear interpolation",
+      "sample_count": 30,
+      "sample_standard_deviation": 5.261986863070492
+    }
+  },
+  "correctness": {
+    "all_measured_trials_match_gate": true,
+    "all_successful_trials_have_observability": true,
+    "all_successful_trials_revalidated": true,
+    "binary_unchanged_during_experiment": true,
+    "exact_generation_bytes_per_token": {
+      "all_successful_trials_equal": true,
+      "bytes_per_generated_token": 1976.0,
+      "definition": "one async cache-backed cold object-payload load divided by subsequently generated tokens; excludes metadata, the synchronous comparator, and the separate forced-eviction path",
+      "denominator_generated_tokens": 4,
+      "numerator_physical_read_bytes": 7904
+    },
+    "forced_eviction_full_generation_parity_fraction": {
+      "denominator": 30,
+      "numerator": 30,
+      "value": 1.0
+    },
+    "gate_projection_digest": "sha256:6613b1a34d4e4ce98bcb6dc877c12377bf9483739a7f84d97bbd9b58c11a35bb",
+    "outcome": "pass",
+    "parity_pass_fraction": {
+      "denominator": 30,
+      "numerator": 30,
+      "value": 1.0
+    },
+    "projection_match_fraction": {
+      "denominator": 30,
+      "numerator": 30,
+      "value": 1.0
+    }
+  },
+  "deterministic_cache_metrics": {
+    "admissions": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 4
+    },
+    "demand_bytes": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 196642
+    },
+    "evictions": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 3
+    },
+    "hits": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 1
+    },
+    "misses": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 4
+    },
+    "physical_read_bytes": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 196625
+    }
+  },
+  "deterministic_forced_eviction_metrics": {
+    "admissions": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 3
+    },
+    "demand_bytes": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 239424
+    },
+    "evictions": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 2
+    },
+    "hits": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 20
+    },
+    "misses": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 3
+    },
+    "physical_read_bytes": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 81344
+    },
+    "trace_event_count": {
+      "all_successful_trials_equal": true,
+      "observed_sample_count": 30,
+      "value": 31
+    }
+  },
+  "experiment_id": "m2-data-plane-forced-eviction-20260803",
+  "interpretation": {
+    "performance_claim": "none; wall time characterizes this validation command only",
+    "scope": "M2 full-generation parity under forced eviction, verified I/O accounting, and fixed-trace cache behavior",
+    "shared_host_caveat": "virtualized-host timing is noisy and uncontrolled"
+  },
+  "schema_version": 2,
+  "source_observations_sha256": "sha256:153769863c49560513ce950f8f1e92ba57da9b912a2951fff5ac4a5df872175e",
+  "status_counts": {
+    "ok": 30
+  },
+  "successful_trial_count": 30,
+  "trial_count": 30,
+  "wall_time_nanoseconds": {
+    "maximum": 14829820.0,
+    "mean": 13132186.866666667,
+    "median": 12397321.0,
+    "median_bootstrap_95_percent_ci": {
+      "confidence_level": 0.95,
+      "lower": 12057114.0,
+      "method": "seeded nonparametric percentile bootstrap of the median",
+      "resamples": 10000,
+      "seed": 20260803,
+      "upper": 14413843.0
+    },
+    "minimum": 11733177.0,
+    "p50": 12397321.0,
+    "p95": 14703078.149999999,
+    "percentile_method": "type-7 linear interpolation",
+    "sample_count": 30,
+    "sample_standard_deviation": 1265532.7990412393
+  }
+}
