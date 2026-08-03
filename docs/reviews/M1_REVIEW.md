@@ -5,7 +5,8 @@
 - Scope: RMOA parser/verifier, deterministic artifact generator, scalar Rust
   adapter, PyTorch oracle, committed vectors, CLI, CI, and public claims
 - Local verdict: pass
-- Remote CI: pending first feature-branch push
+- Implementation commit: `904233cf75152e6c0df025e17a396c3290623f80`
+- Remote CI: [pass, all three jobs](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30790376933)
 
 ## Acceptance evidence
 
@@ -92,8 +93,9 @@ loader, and there are no latency, throughput, memory-scaling, or speedup claims.
 
 ## Residual work
 
-M1 closes only after the feature commit and this review pass all remote CI jobs.
-M2 owns descriptor-relative filesystem traversal, bounded sync/async positional
+The implementation commit and review passed the remote repository-contract,
+Rust, and oracle jobs; the M1 gate is closed. M2 owns descriptor-relative
+filesystem traversal, bounded sync/async positional
 I/O, transactional CAS publication, cancellation/deadline behavior, full
 memory/disk ledgers, cache leases, and fault injection under concurrent
 substitution.
