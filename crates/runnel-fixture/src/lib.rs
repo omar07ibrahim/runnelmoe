@@ -13,6 +13,7 @@ use std::{
 };
 
 use runnel_format::{ArtifactBytes, Digest};
+use runnel_kernels::Bf16;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -82,6 +83,52 @@ pub struct TensorRecipe {
     pub shape: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TinyAdapterVersion {
+    V1,
+    V2,
+}
+
+impl TinyAdapterVersion {
+    const fn number(self) -> u64 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    const fn tensor_dtype(self, tensor_id: u64) -> FixtureDType {
+        if matches!(self, Self::V2) && matches!(tensor_id, 8..=19) {
+            FixtureDType::Bf16
+        } else {
+            FixtureDType::F32
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureDType {
+    F32,
+    Bf16,
+}
+
+impl FixtureDType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::F32 => "f32-le",
+            Self::Bf16 => "bf16-le",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EncodedTensor {
+    recipe: TensorRecipe,
+    dtype: FixtureDType,
+    offset: usize,
+    length: usize,
+}
+
 /// All bytes needed to materialize the deterministic tiny RMOA artifact.
 ///
 /// The artifact is kept as generated source data rather than committed model
@@ -128,16 +175,33 @@ pub enum FixtureError {
 }
 
 impl FixtureArtifact {
+    /// Builds the immutable all-f32 tiny-v1 fixture.
     #[must_use]
     pub fn build() -> Self {
+        Self::build_for(TinyAdapterVersion::V1)
+    }
+
+    /// Builds tiny-v2, which stores only routed-expert matrices as BF16.
+    #[must_use]
+    pub fn build_v2() -> Self {
+        Self::build_for(TinyAdapterVersion::V2)
+    }
+
+    fn build_for(adapter_version: TinyAdapterVersion) -> Self {
         let recipes = tensor_recipes();
         let mut object = Vec::new();
         let mut descriptors = Vec::with_capacity(recipes.len());
         for recipe in recipes {
+            let dtype = adapter_version.tensor_dtype(recipe.id);
             let offset = object.len();
-            let bytes = recipe.little_endian_bytes();
+            let bytes = recipe.encoded_bytes(dtype);
             object.extend_from_slice(&bytes);
-            descriptors.push((recipe, offset, bytes.len()));
+            descriptors.push(EncodedTensor {
+                recipe,
+                dtype,
+                offset,
+                length: bytes.len(),
+            });
         }
 
         let object_digest = Digest::of(&object);
@@ -149,6 +213,7 @@ impl FixtureArtifact {
             object.len(),
             page_table_digest,
             page_table.len(),
+            adapter_version.number(),
         );
 
         Self {
@@ -309,6 +374,21 @@ impl TensorRecipe {
         }
         bytes
     }
+
+    fn encoded_bytes(&self, dtype: FixtureDType) -> Vec<u8> {
+        match dtype {
+            FixtureDType::F32 => self.little_endian_bytes(),
+            FixtureDType::Bf16 => {
+                let mut bytes = Vec::with_capacity(self.element_count() * size_of::<u16>());
+                for item in self.values() {
+                    let word = Bf16::try_from_f32_rne(item)
+                        .expect("the frozen finite fixture formula must fit BF16");
+                    bytes.extend_from_slice(&word.to_bits().to_le_bytes());
+                }
+                bytes
+            }
+        }
+    }
 }
 
 #[must_use]
@@ -383,18 +463,20 @@ fn build_page_table(object: &[u8], object_digest: Digest) -> Vec<u8> {
 }
 
 fn build_manifest(
-    tensors: &[(TensorRecipe, usize, usize)],
+    tensors: &[EncodedTensor],
     object_digest: Digest,
     object_length: usize,
     page_table_digest: Digest,
     page_table_length: usize,
+    adapter_version: u64,
 ) -> Vec<u8> {
     let mut tensor_json = String::new();
-    for (index, (recipe, offset, length)) in tensors.iter().enumerate() {
+    for (index, tensor) in tensors.iter().enumerate() {
         if index != 0 {
             tensor_json.push(',');
         }
-        let shape = recipe
+        let shape = tensor
+            .recipe
             .shape
             .iter()
             .map(usize::to_string)
@@ -402,8 +484,12 @@ fn build_manifest(
             .join(",");
         write!(
             tensor_json,
-            "{{\"dtype\":\"f32-le\",\"id\":{},\"length\":{length},\"object\":\"{object_digest}\",\"offset\":{offset},\"role\":\"{}\",\"shape\":[{shape}]}}",
-            recipe.id, recipe.role
+            "{{\"dtype\":\"{}\",\"id\":{},\"length\":{},\"object\":\"{object_digest}\",\"offset\":{},\"role\":\"{}\",\"shape\":[{shape}]}}",
+            tensor.dtype.as_str(),
+            tensor.recipe.id,
+            tensor.length,
+            tensor.offset,
+            tensor.recipe.role,
         )
         .expect("writing to String cannot fail");
     }
@@ -411,7 +497,7 @@ fn build_manifest(
     format!(
         concat!(
             "{{",
-            "\"adapter\":{{\"id\":\"runnel.tiny-causal-moe\",\"version\":1}},",
+            "\"adapter\":{{\"id\":\"runnel.tiny-causal-moe\",\"version\":{}}},",
             "\"format\":\"rmoa\",",
             "\"model\":{{",
             "\"context_length\":16,",
@@ -435,7 +521,12 @@ fn build_manifest(
             "\"version\":1",
             "}}\n"
         ),
-        object_digest, object_length, page_table_digest, page_table_length, tensor_json,
+        adapter_version,
+        object_digest,
+        object_length,
+        page_table_digest,
+        page_table_length,
+        tensor_json,
     )
     .into_bytes()
 }
@@ -542,7 +633,7 @@ fn io(operation: &'static str, source: std::io::Error) -> FixtureError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runnel_format::{Artifact, Limits, Manifest};
+    use runnel_format::{Artifact, DType, Limits, Manifest};
 
     #[test]
     fn recipe_is_contiguous_and_complete() {
@@ -569,11 +660,35 @@ mod tests {
     }
 
     #[test]
-    fn generated_artifact_is_canonical_and_verified() {
+    fn tiny_v1_identity_and_all_f32_contract_are_frozen() {
         let fixture = FixtureArtifact::build();
         let manifest = Manifest::parse(fixture.manifest_bytes()).unwrap();
         assert_eq!(manifest.artifact_id(), fixture.identity().artifact_id);
+        assert_eq!(manifest.adapter.version, 1);
         assert_eq!(manifest.tensors.len(), 22);
+        assert!(
+            manifest
+                .tensors
+                .iter()
+                .all(|tensor| tensor.dtype == DType::F32Le)
+        );
+
+        let identity = fixture.identity();
+        assert_eq!(fixture.manifest_bytes().len(), 4_488);
+        assert_eq!(identity.object_length, 7_904);
+        assert_eq!(identity.page_table_length, 96);
+        assert_eq!(
+            identity.artifact_id.to_string(),
+            "sha256:e49321cefc980ab59cd449341edfc624ccfc4b0b703cd175184e056d296d9ed3"
+        );
+        assert_eq!(
+            identity.object_digest.to_string(),
+            "sha256:6b2b8a1bbb2854084b1e1fe1e5787a9cfdb021b397e774fc7dbef79ac9d24bf6"
+        );
+        assert_eq!(
+            identity.page_table_digest.to_string(),
+            "sha256:29383b56a150f9e5705f3666ca7707f21bc3fbd663ffd7249f4ecb938da6a62d"
+        );
 
         let artifact = Artifact::from_bytes(fixture.to_parts(), Limits::default()).unwrap();
         assert_eq!(artifact.artifact_id(), fixture.identity().artifact_id);
@@ -581,6 +696,91 @@ mod tests {
             artifact.tensor_by_role("lm_head").unwrap().bytes.len(),
             32 * 8 * 4
         );
+    }
+
+    #[test]
+    fn tiny_v2_pins_mixed_dtype_layout_and_exact_rne_bytes() {
+        let version_one =
+            Artifact::from_bytes(FixtureArtifact::build().to_parts(), Limits::default()).unwrap();
+        let fixture = FixtureArtifact::build_v2();
+        let identity = fixture.identity();
+
+        assert_eq!(fixture.manifest_bytes().len(), 4_500);
+        assert_eq!(identity.object_length, 5_600);
+        assert_eq!(identity.page_table_length, 96);
+        assert_eq!(
+            identity.artifact_id.to_string(),
+            "sha256:606baa0c1082b369632b5dd000d30dc51ae20321b2c032ef3395aaa0bfd7c76c"
+        );
+        assert_eq!(
+            identity.object_digest.to_string(),
+            "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab"
+        );
+        assert_eq!(
+            identity.page_table_digest.to_string(),
+            "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c"
+        );
+
+        let version_two = Artifact::from_bytes(fixture.to_parts(), Limits::default()).unwrap();
+        assert_eq!(version_two.artifact_id(), identity.artifact_id);
+        assert_eq!(version_two.manifest().adapter.version, 2);
+        assert_eq!(version_two.manifest().tensors.len(), 22);
+
+        let mut f32_tensors = 0;
+        let mut bf16_tensors = 0;
+        for (version_one_descriptor, version_two_descriptor) in version_one
+            .manifest()
+            .tensors
+            .iter()
+            .zip(&version_two.manifest().tensors)
+        {
+            assert_eq!(version_two_descriptor.id, version_one_descriptor.id);
+            assert_eq!(version_two_descriptor.role, version_one_descriptor.role);
+            assert_eq!(version_two_descriptor.shape, version_one_descriptor.shape);
+
+            let version_one_bytes = version_one
+                .tensor_bytes(version_one_descriptor.id)
+                .expect("v1 tensor bytes are verified");
+            let version_two_bytes = version_two
+                .tensor_bytes(version_two_descriptor.id)
+                .expect("v2 tensor bytes are verified");
+
+            if matches!(version_two_descriptor.id, 8..=19) {
+                bf16_tensors += 1;
+                assert_eq!(version_two_descriptor.dtype, DType::Bf16Le);
+                assert_eq!(version_two_descriptor.length, 192);
+                assert_eq!(
+                    version_two_descriptor.offset,
+                    2_240 + 192 * (version_two_descriptor.id - 8)
+                );
+                assert_eq!(version_two_bytes.len() * 2, version_one_bytes.len());
+
+                for (version_one_word, version_two_word) in version_one_bytes
+                    .chunks_exact(size_of::<f32>())
+                    .zip(version_two_bytes.chunks_exact(size_of::<u16>()))
+                {
+                    let source = f32::from_le_bytes(version_one_word.try_into().unwrap());
+                    let actual = u16::from_le_bytes(version_two_word.try_into().unwrap());
+                    let expected = Bf16::try_from_f32_rne(source).unwrap();
+                    assert_eq!(actual, expected.to_bits());
+                    assert_eq!(expected.to_f32().to_bits(), source.to_bits());
+                }
+            } else {
+                f32_tensors += 1;
+                assert_eq!(version_two_descriptor.dtype, DType::F32Le);
+                assert_eq!(version_two_descriptor.length, version_one_descriptor.length);
+                assert_eq!(version_two_bytes, version_one_bytes);
+                if version_two_descriptor.id <= 7 {
+                    assert_eq!(version_two_descriptor.offset, version_one_descriptor.offset);
+                }
+            }
+        }
+
+        assert_eq!(bf16_tensors, 12);
+        assert_eq!(f32_tensors, 10);
+        assert_eq!(version_two.manifest().tensors[20].offset, 4_544);
+        assert_eq!(version_two.manifest().tensors[21].offset, 4_576);
+        assert_eq!(version_two.manifest().tensors[21].length, 1_024);
     }
 
     #[test]

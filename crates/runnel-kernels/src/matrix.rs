@@ -1,11 +1,18 @@
 use crate::{Bf16, BufferRole, KernelError};
 
 /// A finite, dense, row-major BF16 matrix in compact host-endian storage.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Bf16Matrix {
     rows: usize,
     columns: usize,
-    words: Box<[u16]>,
+    storage: Box<[u16]>,
+    word_offset: usize,
+}
+
+impl PartialEq for Bf16Matrix {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows && self.columns == other.columns && self.words() == other.words()
+    }
 }
 
 impl Bf16Matrix {
@@ -20,20 +27,50 @@ impl Bf16Matrix {
         columns: usize,
         words: impl Into<Box<[u16]>>,
     ) -> Result<Self, KernelError> {
+        Self::from_storage(rows, columns, words, 0)
+    }
+
+    /// Builds a compact matrix whose logical words begin at an owned-storage
+    /// offset.
+    ///
+    /// The storage must contain exactly `word_offset` prefix words followed by
+    /// the checked row-major matrix length. Prefix words are padding: they are
+    /// retained for allocation alignment experiments but are never exposed,
+    /// validated as weights, or passed to a kernel. Equality is defined over
+    /// dimensions and logical words, not prefix contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid dimensions, offset/size overflow, an
+    /// inexact owned-storage length, or a nonfinite logical matrix word.
+    pub fn from_storage(
+        rows: usize,
+        columns: usize,
+        storage: impl Into<Box<[u16]>>,
+        word_offset: usize,
+    ) -> Result<Self, KernelError> {
         validate_dimensions(rows, columns)?;
-        let expected = checked_elements(rows, columns)?;
-        let words = words.into();
-        if words.len() != expected {
+        let logical_words = checked_elements(rows, columns)?;
+        let expected_storage_words =
+            word_offset
+                .checked_add(logical_words)
+                .ok_or(KernelError::SizeOverflow {
+                    buffer: BufferRole::Weights,
+                })?;
+        let storage = storage.into();
+        if storage.len() != expected_storage_words {
             return Err(KernelError::MatrixLengthMismatch {
-                expected_words: expected,
-                actual_words: words.len(),
+                expected_words: expected_storage_words,
+                actual_words: storage.len(),
             });
         }
-        validate_finite_words(&words)?;
+        let logical = &storage[word_offset..expected_storage_words];
+        validate_finite_words(logical)?;
         Ok(Self {
             rows,
             columns,
-            words,
+            storage,
+            word_offset,
         })
     }
 
@@ -101,17 +138,17 @@ impl Bf16Matrix {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.words.len()
+        self.rows * self.columns
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.words.is_empty()
+        self.len() == 0
     }
 
     #[must_use]
     pub fn words(&self) -> &[u16] {
-        &self.words
+        &self.storage[self.word_offset..]
     }
 
     #[must_use]
@@ -119,7 +156,7 @@ impl Bf16Matrix {
         if row >= self.rows || column >= self.columns {
             return None;
         }
-        Some(Bf16::from_bits(self.words[row * self.columns + column]))
+        Some(Bf16::from_bits(self.words()[row * self.columns + column]))
     }
 }
 

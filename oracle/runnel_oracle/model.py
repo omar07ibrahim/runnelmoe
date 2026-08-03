@@ -25,6 +25,43 @@ class OracleOutput:
     routes: RouteTrace
 
 
+def bf16_storage_round_trip(values: Tensor) -> Tensor:
+    """Model finite f32 artifact values stored as BF16 and widened for compute."""
+
+    if values.dtype != torch.float32:
+        raise ValueError("BF16 storage conversion requires float32 source values")
+    if not bool(torch.all(torch.isfinite(values))):
+        raise ValueError("BF16 storage conversion requires finite source values")
+    widened = values.to(torch.bfloat16).to(torch.float32)
+    if not bool(torch.all(torch.isfinite(widened))):
+        raise ValueError("BF16 storage conversion produced a non-finite value")
+    return widened
+
+
+def formula_tensor(spec: FixtureSpec, tensor: TensorSpec) -> Tensor:
+    """Construct one f32 tensor from the fixture's exact integer recipe."""
+
+    count = math.prod(tensor.shape)
+    flat_index = torch.arange(count, dtype=torch.int64)
+    recipe = spec.recipe
+    numerator = (
+        recipe["multiplier_tensor"] * (tensor.tensor_id + 1)
+        + recipe["multiplier_index"] * (flat_index + 1)
+    ) % recipe["modulus"] - recipe["center"]
+    values = numerator.to(torch.float32)
+    if tensor.tensor_id in recipe["normalization_tensor_ids"]:
+        values = recipe["normalization_base"] + torch.ldexp(
+            values,
+            torch.tensor(-recipe["normalization_denominator_power_of_two"]),
+        )
+    else:
+        values = torch.ldexp(
+            values,
+            torch.tensor(-recipe["ordinary_denominator_power_of_two"]),
+        )
+    return values.reshape(tensor.shape).contiguous()
+
+
 def stable_top_k(scores: Tensor, k: int) -> Tensor:
     """Return IDs ordered by descending score, then ascending expert ID."""
 
@@ -57,25 +94,13 @@ class TinyMoEOracle:
         self.weights = {tensor.role: self._make_tensor(tensor) for tensor in spec.tensors}
 
     def _make_tensor(self, tensor: TensorSpec) -> Tensor:
-        count = math.prod(tensor.shape)
-        flat_index = torch.arange(count, dtype=torch.int64)
-        recipe = self.spec.recipe
-        numerator = (
-            recipe["multiplier_tensor"] * (tensor.tensor_id + 1)
-            + recipe["multiplier_index"] * (flat_index + 1)
-        ) % recipe["modulus"] - recipe["center"]
-        values = numerator.to(torch.float32)
-        if tensor.tensor_id in recipe["normalization_tensor_ids"]:
-            values = recipe["normalization_base"] + torch.ldexp(
-                values,
-                torch.tensor(-recipe["normalization_denominator_power_of_two"]),
-            )
-        else:
-            values = torch.ldexp(
-                values,
-                torch.tensor(-recipe["ordinary_denominator_power_of_two"]),
-            )
-        return values.reshape(tensor.shape).contiguous()
+        values = formula_tensor(self.spec, tensor)
+        if tensor.storage_dtype == "bf16-le":
+            values = bf16_storage_round_trip(values)
+        elif tensor.storage_dtype != "f32-le":
+            raise ValueError(f"unsupported storage dtype {tensor.storage_dtype}")
+        # Storage conversion is complete. All oracle arithmetic stays f32.
+        return values.contiguous()
 
     def _rms_norm(self, values: Tensor, weight_role: str) -> Tensor:
         mean_square = values.square().mean(dim=-1, keepdim=True)

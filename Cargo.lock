@@ -365,6 +365,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "runnel-format",
+ "runnel-kernels",
  "serde",
  "serde_json",
  "sha2",
@@ -394,6 +395,7 @@ version = "0.1.0"
 dependencies = [
  "runnel-fixture",
  "runnel-format",
+ "runnel-kernels",
  "serde",
  "serde_json",
  "tempfile",

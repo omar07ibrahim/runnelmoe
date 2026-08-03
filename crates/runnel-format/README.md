@@ -1,11 +1,12 @@
 # runnel-format
 
-This crate implements the byte-level M1 reader for the normative RMOA v1
-contract in [`docs/FORMAT.md`](../../docs/FORMAT.md). It rejects ambiguous JSON and validates the
-manifest schema, canonical representation, tensor coverage, content digests,
-page-table headers, and every object page before returning a tensor slice.
+This crate implements the byte-level reader for the normative RMOA v1 contract
+in [`docs/FORMAT.md`](../../docs/FORMAT.md), including the closed tiny-adapter
+version set. It rejects ambiguous JSON and validates the manifest schema,
+canonical representation, tensor coverage, content digests, page-table
+headers, and every object page before returning a tensor slice.
 
-M1 fixtures are deliberately tiny, so `Artifact` uses an explicit eager-memory
+Tiny fixtures are deliberately small, so `Artifact` uses an explicit eager-memory
 budget and retains verified bytes. Its filesystem convenience reader does not
 yet claim adversarial pathname safety. M2 must replace that traversal with
 retained directory descriptors, Linux `openat2` resolution (or a component-wise

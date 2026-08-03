@@ -15,6 +15,7 @@ committed vectors:
 ```console
 python -m pip install -r oracle/requirements.txt
 python -m oracle.generate --check
+python -m oracle.generate --check --spec fixtures/tiny-v2/spec.json
 python -m unittest discover -s oracle/tests -v
 ```
 
@@ -23,7 +24,15 @@ change:
 
 ```console
 python -m oracle.generate --write
+python -m oracle.generate --write --spec fixtures/tiny-v2/spec.json
 ```
+
+The default command remains the frozen all-float32 adapter-v1 fixture. The
+second command independently generates or checks adapter v2 in its own
+directory. For v2, only the twelve routed-expert matrices make an explicit
+PyTorch `float32 -> bfloat16 -> float32` round trip. This models compact BF16
+storage with round-to-nearest, ties-to-even while keeping all oracle arithmetic
+in float32. No adapter-v1 source or golden file is rewritten.
 
 `--check` compares token and route IDs exactly, rejects non-finite values, and
 compares floating-point values with the tolerances declared by the fixture. It

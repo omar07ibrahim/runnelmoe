@@ -20,7 +20,7 @@ const MIN_PAGE_SIZE: u32 = 65_536;
 const MAX_PAGE_SIZE: u32 = 2_097_152;
 const MAX_TENSOR_DIMENSION: u64 = 2_147_483_647;
 
-/// Operator limits for parsing M1 artifacts. Defaults are intentionally below
+/// Operator limits for parsing RMOA v1 artifacts. Defaults are intentionally below
 /// the interoperability ceilings in the format contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -31,7 +31,7 @@ pub struct Limits {
     pub aggregate_object_bytes: u64,
     pub page_table_bytes: u64,
     pub aggregate_page_table_bytes: u64,
-    /// Independent M1 budget for eagerly retained manifest, object, and page-table bytes.
+    /// Independent budget for eagerly retained manifest, object, and page-table bytes.
     pub eager_memory_bytes: u64,
 }
 
@@ -257,7 +257,7 @@ pub struct TensorRecord {
     pub shape: Vec<u32>,
 }
 
-/// A schema-checked, canonical RMOA v1 manifest for the M1 tiny adapter.
+/// A schema-checked, canonical RMOA v1 manifest for a supported tiny adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub adapter: Adapter,
@@ -382,14 +382,14 @@ fn parse_adapter(value: &JsonValue) -> Result<Adapter, FormatError> {
     let id = expect_string(required(object, "id", "$.adapter")?, "$.adapter.id")?;
     validate_identifier(id, "$.adapter.id")?;
     if id != "runnel.tiny-causal-moe" {
-        return schema("$.adapter.id", "unsupported M1 adapter ID");
+        return schema("$.adapter.id", "unsupported tiny adapter ID");
     }
     let version = positive_integer(
         required(object, "version", "$.adapter")?,
         "$.adapter.version",
     )?;
-    if version != 1 {
-        return schema("$.adapter.version", "unsupported M1 adapter version");
+    if !matches!(version, 1 | 2) {
+        return schema("$.adapter.version", "unsupported tiny adapter version");
     }
     Ok(Adapter {
         id: id.to_owned(),
@@ -667,7 +667,7 @@ fn parse_tensors(
             shape.push(u32::try_from(dimension).map_err(|_| {
                 schema_error(
                     &dimension_path,
-                    "dimension does not fit the M1 representation",
+                    "dimension does not fit the RMOA v1 representation",
                 )
             })?);
         }

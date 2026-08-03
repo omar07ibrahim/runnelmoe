@@ -74,6 +74,17 @@ impl GemvWorkspace {
     pub fn rows(&self) -> usize {
         self.temporary_output.len()
     }
+
+    /// Changes the logical row count while retaining the allocation whenever
+    /// the requested size fits its existing capacity.
+    ///
+    /// Prepared operations still require an exact logical row count. Callers
+    /// that need to reuse one maximum-sized allocation across differently
+    /// shaped GEMVs can resize it immediately before each invocation without
+    /// weakening that validation contract.
+    pub fn resize_rows(&mut self, rows: usize) {
+        self.temporary_output.resize(rows, 0.0);
+    }
 }
 
 /// A dimension-checked GEMV with dispatch resolved outside execution.

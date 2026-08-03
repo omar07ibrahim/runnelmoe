@@ -28,6 +28,41 @@ fn exact_row_major_case_prevents_transpose_errors() {
 }
 
 #[test]
+fn one_word_owned_prefix_preserves_each_backend_result() {
+    let logical_words = [1_i16, 2, 3, 4, -2, 1, 0, 3, 7, -1, 2, -4]
+        .map(|value| Bf16::from_f32_rne(f32::from(value)).to_bits());
+    let natural = Bf16Matrix::from_words(3, 4, logical_words.to_vec()).unwrap();
+    let mut storage = Vec::with_capacity(logical_words.len() + 1);
+    storage.push(0x7fc1);
+    storage.extend_from_slice(&logical_words);
+    let offset = Bf16Matrix::from_storage(3, 4, storage, 1).unwrap();
+    let input_values = [2.0, -1.0, 0.5, 3.0];
+    let input = FiniteInput::new(&input_values).unwrap();
+
+    for request in [BackendRequest::Scalar, BackendRequest::Avx2] {
+        if request == BackendRequest::Avx2 && !Capabilities::detected().avx2_available() {
+            continue;
+        }
+        let mut natural_workspace = GemvWorkspace::new(3);
+        let mut offset_workspace = GemvWorkspace::new(3);
+        let mut natural_output = [f32::NAN; 3];
+        let mut offset_output = [f32::NAN; 3];
+        PreparedGemv::new(&natural, input, request)
+            .unwrap()
+            .run(&mut natural_workspace, &mut natural_output)
+            .unwrap();
+        PreparedGemv::new(&offset, input, request)
+            .unwrap()
+            .run(&mut offset_workspace, &mut offset_output)
+            .unwrap();
+        assert_eq!(
+            offset_output.map(f32::to_bits),
+            natural_output.map(f32::to_bits)
+        );
+    }
+}
+
+#[test]
 fn every_tail_and_boundary_meets_each_backends_f64_bound() {
     let mut state = 0x6a09_e667_f3bc_c909_u64;
     let columns = (1..=33).chain([255, 256, 257, 4095, 4096, 4097]);
@@ -225,6 +260,52 @@ fn finite_and_dimension_validation_is_closed() {
             ..
         })
     ));
+}
+
+#[test]
+fn one_workspace_can_be_explicitly_resized_across_shapes() {
+    let wide = matrix_from_i16(12, 8, &[1; 12 * 8]);
+    let narrow = matrix_from_i16(8, 12, &[1; 8 * 12]);
+    let wide_input_values = [0.25_f32; 8];
+    let narrow_input_values = [0.5_f32; 12];
+
+    for request in [BackendRequest::Scalar, BackendRequest::Avx2] {
+        if request == BackendRequest::Avx2 && !Capabilities::detected().avx2_available() {
+            continue;
+        }
+
+        let wide_prepared = PreparedGemv::new(
+            &wide,
+            FiniteInput::new(&wide_input_values).unwrap(),
+            request,
+        )
+        .unwrap();
+        let narrow_prepared = PreparedGemv::new(
+            &narrow,
+            FiniteInput::new(&narrow_input_values).unwrap(),
+            request,
+        )
+        .unwrap();
+        let mut workspace = GemvWorkspace::new(12);
+
+        let mut wide_output = [f32::NAN; 12];
+        wide_prepared.run(&mut workspace, &mut wide_output).unwrap();
+        assert_eq!(wide_output.map(f32::to_bits), [2.0_f32.to_bits(); 12]);
+
+        workspace.resize_rows(8);
+        assert_eq!(workspace.rows(), 8);
+        let mut narrow_output = [f32::NAN; 8];
+        narrow_prepared
+            .run(&mut workspace, &mut narrow_output)
+            .unwrap();
+        assert_eq!(narrow_output.map(f32::to_bits), [6.0_f32.to_bits(); 8]);
+
+        workspace.resize_rows(12);
+        assert_eq!(workspace.rows(), 12);
+        wide_output.fill(f32::NAN);
+        wide_prepared.run(&mut workspace, &mut wide_output).unwrap();
+        assert_eq!(wide_output.map(f32::to_bits), [2.0_f32.to_bits(); 12]);
+    }
 }
 
 fn check_backend(

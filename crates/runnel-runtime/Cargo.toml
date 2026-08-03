@@ -1,6 +1,6 @@
 [package]
 name = "runnel-runtime"
-description = "Safe scalar reference runtime for RunnelMoE"
+description = "Safe tiny MoE runtime with dispatched compact-BF16 experts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,13 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["native-avx2"]
+native-avx2 = ["runnel-kernels/native-avx2"]
+
 [dependencies]
 runnel-format = { path = "../runnel-format" }
+runnel-kernels = { path = "../runnel-kernels", default-features = false }
 thiserror.workspace = true
 
 [dev-dependencies]

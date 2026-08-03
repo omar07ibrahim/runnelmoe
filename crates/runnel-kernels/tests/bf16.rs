@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use runnel_kernels::{Bf16, Bf16Class, Bf16Matrix, KernelError};
 
 #[test]
@@ -90,5 +92,50 @@ fn matrix_loads_little_endian_and_rejects_nonfinite_words() {
     assert!(matches!(
         Bf16Matrix::from_words(1, 1, vec![0x7fc1]),
         Err(KernelError::NonFiniteWeight { .. })
+    ));
+}
+
+#[test]
+fn owned_prefix_exposes_only_the_exact_logical_matrix() {
+    let storage = vec![0x7f80, 0x3f80, 0xc000].into_boxed_slice();
+    let allocation_address = storage.as_ptr() as usize;
+    let matrix = Bf16Matrix::from_storage(1, 2, storage, 1).unwrap();
+    let logical_address = matrix.words().as_ptr() as usize;
+
+    assert_eq!(logical_address - allocation_address, size_of::<u16>());
+    assert_eq!(matrix.words(), &[0x3f80, 0xc000]);
+    assert_eq!(matrix.len(), 2);
+    assert_eq!(
+        matrix,
+        Bf16Matrix::from_words(1, 2, vec![0x3f80, 0xc000]).unwrap()
+    );
+}
+
+#[test]
+fn owned_prefix_rejects_bad_offsets_lengths_and_nonfinite_logical_words() {
+    assert!(matches!(
+        Bf16Matrix::from_storage(1, 2, vec![0_u16; 2], 1),
+        Err(KernelError::MatrixLengthMismatch {
+            expected_words: 3,
+            actual_words: 2,
+        })
+    ));
+    assert!(matches!(
+        Bf16Matrix::from_storage(1, 2, vec![0_u16; 4], 1),
+        Err(KernelError::MatrixLengthMismatch {
+            expected_words: 3,
+            actual_words: 4,
+        })
+    ));
+    assert!(matches!(
+        Bf16Matrix::from_storage(1, 1, vec![0_u16; 1], usize::MAX),
+        Err(KernelError::SizeOverflow { .. })
+    ));
+    assert!(matches!(
+        Bf16Matrix::from_storage(1, 1, vec![0_u16, 0x7fc1], 1),
+        Err(KernelError::NonFiniteWeight {
+            index: 0,
+            bits: 0x7fc1,
+        })
     ));
 }
