@@ -17,12 +17,14 @@ exists.
 
 ## M1 — exact tiny reference runtime
 
-- [ ] A deterministic generator emits a tiny hash-verified checkpoint.
-- [ ] Scalar Rust covers tokenization, causal state, top-k routing, expert
+- [x] A deterministic generator emits a tiny hash-verified checkpoint.
+- [x] Scalar Rust covers tokenization, causal state, top-k routing, expert
   dispatch, logits, greedy generation, and malformed-input rejection.
-- [ ] A separately organized PyTorch oracle agrees on routes, logits
+- [x] A separately organized PyTorch oracle agrees on routes, logits
   (declared tolerance), and generated tokens.
-- [ ] Committed fixtures and offline Rust tests pass from a clean checkout.
+- [x] Committed source fixtures and offline Rust tests pass from a clean
+  checkout. Evidence: [M1 review](reviews/M1_REVIEW.md) and
+  [green CI](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30790376933).
 
 ## M2 — out-of-core data plane
 

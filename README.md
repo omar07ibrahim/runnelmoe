@@ -6,9 +6,9 @@ available RAM. It is designed to make the hard tradeoffs visible: verified
 storage, bounded memory, asynchronous I/O, cache policy, numerical parity,
 request scheduling, and honest measurement.
 
-> Project status: M0 design/provenance is verified. The M1 tiny-reference
-> runtime is implemented and undergoing its milestone review/CI gate. There
-> are no performance or out-of-core execution claims yet.
+> Project status: M0 design/provenance and the M1 tiny-reference runtime are
+> verified. M2 out-of-core data-plane work is next. There are no performance or
+> out-of-core execution claims yet.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling
