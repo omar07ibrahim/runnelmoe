@@ -72,11 +72,16 @@ thread one GEMV, or change routing semantics.
 ### Native boundary
 
 A new `runnel-kernels` crate owns compact matrices, safe dispatch, and the only
-reviewed Rust unsafe island. Existing crates continue inheriting the workspace
-`unsafe_code = "forbid"` lint. The kernel crate instead denies unsafe
-operations inside unsafe functions, documents every proof obligation, and
-keeps native declarations, calls, and x86 control-register reads in one
+production Rust unsafe island. Existing crates continue inheriting the
+workspace `unsafe_code = "forbid"` lint. The kernel library instead denies
+unsafe operations inside unsafe functions, documents every proof obligation,
+and keeps native declarations, calls, and x86 control-register reads in one
 reviewed module with minimal documented unsafe blocks. Its public API is safe.
+The evidence-only benchmark binary has a second, separately reviewed platform
+module for Linux raw clocks, process resource counters, thread
+affinity/residency, and read-only MXCSR inspection. The binary denies unsafe
+code everywhere else; that probe module is not linked into the runtime library
+and does not widen the production API or ABI.
 
 The versioned C ABI uses no Rust layout, enum, boolean, allocation, callback,
 or ownership type:
@@ -183,10 +188,25 @@ Correctness separates representation, kernel order, and model semantics:
    so there is no universal fixed cross-backend tolerance beyond both paths'
    f64 forward-error gates. Exact hand-computable cases and row-distinct f64
    references prevent that bound from hiding indexing or transpose errors.
-4. Tiny v2 scalar and AVX2 execution require exact routes, expert IDs, greedy
-   tokens, and deterministic repetition. Logits and route weights use the
-   existing `atol = 1e-5`, `rtol = 1e-4` model gate against the independently
-   extended Python/PyTorch oracle. Tiny v1 identity and goldens remain exact.
+   If scalar execution itself fails, an independently completed AVX2 or staged
+   result still retains its own f64 proof; only its three unavailable
+   cross-scalar diagnostic fields are null.
+4. Tiny v2 scalar and AVX2 execution require exact selected expert IDs, greedy
+   tokens, and deterministic repetition. Continuous router scores, selected
+   route weights, and logits each use a componentwise
+   `abs_error / (atol + rtol * abs(expected)) <= 1` proof with the existing
+   `atol = 1e-5`, `rtol = 1e-4` model gate against the independently extended
+   Python/PyTorch oracle. Tiny v1 identity and golden-file custody remain
+   exact. A failed numerical gate retains its finite diagnostics rather than
+   relabeling tolerance parity as bitwise equality.
+
+The model ledger applies that fourth gate to both complete `run_tokens`
+positions and both cache-backed greedy-generation repetitions. Generation
+decision logits are joined to the oracle's separate step ledger; generation
+router scores, weights, and expert IDs are joined to the corresponding route
+positions. Once static golden and authenticated-fixture custody succeeds, a
+construction or execution error is retained as that check's closed
+`model_execution_error` row and does not truncate the other checks.
 
 Random differential shapes cover every tail from columns 1 through 33, the
 255/256/257 and 4095/4096/4097 boundaries, asymmetric orientations, and rows
@@ -275,6 +295,14 @@ clock surrounds only the fixed call batch. The call-indexed timed sink retains
 evidence from every repeated call; after the clock stops, both that sink and
 the final output buffer are consumed and validated.
 
+The recorded weight, input, and output address residues identify the compact
+matrix, finite input, and public caller-output/copy destination. The workspace
+temporary used as the native ABI output remains encapsulated by
+`PreparedGemv`; its address is not exposed by the production API. The residue
+is therefore buffer-reuse and publication-destination custody, not a claim
+about native-output alignment. The C ABI explicitly supports unaligned
+weights, input, and output.
+
 The exact experiment has thirteen paired comparison cells:
 
 - five one-thread scalar/AVX2 cells at the table's natural allocations;
@@ -304,6 +332,18 @@ raw fields.
 Failures, interruptions, timeouts, page faults, context switches, and CPU-time
 deltas remain raw; no outlier is removed.
 
+Each cell child flushes a canonical JSONL stream after every event: five
+self-authenticating warmup records followed by the sixty ordered observation
+records. The parent validates and retains the longest exact prefix after a
+timeout, nonzero exit, output-limit event, or malformed suffix, then fills only
+the missing grid keys with explicit failure rows. A failure discovered after
+all observations were flushed is attached to the final row without removing
+its timing, resource, affinity, output, or sink fields.
+Within a failed timed row, address residues, each completed worker record, and
+resource deltas are independently nullable and retained whenever their own
+probe completed; a missing resource snapshot does not erase valid affinity or
+address evidence, and migration/MXCSR mismatches remain visible as raw values.
+
 All 30 measured pairs (60 variant rows) in a cell must complete successfully
 before that cell receives a paired interval or any interval-based statement.
 The fixed 780-row grid may contain explicit failure-status rows, but a cell
@@ -311,6 +351,11 @@ with any unsuccessful row is marked incomplete: it reports status counts only,
 emits no inferential interval, and cannot satisfy either a cell-specific or
 general claim rule. Failed rows and their successful partners are never
 silently discarded or replaced.
+
+For every successful cell/implementation, archived verification also requires
+the call-indexed sink digest, final-output digest, and address residues to
+remain identical across all repeated identical-input batches. Worker CPU sets
+remain identical across both variants, every pair, and the full cell.
 
 Repeated calls use identical mathematical inputs, so final-output consumption
 alone is not an anti-elision proof for the inlinable Rust reference. Every call
@@ -389,30 +434,56 @@ The clean-commit harness performs a two-job, locked/offline, nonincremental
 release build in a private mode-0700 tmpfs child and rechecks the historical
 harness blob and executable before publication. Primary, vector-offset, and
 staging children inherit one-CPU affinity; two-worker children inherit their
-recorded two-physical-core set. Locale and timezone are controlled. On x86 the
+recorded two-physical-core set. The environment records the lowest allowed CPU
+for one-worker cells and the lowest second CPU with a distinct package/core
+identity for two-worker cells; archived verification derives the same sets
+from the recorded topology and joins every retained worker row. Locale and
+timezone are controlled. On x86 the
 harness records MXCSR before and after every kernel-calling thread, including
 each individually pinned two-worker thread, requires round-to-nearest with FTZ
 and DAZ clear, and rejects any change without modifying the register.
 Allowlisted metadata records CPU model/features, cpuset and affinity,
-cache/SMT/NUMA topology, governor/frequency availability, toolchains and flags,
-memory/tmpfs reserve, load average, and pre/post process resource counters. It
-never changes turbo, governor, firewall, host cache state, or floating-point
-mode.
+cache/SMT/NUMA topology, governor/frequency availability, Cargo/Rust compiler
+versions, resolved and hashed C compiler/archiver identities, exact native
+compiler/archiver argument vectors, memory/tmpfs reserve, load average, and
+pre/post process resource counters. Before building, capture parses the closed
+`build.rs` command chains and refuses any drift from the recorded native
+vectors. It never changes turbo, governor, firewall, host cache state, or
+floating-point mode.
 
 Live benchmark memory is capped at 256 MiB, evidence at 16 MiB, child stdout
 and stderr at 1 MiB each, one cell child at 180 seconds, and full capture at
-15 minutes. Capture requires at least 2 GiB free on its tmpfs build filesystem
-after the reserve. No build or measurement uses the constrained root
-filesystem, downloads a model, or creates a multi-gigabyte artifact.
+15 minutes. One absolute deadline bounds tool probes, source-custody checks,
+the private build, correctness commands, and every cell child; each subprocess
+receives no more than the remaining global duration. Capture requires at least
+2 GiB free on its tmpfs build filesystem after the reserve and 32 MiB free on
+the repository filesystem for exclusive staging of the bounded evidence
+directory. No build or measurement uses the constrained root filesystem,
+downloads a model, or creates a multi-gigabyte artifact.
+
+### Pre-capture implementation clarification
+
+The benchmark protocol implementation review completed on 2026-08-03 before
+the first timing observation was captured. It fixed the retained correctness
+ledger at thirteen kernel rows (five scalar, five AVX2, and three staged-f32)
+plus three full-model rows; moved finite-input validation, prepared dispatch,
+and two-worker setup outside the raw-clock interval; extended the model proof
+to cache-backed generation; retained post-start failure measurements; made
+cell output prefix-preserving; and made the benchmark-only platform module,
+continuous router-score tolerance, CPU and native-toolchain custody, absolute
+deadline, repeated-batch joins, and separate tmpfs/repository reserves explicit
+above. These clarifications do not change any case, cell, call count, pair
+order, statistic, interval, or claim rule.
 
 ## Consequences
 
-M4 adds one auditable unsafe island and one compact expert path rather than a
-general tensor library. Adapter v1 remains the exact reference. Adapter v2 can
-prove compact storage, numerical parity, dispatch, and sanitized native code,
-but it does not establish support for arbitrary models, MXFP4, BF16 arithmetic,
-threaded GEMM, other ISAs, or multi-NUMA execution. Timings characterize only
-the named synthetic cells on the recorded host.
+M4 adds one auditable production unsafe island, one evidence-only platform
+probe island, and one compact expert path rather than a general tensor library.
+Adapter v1 remains the exact reference. Adapter v2 can prove compact storage,
+numerical parity, dispatch, and sanitized native code, but it does not
+establish support for arbitrary models, MXFP4, BF16 arithmetic, threaded GEMM,
+other ISAs, or multi-NUMA execution. Timings characterize only the named
+synthetic cells on the recorded host.
 
 ## Primary sources
 

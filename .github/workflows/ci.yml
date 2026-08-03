@@ -48,6 +48,29 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test all targets
         run: cargo test --workspace --all-targets --locked
+      - name: Smoke-test the closed M4 evidence protocol
+        run: |
+          cargo build --locked -p runnel-kernels --bin runnel-kernel-bench \
+            -p runnel --bin runnel-m4-model-check
+          m4_smoke="$(mktemp -d /dev/shm/runnel-m4-smoke.XXXXXX)"
+          test "$(stat -c %a "$m4_smoke")" = 700
+          target/debug/runnel-kernel-bench cases > "$m4_smoke/cases.jsonl"
+          target/debug/runnel-kernel-bench correctness > "$m4_smoke/kernel.jsonl"
+          target/debug/runnel-m4-model-check > "$m4_smoke/model.jsonl"
+          PYTHONPATH=scripts python3 - "$m4_smoke" <<'PY'
+          import pathlib
+          import sys
+          import run_m4_experiment as evidence
+
+          root = pathlib.Path(sys.argv[1])
+          parse = lambda name: evidence.parse_jsonl_bytes(
+              (root / name).read_bytes(), name
+          )
+          evidence.validate_cases(parse("cases.jsonl"))
+          evidence.validate_correctness(
+              [*parse("kernel.jsonl"), *parse("model.jsonl")]
+          )
+          PY
       - name: Test scalar-only kernel and runtime build
         run: |
           scalar_target="$(mktemp -d /dev/shm/runnel-scalar-target.XXXXXX)"

@@ -13,6 +13,16 @@ build = "build.rs"
 default = ["native-avx2"]
 native-avx2 = []
 
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[[bin]]
+name = "runnel-kernel-bench"
+path = "src/bin/runnel-kernel-bench.rs"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

@@ -351,6 +351,7 @@ dependencies = [
  "clap",
  "runnel-fixture",
  "runnel-format",
+ "runnel-kernels",
  "runnel-runtime",
  "runnel-store",
  "serde",
@@ -388,6 +389,12 @@ dependencies = [
 [[package]]
 name = "runnel-kernels"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "runnel-runtime"
