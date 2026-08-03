@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use runnel_format::{Artifact, DType};
+use runnel_format::{Artifact, DType, Manifest, TensorRecord};
 
 use crate::{EOS_TOKEN, Result, RuntimeError, Tensor, TensorCatalog};
 
@@ -144,7 +144,30 @@ pub struct TinyModel {
 
 impl TinyModel {
     pub fn from_artifact(artifact: &Artifact) -> Result<Self> {
-        let manifest = artifact.manifest();
+        Self::from_verified_tensor_bytes(artifact.manifest(), |descriptor| {
+            artifact
+                .tensor_bytes(descriptor.id)
+                .map(|bytes| bytes.to_vec())
+                .ok_or_else(|| {
+                    RuntimeError::InvalidArtifact(format!(
+                        "verified bytes are unavailable for tensor {}",
+                        descriptor.role
+                    ))
+                })
+        })
+    }
+
+    /// Builds tiny-v1 from an authenticated manifest and caller-supplied
+    /// tensor bytes.
+    ///
+    /// This is the adapter boundary used by the out-of-core store: the caller
+    /// retains responsibility for byte authentication, while this method
+    /// independently validates the complete adapter catalog, shapes, dtypes,
+    /// finite values, and required roles before constructing executable state.
+    pub fn from_verified_tensor_bytes<F>(manifest: &Manifest, mut tensor_bytes: F) -> Result<Self>
+    where
+        F: FnMut(&TensorRecord) -> Result<Vec<u8>>,
+    {
         if manifest.adapter.id != "runnel.tiny-causal-moe" || manifest.adapter.version != 1 {
             return Err(RuntimeError::InvalidArtifact(
                 "unsupported adapter identity".into(),
@@ -210,12 +233,20 @@ impl TinyModel {
 
         let mut catalog = TensorCatalog::new();
         for descriptor in &manifest.tensors {
-            let bytes = artifact.tensor_bytes(descriptor.id).ok_or_else(|| {
+            let bytes = tensor_bytes(descriptor)?;
+            let expected_length = usize::try_from(descriptor.length).map_err(|_| {
                 RuntimeError::InvalidArtifact(format!(
-                    "verified bytes are unavailable for tensor {}",
+                    "tensor {} length cannot be represented on this host",
                     descriptor.role
                 ))
             })?;
+            if bytes.len() != expected_length {
+                return Err(RuntimeError::InvalidArtifact(format!(
+                    "tensor {} supplied {} bytes, expected {expected_length}",
+                    descriptor.role,
+                    bytes.len()
+                )));
+            }
             let mut chunks = bytes.chunks_exact(size_of::<f32>());
             let values: Vec<f32> = chunks
                 .by_ref()

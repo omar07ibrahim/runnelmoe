@@ -7,8 +7,8 @@ storage, bounded memory, asynchronous I/O, cache policy, numerical parity,
 request scheduling, and honest measurement.
 
 > Project status: M0 design/provenance and the M1 tiny-reference runtime are
-> verified. M2 out-of-core data-plane work is next. There are no performance or
-> out-of-core execution claims yet.
+> verified. The M2 out-of-core data plane is implemented and undergoing its
+> evidence/review gate. No performance improvement is claimed.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling
@@ -35,6 +35,13 @@ two-head causal attention, stable top-2 MoE routing, and greedy generation; an
 independently organized vectorized PyTorch oracle; and a black-box CLI. The
 fixture contains no trained data or committed weight file.
 
+M2 adds a descriptor-retaining content-addressed store, resumable verified
+staging with manifest-last publication, a bounded positional reader, a fixed
+asynchronous reader pool, a 64-byte-quantized byte-capacity LRU cache, explicit
+leases, fault tests, bounded traces, cache counters, and separate RSS samples.
+The tiny adapter integration reconstructs verified tensors before scalar
+execution; it does not yet stream expert pages during each token's compute.
+
 Run the complete artifact-to-token demo after fetching the locked Rust
 dependencies once:
 
@@ -46,10 +53,20 @@ The stable fixture result is generated IDs `[15, 11, 20, 9]`, decoded as
 `"njsh"`. This is a systems-test vector, not language-model-quality evidence.
 See [development](docs/DEVELOPMENT.md) for the complete verification suite.
 
+Exercise sync/cached numerical parity and a forced-eviction three-page trace:
+
+```console
+cargo run --locked -p runnel -- data-plane-demo --json
+```
+
+This command reports exact byte and cache-transition accounting alongside
+volatile I/O-wait and RSS observations. It is a correctness/observability demo,
+not a throughput comparison.
+
 ## Architecture contract
 
-- Rust owns parsing and the scalar reference runtime; later milestones add
-  storage, cache, scheduling, kernels, and serving.
+- Rust owns parsing, verified storage/cache, and the scalar reference runtime;
+  later milestones add scheduling, optimized kernels, and serving.
 - A narrow C ABI will contain measured SIMD kernels; scalar Rust will stay the
   correctness baseline.
 - Python/PyTorch is used only as an independently structured oracle, golden

@@ -82,3 +82,43 @@ cargo run --locked -p runnel -- generate --artifact /tmp/runnel-tiny-rmoa --prom
 
 The fixture command refuses an existing output root. Generated object and page
 table bytes are disposable and excluded from source control.
+
+## M2 verified-data-plane verification
+
+The M2 store is Linux-oriented and uses only tiny generated artifacts. It does
+not download a model. Run the disk guard first, then:
+
+```console
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+python3 -m unittest discover -s scripts/tests -v
+cargo run --locked -p runnel -- data-plane-demo --json
+```
+
+Append `--offline` to the Cargo commands after the locked dependency set is
+available. The storage suite covers descriptor traversal, corruption,
+truncation, reordered pages, cancellation/deadline checkpoints, exact disk and
+page-pool boundaries, resumable stages, no-replace publication ambiguity,
+fail-closed collection, queue saturation, cache single-flight, eviction,
+retiring leases, and sync/async numerical parity.
+
+### Reproduce M2 raw evidence
+
+Evidence must name a clean commit. Confirm `git status --short` is empty and
+choose a new lowercase ID:
+
+```console
+python3 scripts/run_m2_experiment.py m2-data-plane-YYYYMMDD
+```
+
+The standard-library harness performs the recorded two-job, nonincremental,
+locked offline release build from that clean commit. It refuses dirty trees,
+less than 2 GiB of free disk, existing result directories, absolute paths,
+fewer than 30 measured repetitions, missing observations, or an incorrect
+demo. It writes the experiment contract, allowlisted environment metadata,
+every raw trial, and a generated statistical summary below
+`benchmarks/raw/<id>/`.
+Timing describes the validation command on a shared virtualized host; it is not
+evidence of a performance improvement.

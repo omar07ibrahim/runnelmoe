@@ -28,6 +28,8 @@ jobs:
           python-version: "3.12"
       - name: Verify repository contract
         run: python3 scripts/verify_repository.py
+      - name: Test evidence tooling
+        run: python3 -m unittest discover -s scripts/tests -v
 
   rust:
     runs-on: ubuntu-24.04

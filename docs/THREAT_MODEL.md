@@ -42,23 +42,23 @@ The cross-milestone system invariants are:
 
 | Threat | Controls | Verification | Gate |
 | --- | --- | --- | --- |
-| Path traversal or symlink substitution | digest-derived names now; retained directory FDs plus `openat2` beneath/no-symlink or component-wise `openat(O_NOFOLLOW)` next | M1 leaf FIFO/symlink tests; M2 concurrent substitution tests | M1/M2 |
+| Path traversal or symlink substitution | digest-derived names; retained directory FDs plus one-time-selected `openat2` beneath/no-symlink or component-wise `openat(O_NOFOLLOW)` | leaf FIFO/symlink, ancestor symlink, retained-rename, and CAS-layout tests | M1/M2 |
 | Manifest allocation bomb | byte/count/rank/string caps and checked arithmetic before reserve | boundary tests now; fuzzing next | M1/M2 |
-| Truncation, mutation, or reordered pages | eager exact length, whole/page SHA now; bounded positional reads and retained handles next | mutation corpus now; I/O fault injection next | M1/M2 |
-| Cross-artifact object replay | root manifest identity plus object role/shape binding | expected-ID rejection now; valid-object swap fault injection next | M1/M2 |
+| Truncation, mutation, or reordered pages | exact lengths, retained handles, bounded positional reads, and whole/page SHA before exposure | truncation, extension, corruption, reordering, unlink/rename retention, and cancellation checkpoints | M1/M2 |
+| Cross-artifact object replay | trusted expected manifest ID plus object digest, page geometry, tensor role/shape binding | expected-ID and corrupt-preexisting-object rejection | M1/M2 |
 | Partial-object publication | exclusive staging, hash and `fsync`, no-replace publication, manifest last | cancellation/crash at each transition | M2 |
-| Duplicate concurrent load | one in-flight owner, waiters share completion/error | race tests and Loom where practical | M2 |
-| Use-after-evict | reference-counted page leases; retire before reclaim | state-machine/property tests and Miri | M2 |
+| Duplicate concurrent load | one cache-owned in-flight generation; bounded waiters share completion/error | deterministic worker-gate and concurrent fan-out tests | M2 |
+| Use-after-evict | explicit page leases; retire before reclaim; rounded payload charge retained through final lease | eviction/invalidation/shutdown state tests | M2 |
 | Integer overflow/shape confusion | checked arithmetic and exact dtype/byte/shape validation | generated mutation corpus | M1 |
 | NaN/Inf or unstable routing | finite checks and specified score/tie policy | special-value and tie tests | M1 |
 | Compression bomb | compression absent from and rejected by RMOA v1 | exact-schema tests | M1 |
-| Memory/queue denial of service | eager retained-byte cap now; full ledger/admission and bounded queues next | low-budget parser tests now; overload tests next | M1/M2/M5 |
+| Memory/queue denial of service | eager metadata caps; 64-byte-quantized page-pool ledger; bounded entries, loads, workers, queues, waiters, leases, and traces | exact budget, queue saturation, hostile configuration, and failed-admission tests | M1/M2/M5 |
 | Slow client or abandoned SSE | deadlines, bounded output channel, disconnect cancellation | stalled/disconnect black-box tests | M6 |
 | High-cardinality telemetry | bounded metric labels; IDs only in sampled traces | metrics cardinality test | M6 |
 | Secret/prompt disclosure | allowlisted output and content-redacted errors | CLI stderr capture now; server log capture next | M1/M6 |
 | Illegal SIMD or memory unsafety | scalar fallback, runtime CPUID, narrow C ABI | sanitizer/random differential tests | M4 |
 | Dependency or CI compromise | lockfiles, exact dependencies, pinned CI action revisions | CI and release audit | ongoing |
-| Disk exhaustion | no committed checkpoints now; reserve-aware CAS and bounded results next | disk preflight and low-space tests | M1/M2 |
+| Disk exhaustion | no committed checkpoints; allocation-aware CAS ceiling, staging/orphan accounting, and mandatory filesystem reserve | exact injected budget arithmetic and stable reserve endpoints | M1/M2 |
 
 ## Parser rejection matrix
 
@@ -70,10 +70,12 @@ record counts; unsupported dtype/encoding; logical/stored size disagreement;
 overlap/misalignment/out-of-file ranges; missing/trailing data; digest
 mismatch; valid page reordering; and unknown required adapter fields.
 
-M2 I/O tests inject short reads, interruption/retry, concurrent truncation,
-replacement after open, and cancellation before read, during read, during
-hashing, and immediately before publication. No failure may expose verified
-status or leak accounted bytes.
+M2 I/O tests cover short reads, retained-descriptor replacement resistance,
+truncation/extension, cancellation before and after physical reads, cancellation
+during hashing, and cancellation immediately before both publication paths.
+No failure may expose verified status or release an owned payload charge before
+worker completion. Same-UID concurrent content mutation remains a documented
+residual risk, not a filesystem-isolation claim.
 
 ## Abuse cases for later serving
 
@@ -97,8 +99,8 @@ access must place a reviewed gateway in front, outside this project's default.
 - Descriptor-relative traversal prevents pathname redirection, but it is not
   hostile same-UID isolation. Every demanded page is still authenticated
   before use.
-- The M1 eager convenience reader is for a trusted local directory that is not
-  concurrently replaced. Descriptor-relative race resistance and transactional
-  publication are M2 gates.
+- The M1 eager convenience reader remains for a trusted local directory that is
+  not concurrently replaced. M2 descriptor-relative reads and transactional
+  CAS publication are the hardened runtime path.
 
 Security issues should follow [SECURITY.md](../SECURITY.md), not a public issue.

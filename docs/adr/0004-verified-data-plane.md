@@ -81,6 +81,13 @@ Queue admission, execution, completion, and shutdown preserve buffer ownership
 and resource permits. Terminal cancellation is reported only after ownership
 returns from a queued or running worker.
 
+A cache demand waiter does not own that backend buffer. It may return its own
+`cancelled`/`deadline_exceeded` result once its waiter and prospective-lease
+reservations are withdrawn under the cache lock. If it was the final interest,
+the cache requests backend cancellation, but the cache-owned load and rounded
+payload charge remain live until the worker acknowledges completion. Direct
+`AsyncReader` callers retain the stricter terminal-ownership rule above.
+
 ### Cache and memory ledger
 
 The verified-page cache uses a mutex-linearized state machine with a
@@ -114,9 +121,14 @@ loading_bytes <= max_inflight_bytes <= page_pool_capacity
 
 The in-flight limit is a subset cap, not a second allocatable pool. Capacity is
 reserved before allocation and moves with the buffer without being released or
-double charged. Separate bounded limits cover entries, waiters, load slots,
-backend queue items, retained metadata, leases, and trace events. Configuration
-is rejected when one supported page cannot fit.
+double charged. The reader moves its uniquely owned `Vec` payload into the
+shared verified-page handle, avoiding a full-payload allocation/copy at
+publication, and the ledger rounds requested payload capacity to an explicit
+64-byte capacity quantum. This is not a pointer-alignment claim. Allocator
+bookkeeping and the bounded entry control block remain outside that payload
+pool and are reported through RSS. Separate bounded limits cover entries,
+waiters, load slots, backend queue items, retained metadata, leases, and trace
+events. Configuration is rejected when one supported page cannot fit.
 
 Demand, coalesced demand, prefetch, late prefetch, useful prefetch, wasted
 prefetch, redundant prefetch, and budget-dropped prefetch are distinct events.
@@ -140,11 +152,14 @@ is never trusted. After copying, the retained staging descriptor is reread to
 verify on-disk length, whole digest, and page hashes before it is synced.
 
 Publication uses `renameat2(RENAME_NOREPLACE)` or, only when that operation is
-known unsupported, same-directory `linkat` followed by `unlinkat`. It never
-uses a check-then-overwrite rename. A preexisting final leaf is accepted only
-after complete verification. Page tables publish first, objects second, and
-the digest-named manifest last as the artifact commit point; each modified
-directory is synced.
+known unsupported, same-filesystem `linkat`, destination-directory `fsync`,
+`unlinkat` of the stage alias, and staging-directory `fsync`, in that order. A
+failed destination sync retains the resumable stage alias, so every crash point
+has at least one durable name. Publication never uses a check-then-overwrite
+rename. A preexisting final leaf is accepted only after complete verification.
+Page tables publish first, objects second, and the digest-named manifest last as
+the artifact commit point. A retry syncs the manifest directory only after all
+dependency and staging-directory syncs succeed.
 
 Cancellation is checked immediately before the no-replace operation. Once a
 final digest name becomes addressable, cancellation no longer wins and the

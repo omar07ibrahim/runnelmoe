@@ -149,15 +149,24 @@ The configured runtime budget is partitioned explicitly:
     page_pool_used = loading_bytes + resident_bytes + retiring_bytes
     loading_bytes <= max_in_flight_bytes <= page_pool_capacity
 
-Capacity, including alignment padding, is reserved before every allocation or
-I/O submission and released exactly once by its owner. The in-flight limit is
-a subset cap within the page pool, not a second allocation pool. A shared
+Capacity, including the configured capacity-quantum padding, is reserved before
+every allocation or I/O submission and released exactly once by its owner. The
+in-flight limit is a subset cap within the page pool, not a second allocation
+pool. A shared
 physical page buffer is charged once as it moves from loading through resident
 or retiring; each waiter and lease is charged separately.
+
+The data plane charges page payload capacity at an explicit 64-byte quantum and
+moves the reader's `Vec` allocation into an `Arc`-owned control block without a
+second payload copy. Entry/control-block and allocator bookkeeping are bounded
+or observed separately; process RSS remains the authoritative whole-process
+observation rather than an inferred allocator total.
 Configuration is rejected if the minimum executable operation cannot fit.
 Cache policies operate on fixed-size pages so byte capacity and offline
-optimal comparisons are unambiguous. Large tensors are streamed as ordered
-pages; tensors that share a physical page share its buffer charge.
+optimal comparisons are unambiguous. The data-plane API exposes large tensors
+as ordered pages; the M2 tiny-runtime adapter still reconstructs complete
+verified tensors before compute. Tensors that share a physical page share its
+buffer charge.
 
 The I/O backend owns a submitted buffer until completion or acknowledged
 cancellation. Request cancellation becomes terminal only after buffer
@@ -165,6 +174,11 @@ ownership returns. A completed page may publish at exactly one atomic
 state transition from `loading` to `resident`; cancellation that linearizes
 first prevents publication. One in-flight owner serves duplicate waiters, and
 each waiter independently releases its metadata reservation.
+
+That terminal-ownership statement applies to direct I/O submissions. A cache
+waiter owns only its waiter and prospective-lease reservations, so it may
+return after withdrawing them; any now-unwanted cache-owned physical load stays
+charged until its worker completion releases the page-pool reservation.
 
 The multi-request scheduler will use request-owned RNG state, stable request
 IDs, bounded queues, token-boundary preemption, and deficit-based service.

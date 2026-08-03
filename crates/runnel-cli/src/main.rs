@@ -1,9 +1,13 @@
-use std::{error::Error, path::PathBuf, process::ExitCode};
+use std::{collections::BTreeMap, error::Error, io, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use runnel_fixture::{FixtureArtifact, FixtureIdentity};
-use runnel_format::{Artifact, Limits};
-use runnel_runtime::{EOS_TOKEN, TinyModel, TinyTokenizer};
+use runnel_fixture::{FixtureArtifact, FixtureIdentity, MultiPageFixture, PAGE_SIZE};
+use runnel_format::{Artifact, Limits, Manifest, TensorRecord};
+use runnel_runtime::{EOS_TOKEN, RuntimeError, TinyModel, TinyTokenizer};
+use runnel_store::{
+    AccessReason, ArtifactSource, AsyncReader, AsyncReaderConfig, CacheConfig, Control,
+    MetricsSnapshot, PageCache, PageSpec, RssSample, StoredArtifact, TraceEvent, TraceOutcome,
+};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -41,6 +45,11 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 4)]
         max_new_tokens: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify synchronous and cached data-plane parity on disposable fixtures.
+    DataPlaneDemo {
         #[arg(long)]
         json: bool,
     },
@@ -84,6 +93,189 @@ struct FixtureOutput {
     page_table_length: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct DataPlaneFixtureOutput {
+    artifact_id: String,
+    object_digest: String,
+    object_length: u64,
+    page_table_digest: String,
+    page_table_length: u64,
+}
+
+impl From<FixtureIdentity> for DataPlaneFixtureOutput {
+    fn from(identity: FixtureIdentity) -> Self {
+        Self {
+            artifact_id: identity.artifact_id.to_string(),
+            object_digest: identity.object_digest.to_string(),
+            object_length: identity.object_length,
+            page_table_digest: identity.page_table_digest.to_string(),
+            page_table_length: identity.page_table_length,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DataPlaneFixturesOutput {
+    tiny: DataPlaneFixtureOutput,
+    multi_page: DataPlaneFixtureOutput,
+}
+
+#[derive(Debug, Serialize)]
+struct DemandTraceOutput {
+    access: &'static str,
+    page_indices: [u64; 5],
+    page_lengths: [u64; 3],
+    event_count: u64,
+    outcomes: TraceOutcomeCountsOutput,
+    events: Vec<NormalizedTraceEventOutput>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct NormalizedTraceEventOutput {
+    sequence: u64,
+    outcome: &'static str,
+    reason: &'static str,
+    object_digest: String,
+    page_size: u64,
+    page_index: u64,
+    logical_bytes: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceOutcomeCountsOutput {
+    hit: u64,
+    miss: u64,
+    load_started: u64,
+    load_coalesced: u64,
+    late_prefetch: u64,
+    prefetch_coalesced: u64,
+    admitted: u64,
+    evicted: u64,
+    retired: u64,
+    load_failed: u64,
+    cancelled: u64,
+    prefetch_useful: u64,
+    prefetch_wasted: u64,
+    prefetch_redundant: u64,
+    prefetch_dropped: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ExactBytesPerTokenOutput {
+    numerator_bytes: u64,
+    denominator_tokens: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct GenerationCacheOutput {
+    completed_generated_tokens: u64,
+    physical_read_bytes: u64,
+    bytes_per_generated_token: ExactBytesPerTokenOutput,
+}
+
+#[derive(Debug, Serialize)]
+struct PrefetchMetricsOutput {
+    bytes: u64,
+    coalesced: u64,
+    late: u64,
+    useful: u64,
+    wasted: u64,
+    redundant: u64,
+    dropped: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AccountedGaugesOutput {
+    active_loads: u64,
+    page_pool_bytes: u64,
+    inflight_bytes: u64,
+    resident_bytes: u64,
+    retiring_bytes: u64,
+    leases: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RssOutput {
+    resident_bytes: u64,
+    peak_bytes: u64,
+}
+
+impl From<RssSample> for RssOutput {
+    fn from(sample: RssSample) -> Self {
+        Self {
+            resident_bytes: sample.resident_bytes,
+            peak_bytes: sample.peak_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DataPlaneMetricsOutput {
+    demand_bytes: u64,
+    physical_read_bytes: u64,
+    hits: u64,
+    misses: u64,
+    admissions: u64,
+    evictions: u64,
+    coalesced_demands: u64,
+    prefetch: PrefetchMetricsOutput,
+    wait_nanoseconds: u64,
+    io_nanoseconds: u64,
+    accounted: AccountedGaugesOutput,
+    observed_rss: Option<RssOutput>,
+    trace_events_dropped: u64,
+}
+
+impl From<MetricsSnapshot> for DataPlaneMetricsOutput {
+    fn from(metrics: MetricsSnapshot) -> Self {
+        Self {
+            demand_bytes: metrics.demand_bytes,
+            physical_read_bytes: metrics.physical_read_bytes,
+            hits: metrics.hits,
+            misses: metrics.misses,
+            admissions: metrics.admissions,
+            evictions: metrics.evictions,
+            coalesced_demands: metrics.coalesced_demands,
+            prefetch: PrefetchMetricsOutput {
+                bytes: metrics.prefetch_bytes,
+                coalesced: metrics.coalesced_prefetches,
+                late: metrics.late_prefetches,
+                useful: metrics.useful_prefetches,
+                wasted: metrics.wasted_prefetches,
+                redundant: metrics.redundant_prefetches,
+                dropped: metrics.dropped_prefetches,
+            },
+            wait_nanoseconds: metrics.wait_nanoseconds,
+            io_nanoseconds: metrics.io_nanoseconds,
+            accounted: AccountedGaugesOutput {
+                active_loads: metrics.active_loads,
+                page_pool_bytes: metrics.page_pool_bytes,
+                inflight_bytes: metrics.inflight_bytes,
+                resident_bytes: metrics.resident_bytes,
+                retiring_bytes: metrics.retiring_bytes,
+                leases: metrics.leases,
+            },
+            observed_rss: metrics.rss.map(Into::into),
+            trace_events_dropped: metrics.trace_events_dropped,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DataPlaneDemoOutput {
+    schema_version: u64,
+    fixtures: DataPlaneFixturesOutput,
+    prompt: &'static str,
+    max_new_tokens: usize,
+    generated_ids: Vec<u32>,
+    generated_text: String,
+    parity: bool,
+    generation_cache: GenerationCacheOutput,
+    trace: DemandTraceOutput,
+    cache_capacity_bytes: u64,
+    metrics: DataPlaneMetricsOutput,
+}
+
 fn main() -> ExitCode {
     match run(Arguments::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -122,6 +314,464 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn Error>> {
             let artifact = Artifact::open(root, Limits::default())?;
             print_generation(&artifact, &prompt, max_new_tokens, json)?;
         }
+        Command::DataPlaneDemo { json } => print_data_plane_demo(json)?,
+    }
+    Ok(())
+}
+
+fn print_data_plane_demo(json: bool) -> Result<(), Box<dyn Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_time()
+        .build()?;
+    let output = runtime.block_on(build_data_plane_demo())?;
+    if json {
+        println!("{}", serde_json::to_string(&output)?);
+    } else {
+        println!("data-plane parity: {}", output.parity);
+        println!("generated IDs: {:?}", output.generated_ids);
+        println!(
+            "generation cache: {} physical bytes / {} completed tokens",
+            output.generation_cache.physical_read_bytes,
+            output.generation_cache.completed_generated_tokens,
+        );
+        println!("trace pages: {:?}", output.trace.page_indices);
+        println!(
+            "cache: {} hit, {} misses, {} admissions, {} evictions, {} physical bytes",
+            output.metrics.hits,
+            output.metrics.misses,
+            output.metrics.admissions,
+            output.metrics.evictions,
+            output.metrics.physical_read_bytes,
+        );
+    }
+    Ok(())
+}
+
+async fn build_data_plane_demo() -> Result<DataPlaneDemoOutput, Box<dyn Error>> {
+    const PROMPT: &str = "moe";
+    const MAX_NEW_TOKENS: usize = 4;
+    const DEMAND_TRACE: [u64; 5] = [0, 1, 0, 2, 2];
+
+    let temporary = tempfile::tempdir()?;
+    let tiny_root = temporary.path().join("tiny");
+    let multi_root = temporary.path().join("multi-page");
+    let tiny_fixture = FixtureArtifact::build();
+    let multi_fixture = MultiPageFixture::build();
+    let tiny_identity = tiny_fixture.write_new(&tiny_root)?;
+    let multi_identity = multi_fixture.write_new(&multi_root)?;
+
+    let tiny_source = ArtifactSource::open(&tiny_root)?;
+    let tiny_stored = tiny_source.open_with_expected_id(
+        Limits::default(),
+        tiny_identity.artifact_id,
+        &Control::unbounded(),
+    )?;
+    let sync_tensors = collect_sync_tensor_bytes(&tiny_stored)?;
+    let sync_model = model_from_verified_tensor_bytes(tiny_stored.manifest(), sync_tensors)?;
+
+    let tiny_async = AsyncReader::new(tiny_stored.reader(), AsyncReaderConfig::new(2, 4)?)?;
+    let tiny_cache = PageCache::new(
+        tiny_async,
+        CacheConfig::new(u64::from(PAGE_SIZE), u64::from(PAGE_SIZE))?,
+    )?;
+    let cached_tensors = collect_cached_tensor_bytes(&tiny_stored, &tiny_cache).await?;
+    let cached_model = model_from_verified_tensor_bytes(tiny_stored.manifest(), cached_tensors)?;
+
+    let prompt_ids = TinyTokenizer.encode(PROMPT)?;
+    let sync_generation = sync_model.generate_greedy(&prompt_ids, MAX_NEW_TOKENS)?;
+    let cached_generation = cached_model.generate_greedy(&prompt_ids, MAX_NEW_TOKENS)?;
+    let parity = sync_generation == cached_generation;
+    if !parity {
+        return Err(io::Error::other("synchronous and cached generation differ").into());
+    }
+    let generated_text = TinyTokenizer.decode(&sync_generation.generated_tokens)?;
+    let generated_ids = sync_generation.generated_tokens;
+    let completed_generated_tokens = u64::try_from(generated_ids.len())?;
+    if completed_generated_tokens == 0 {
+        return Err(io::Error::other("tiny generation produced no completed tokens").into());
+    }
+    let tiny_metrics = tiny_cache.metrics();
+    if tiny_metrics.physical_read_bytes != tiny_identity.object_length {
+        return Err(io::Error::other("tiny cached load physical byte count changed").into());
+    }
+    tiny_cache.shutdown();
+
+    let multi_source = ArtifactSource::open(&multi_root)?;
+    let multi_stored = multi_source.open_with_expected_id(
+        Limits::default(),
+        multi_identity.artifact_id,
+        &Control::unbounded(),
+    )?;
+    let mut specifications = BTreeMap::new();
+    for specification in multi_stored.page_specs() {
+        let specification = specification?;
+        if specifications
+            .insert(specification.key().index(), specification)
+            .is_some()
+        {
+            return Err(io::Error::other("multi-page fixture repeated a page index").into());
+        }
+    }
+    let page_lengths = [
+        page_specification(&specifications, 0)?.length(),
+        page_specification(&specifications, 1)?.length(),
+        page_specification(&specifications, 2)?.length(),
+    ];
+    if page_lengths != [u64::from(PAGE_SIZE), u64::from(PAGE_SIZE), 17] {
+        return Err(io::Error::other("multi-page fixture geometry changed").into());
+    }
+
+    let trace_reader = AsyncReader::new(multi_stored.reader(), AsyncReaderConfig::new(2, 4)?)?;
+    let trace_cache = PageCache::new(
+        trace_reader,
+        CacheConfig::new(u64::from(PAGE_SIZE), u64::from(PAGE_SIZE))?
+            .with_max_inflight_bytes(u64::from(PAGE_SIZE))
+            .with_max_loads(1)
+            .with_trace_capacity(64),
+    )?;
+    let synchronous_reader = multi_stored.reader();
+    for page_index in DEMAND_TRACE {
+        let specification = page_specification(&specifications, page_index)?;
+        let (expected, _stats) = synchronous_reader.read(specification, &Control::unbounded())?;
+        let actual = trace_cache
+            .get(specification.clone(), Control::unbounded())
+            .await?;
+        if actual.bytes() != expected.bytes() {
+            return Err(io::Error::other("cached page differs from synchronous page").into());
+        }
+    }
+
+    let metrics = trace_cache.metrics();
+    validate_trace_metrics(metrics, page_lengths)?;
+    let trace_events = trace_cache.trace_sink().drain();
+    let trace_outcomes = count_trace_outcomes(&trace_events)?;
+    validate_trace_outcomes(&trace_outcomes, trace_events.len())?;
+    let normalized_trace = normalize_trace_events(&trace_events)?;
+    let multi_object_digest = multi_identity.object_digest.to_string();
+    validate_normalized_trace(&normalized_trace, &multi_object_digest)?;
+    let output = DataPlaneDemoOutput {
+        schema_version: 1,
+        fixtures: DataPlaneFixturesOutput {
+            tiny: tiny_identity.into(),
+            multi_page: multi_identity.into(),
+        },
+        prompt: PROMPT,
+        max_new_tokens: MAX_NEW_TOKENS,
+        generated_ids,
+        generated_text,
+        parity,
+        generation_cache: GenerationCacheOutput {
+            completed_generated_tokens,
+            physical_read_bytes: tiny_metrics.physical_read_bytes,
+            bytes_per_generated_token: ExactBytesPerTokenOutput {
+                numerator_bytes: tiny_metrics.physical_read_bytes,
+                denominator_tokens: completed_generated_tokens,
+            },
+        },
+        trace: DemandTraceOutput {
+            access: "demand",
+            page_indices: DEMAND_TRACE,
+            page_lengths,
+            event_count: u64::try_from(trace_events.len())?,
+            outcomes: trace_outcomes,
+            events: normalized_trace,
+        },
+        cache_capacity_bytes: u64::from(PAGE_SIZE),
+        metrics: metrics.into(),
+    };
+    trace_cache.shutdown();
+    Ok(output)
+}
+
+fn normalize_trace_events(
+    events: &[TraceEvent],
+) -> Result<Vec<NormalizedTraceEventOutput>, Box<dyn Error>> {
+    events
+        .iter()
+        .map(|event| {
+            Ok(NormalizedTraceEventOutput {
+                sequence: event.sequence,
+                outcome: trace_outcome_name(event.outcome)?,
+                reason: access_reason_name(event.reason),
+                object_digest: event.key.object().to_string(),
+                page_size: event.key.page_size(),
+                page_index: event.key.index(),
+                logical_bytes: event.bytes,
+            })
+        })
+        .collect()
+}
+
+fn trace_outcome_name(outcome: TraceOutcome) -> Result<&'static str, Box<dyn Error>> {
+    Ok(match outcome {
+        TraceOutcome::Hit => "hit",
+        TraceOutcome::Miss => "miss",
+        TraceOutcome::LoadStarted => "load_started",
+        TraceOutcome::LoadCoalesced => "load_coalesced",
+        TraceOutcome::LatePrefetch => "late_prefetch",
+        TraceOutcome::PrefetchCoalesced => "prefetch_coalesced",
+        TraceOutcome::Admitted => "admitted",
+        TraceOutcome::Evicted => "evicted",
+        TraceOutcome::Retired => "retired",
+        TraceOutcome::LoadFailed => "load_failed",
+        TraceOutcome::Cancelled => "cancelled",
+        TraceOutcome::PrefetchUseful => "prefetch_useful",
+        TraceOutcome::PrefetchWasted => "prefetch_wasted",
+        TraceOutcome::PrefetchRedundant => "prefetch_redundant",
+        TraceOutcome::PrefetchDropped => "prefetch_dropped",
+        _ => return Err(io::Error::other("trace contained an unsupported outcome").into()),
+    })
+}
+
+const fn access_reason_name(reason: AccessReason) -> &'static str {
+    match reason {
+        AccessReason::Demand => "demand",
+        AccessReason::Prefetch => "prefetch",
+    }
+}
+
+fn validate_normalized_trace(
+    events: &[NormalizedTraceEventOutput],
+    object_digest: &str,
+) -> Result<(), Box<dyn Error>> {
+    const EXPECTED: [(&str, u64, u64); 16] = [
+        ("miss", 0, 65_536),
+        ("load_started", 0, 65_536),
+        ("admitted", 0, 65_536),
+        ("miss", 1, 65_536),
+        ("evicted", 0, 65_536),
+        ("load_started", 1, 65_536),
+        ("admitted", 1, 65_536),
+        ("miss", 0, 65_536),
+        ("evicted", 1, 65_536),
+        ("load_started", 0, 65_536),
+        ("admitted", 0, 65_536),
+        ("miss", 2, 17),
+        ("evicted", 0, 65_536),
+        ("load_started", 2, 17),
+        ("admitted", 2, 17),
+        ("hit", 2, 17),
+    ];
+    if events.len() != EXPECTED.len() {
+        return Err(io::Error::other("fixed demand trace length changed").into());
+    }
+    for (sequence, (event, (outcome, page_index, logical_bytes))) in
+        events.iter().zip(EXPECTED).enumerate()
+    {
+        let sequence = u64::try_from(sequence)?;
+        if event.sequence != sequence
+            || event.outcome != outcome
+            || event.reason != "demand"
+            || event.object_digest != object_digest
+            || event.page_size != u64::from(PAGE_SIZE)
+            || event.page_index != page_index
+            || event.logical_bytes != logical_bytes
+        {
+            return Err(io::Error::other("fixed normalized trace changed").into());
+        }
+    }
+    Ok(())
+}
+
+fn count_trace_outcomes(events: &[TraceEvent]) -> Result<TraceOutcomeCountsOutput, Box<dyn Error>> {
+    let mut counts = TraceOutcomeCountsOutput::default();
+    for event in events {
+        let count = match event.outcome {
+            TraceOutcome::Hit => &mut counts.hit,
+            TraceOutcome::Miss => &mut counts.miss,
+            TraceOutcome::LoadStarted => &mut counts.load_started,
+            TraceOutcome::LoadCoalesced => &mut counts.load_coalesced,
+            TraceOutcome::LatePrefetch => &mut counts.late_prefetch,
+            TraceOutcome::PrefetchCoalesced => &mut counts.prefetch_coalesced,
+            TraceOutcome::Admitted => &mut counts.admitted,
+            TraceOutcome::Evicted => &mut counts.evicted,
+            TraceOutcome::Retired => &mut counts.retired,
+            TraceOutcome::LoadFailed => &mut counts.load_failed,
+            TraceOutcome::Cancelled => &mut counts.cancelled,
+            TraceOutcome::PrefetchUseful => &mut counts.prefetch_useful,
+            TraceOutcome::PrefetchWasted => &mut counts.prefetch_wasted,
+            TraceOutcome::PrefetchRedundant => &mut counts.prefetch_redundant,
+            TraceOutcome::PrefetchDropped => &mut counts.prefetch_dropped,
+            _ => return Err(io::Error::other("trace contained an unsupported outcome").into()),
+        };
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("trace outcome count overflow"))?;
+    }
+    Ok(counts)
+}
+
+fn validate_trace_outcomes(
+    outcomes: &TraceOutcomeCountsOutput,
+    event_count: usize,
+) -> Result<(), Box<dyn Error>> {
+    let exact = event_count == 16
+        && outcomes.hit == 1
+        && outcomes.miss == 4
+        && outcomes.load_started == 4
+        && outcomes.admitted == 4
+        && outcomes.evicted == 3
+        && outcomes.load_coalesced == 0
+        && outcomes.late_prefetch == 0
+        && outcomes.prefetch_coalesced == 0
+        && outcomes.retired == 0
+        && outcomes.load_failed == 0
+        && outcomes.cancelled == 0
+        && outcomes.prefetch_useful == 0
+        && outcomes.prefetch_wasted == 0
+        && outcomes.prefetch_redundant == 0
+        && outcomes.prefetch_dropped == 0;
+    if !exact {
+        return Err(io::Error::other("fixed demand trace outcomes changed").into());
+    }
+    Ok(())
+}
+
+fn collect_sync_tensor_bytes(
+    stored: &StoredArtifact,
+) -> Result<BTreeMap<u64, Vec<u8>>, Box<dyn Error>> {
+    let mut tensors = BTreeMap::new();
+    for tensor in &stored.manifest().tensors {
+        let mut bytes = Vec::with_capacity(tensor_length(tensor)?);
+        for specification in stored.tensor_page_specs(tensor.id)? {
+            let specification = specification?;
+            let (page, _stats) = stored
+                .reader()
+                .read(&specification, &Control::unbounded())?;
+            append_intersection(&mut bytes, tensor, &specification, page.bytes())?;
+        }
+        require_tensor_length(tensor, &bytes)?;
+        tensors.insert(tensor.id, bytes);
+    }
+    Ok(tensors)
+}
+
+async fn collect_cached_tensor_bytes(
+    stored: &StoredArtifact,
+    cache: &PageCache,
+) -> Result<BTreeMap<u64, Vec<u8>>, Box<dyn Error>> {
+    let mut tensors = BTreeMap::new();
+    for tensor in &stored.manifest().tensors {
+        let mut bytes = Vec::with_capacity(tensor_length(tensor)?);
+        for specification in stored.tensor_page_specs(tensor.id)? {
+            let specification = specification?;
+            let lease = cache
+                .get(specification.clone(), Control::unbounded())
+                .await?;
+            append_intersection(&mut bytes, tensor, &specification, lease.bytes())?;
+        }
+        require_tensor_length(tensor, &bytes)?;
+        tensors.insert(tensor.id, bytes);
+    }
+    Ok(tensors)
+}
+
+fn append_intersection(
+    output: &mut Vec<u8>,
+    tensor: &TensorRecord,
+    specification: &PageSpec,
+    page: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let tensor_end = tensor
+        .offset
+        .checked_add(tensor.length)
+        .ok_or_else(|| io::Error::other("tensor range overflow"))?;
+    let page_end = specification
+        .offset()
+        .checked_add(specification.length())
+        .ok_or_else(|| io::Error::other("page range overflow"))?;
+    let start = tensor.offset.max(specification.offset());
+    let end = tensor_end.min(page_end);
+    if start >= end {
+        return Err(io::Error::other("tensor page does not intersect tensor range").into());
+    }
+    let local_start = usize::try_from(start - specification.offset())?;
+    let local_end = usize::try_from(end - specification.offset())?;
+    let intersection = page
+        .get(local_start..local_end)
+        .ok_or_else(|| io::Error::other("verified page is shorter than its specification"))?;
+    output.extend_from_slice(intersection);
+    Ok(())
+}
+
+fn tensor_length(tensor: &TensorRecord) -> Result<usize, Box<dyn Error>> {
+    Ok(usize::try_from(tensor.length)?)
+}
+
+fn require_tensor_length(tensor: &TensorRecord, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    if bytes.len() != tensor_length(tensor)? {
+        return Err(io::Error::other("trimmed tensor bytes have the wrong length").into());
+    }
+    Ok(())
+}
+
+fn model_from_verified_tensor_bytes(
+    manifest: &Manifest,
+    mut tensors: BTreeMap<u64, Vec<u8>>,
+) -> Result<TinyModel, RuntimeError> {
+    TinyModel::from_verified_tensor_bytes(manifest, |descriptor| {
+        tensors.remove(&descriptor.id).ok_or_else(|| {
+            RuntimeError::InvalidArtifact(format!(
+                "verified storage omitted tensor {}",
+                descriptor.role
+            ))
+        })
+    })
+}
+
+fn page_specification(
+    specifications: &BTreeMap<u64, PageSpec>,
+    page_index: u64,
+) -> Result<&PageSpec, Box<dyn Error>> {
+    specifications
+        .get(&page_index)
+        .ok_or_else(|| io::Error::other("multi-page fixture omitted a requested page").into())
+}
+
+fn validate_trace_metrics(
+    metrics: MetricsSnapshot,
+    page_lengths: [u64; 3],
+) -> Result<(), Box<dyn Error>> {
+    const PAGE_BUFFER_CAPACITY_QUANTUM: u64 = 64;
+
+    let expected_demand_bytes = page_lengths[0]
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(page_lengths[2].checked_mul(2)?))
+        .ok_or_else(|| io::Error::other("trace demand byte count overflow"))?;
+    let expected_physical_bytes = page_lengths[0]
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(page_lengths[2]))
+        .ok_or_else(|| io::Error::other("trace physical byte count overflow"))?;
+    let expected_retained_bytes = page_lengths[2]
+        .div_ceil(PAGE_BUFFER_CAPACITY_QUANTUM)
+        .checked_mul(PAGE_BUFFER_CAPACITY_QUANTUM)
+        .ok_or_else(|| io::Error::other("trace retained byte count overflow"))?;
+    let prefetch_total = metrics
+        .prefetch_bytes
+        .saturating_add(metrics.coalesced_prefetches)
+        .saturating_add(metrics.late_prefetches)
+        .saturating_add(metrics.useful_prefetches)
+        .saturating_add(metrics.wasted_prefetches)
+        .saturating_add(metrics.redundant_prefetches)
+        .saturating_add(metrics.dropped_prefetches);
+    let exact = metrics.demand_bytes == expected_demand_bytes
+        && metrics.physical_read_bytes == expected_physical_bytes
+        && metrics.hits == 1
+        && metrics.misses == 4
+        && metrics.admissions == 4
+        && metrics.evictions == 3
+        && metrics.coalesced_demands == 0
+        && prefetch_total == 0
+        && metrics.active_loads == 0
+        && metrics.page_pool_bytes == expected_retained_bytes
+        && metrics.inflight_bytes == 0
+        && metrics.resident_bytes == expected_retained_bytes
+        && metrics.retiring_bytes == 0
+        && metrics.leases == 0
+        && metrics.trace_events_dropped == 0;
+    if !exact {
+        return Err(io::Error::other("fixed demand trace metrics changed").into());
     }
     Ok(())
 }

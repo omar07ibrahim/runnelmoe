@@ -5,9 +5,9 @@ format. This document is the normative version-1 contract.
 
 Implementation status matters: M1 implements the canonical manifest schema,
 limits, eager memory budget, whole-object/page-table/page verification, and a
-small local-filesystem convenience reader. Sections explicitly marked **M2
-target** define the descriptor-safe storage/publication contract and are not an
-M1 claim.
+small local-filesystem convenience reader. M2 implements the separate internal
+CAS, descriptor-safe bounded reads, resumable publication, asynchronous
+dispatch, and verified page cache described below.
 
 ## Layout and identity
 
@@ -154,18 +154,21 @@ explicitly lowers or raises them, the M1 reader accepts at most a 1 MiB manifest
 cannot exceed the format ceiling. Its independent eager budget defaults to 256
 MiB and covers retained manifest, object, and page-table bytes.
 
-M2 ingestion will additionally perform a worst-case preflight that includes
+M2 ingestion additionally performs a worst-case preflight that includes
 current CAS usage, all staging bytes, newly published bytes, and verified
 orphan entries while preserving the configured disk reserve. Its hash loops
-will check cancellation and deadline at every bounded buffer or page.
+check cancellation and deadline at every bounded buffer or page.
 
-The full M2 runtime memory budget is independent: metadata, page tables,
-open-handle state, resident pages, in-flight capacity, scratch, queues, and
-sequence state must be reserved before use.
+The M2 data plane independently bounds manifest/page-table metadata, handles,
+queues, waiters, leases, traces, and 64-byte-quantized loading, resident, and
+retiring page payloads. The later scheduler must add sequence state, kernel
+scratch, and request queues to form the full runtime admission budget.
+Allocator/runtime overhead is observed through RSS rather than guessed from
+logical bytes.
 
-## Filesystem and publication rules — M2 target
+## Filesystem and publication rules
 
-On Linux, the M2 loader will retain file descriptors for the artifact root and
+On Linux, the M2 loader retains file descriptors for the artifact root and
 both digest directories and resolve children with `openat2` using
 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`. A portable
 fallback walks fixed path components with directory-relative `openat`,
@@ -175,19 +178,21 @@ checked on the retained regular-file descriptor.
 
 M2 ingestion creates a randomly named file in the retained CAS staging
 directory with `O_CREAT | O_EXCL` and mode 0600. It writes with bounded
-buffers, verifies the on-disk descriptor's length and hashes, flushes and
-`fsync`s the file, then publishes without
-replacement using `renameat2(RENAME_NOREPLACE)`. Where unavailable, a
-same-directory `linkat`-then-unlink fallback provides no-replace publication.
-The parent directory is `fsync`ed. Page tables publish before objects and the
-digest-named manifest publishes last. Cancellation may leave complete verified but
-unreferenced content-addressed files as well as unaddressed staging files.
+buffers, rereads and verifies the on-disk descriptor's length and hashes, fully
+`fsync`s the file, then publishes without replacement using
+`renameat2(RENAME_NOREPLACE)`. Where unavailable, a same-filesystem
+fallback links the final name, `fsync`s its digest directory, unlinks the stage
+alias, and then `fsync`s the staging directory. A failed destination sync keeps
+the resumable alias. Page tables publish before objects and the digest-named
+manifest publishes last; manifest-directory sync is attempted only after all
+dependency and staging syncs succeed. Cancellation may leave complete verified
+but unreferenced content-addressed files as well as unaddressed staging files.
 Orphans are safe to ignore and may be garbage-collected only by comparing
 digests against every retained digest-named manifest; partial files are never
 addressable. M2 does not delete manifests, so each one is a garbage-collection
 root.
 
-The M2 project CAS will have a configured disk budget; the host default is the
+The M2 project CAS has a configured disk budget; the host default is the
 smaller of 2 GiB and available bytes above the mandatory 2 GiB filesystem
 reserve.
 Staging and orphan bytes count against it. Ingestion and garbage collection
@@ -206,7 +211,7 @@ non-regular inputs, bounds each read, and eagerly verifies all declared bytes
 before exposure. It does not yet retain directory descriptors or defend
 ancestor-directory replacement.
 
-The M2 storage API will read whole logical pages. It will verify the retained
+The M2 storage API reads whole logical pages. It verifies the retained
 page-table entry before transitioning a buffer from `loading` to `resident`.
 Consumers may receive tensor slices only after every intersecting page
 verifies. Short reads, extra bytes, hash mismatch, mutation, cancellation, or
