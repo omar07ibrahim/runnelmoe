@@ -1,6 +1,6 @@
 # ADR 0006: compact BF16 expert GEMV with isolated AVX2 dispatch
 
-- Status: accepted; measurement outcome pending
+- Status: accepted; implementation and measurement outcome recorded
 - Date: 2026-08-03
 - Milestone: M4
 
@@ -474,6 +474,34 @@ continuous router-score tolerance, CPU and native-toolchain custody, absolute
 deadline, repeated-batch joins, and separate tmpfs/repository reserves explicit
 above. These clarifications do not change any case, cell, call count, pair
 order, statistic, interval, or claim rule.
+
+### Recorded outcome
+
+The first capture was made from clean implementation commit
+`035d217baf0901809fa02bf0a5c11c1a490198c2` and published append-only in
+`benchmarks/raw/m4-bf16-gemv-20260803/` by commit
+`ae69481def4b320ff619090ce7793ef3d65ace33`. All thirteen cells retained 30
+complete pairs, all 780 timing rows have `status = ok`, and all thirteen kernel
+plus three model correctness rows passed. Archival verification recreates the
+summary and both figures byte-for-byte.
+
+The natural one-thread streaming-expand candidate/scalar median ratio was
+0.176712 with an unadjusted 95% paired-bootstrap interval of
+`[0.175869, 0.178408]`. Streaming-contract was 0.183190 with interval
+`[0.176564, 0.188793]`. Both observed medians meet the frozen 0.95 threshold
+and both upper bounds are below one, so the preregistered conjunction is
+satisfied. This remains an observed-median rule, not a confidence-bounded
+minimum 5% effect.
+
+The shared four-vCPU host was busy during capture, with one-, five-, and
+fifteen-minute load averages of 3.88, 3.76, and 11.28 and nearly exhausted
+swap. Trial order was balanced and timed rows record zero major faults, but the
+formal intervals describe within-run paired resampling only. They do not
+establish run-to-run, host-to-host, model, shape, compiler, or ISA portability.
+The result measures fixed synthetic kernel batches, not token throughput,
+TTFT, storage I/O, hardware bandwidth, or end-to-end inference.
+The complete interpretation and independent reviews are in
+[the M4 review](../reviews/M4_REVIEW.md).
 
 ## Consequences
 

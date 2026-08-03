@@ -139,6 +139,7 @@ REQUIRED = {
     "docs/reviews/M1_REVIEW.md",
     "docs/reviews/M2_REVIEW.md",
     "docs/reviews/M3_REVIEW.md",
+    "docs/reviews/M4_REVIEW.md",
     "fixtures/README.md",
     "fixtures/cache/README.md",
     "fixtures/cache/m2-forced-eviction.jsonl",

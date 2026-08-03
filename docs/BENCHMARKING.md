@@ -221,6 +221,10 @@ twice the BF16 bytes after discarding its source. It introduces no second native
 ABI and cannot support the primary AVX2-versus-scalar claim. Logical BF16
 bytes/s is a workload rate, not measured hardware bandwidth.
 
+The accepted capture, generated summary, and scope-qualified interpretation
+are linked from the [M4 review](reviews/M4_REVIEW.md). This paragraph records
+the outcome location only; the preregistered contract above remains unchanged.
+
 ### Scheduling
 
 - **goodput:** requests completing within their declared deadline per second;
