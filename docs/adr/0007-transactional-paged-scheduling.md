@@ -381,7 +381,8 @@ top-k, top-p equality and just-below/above boundaries, `u = 0`-adjacent and
 one-adjacent values, the smallest positive f32 temperature, underflowed
 non-maximum weights, and invalid/nonfinite parameters. Cross-language golden
 tokens and retained candidate IDs are exact; finite probability diagnostics
-use a declared binary64 tolerance rather than a false bitwise-libm claim.
+use a maximum four-ULP binary64 tolerance rather than a false bitwise-libm
+claim. This diagnostic tolerance is fixed before M5 timing begins.
 
 The version-1 RNG is SplitMix64. Given state `s`, one preview computes:
 

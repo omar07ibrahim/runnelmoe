@@ -17,6 +17,12 @@ only the adapter identity and declared context cap change. The 1,024-token cap
 supports preregistered long-context scheduler measurements without changing
 the frozen v1 or v2 contracts. The generated object is still not committed.
 
+M5 also adds the independently generated
+[`scheduler/sampling-v1.json`](scheduler/README.md) vectors for SplitMix64 and
+seeded top-k/top-p categorical sampling. These inputs contain only small,
+hand-auditable numeric cases encoded with exact float-bit custody; they are not
+model weights or production-runtime traces.
+
 M3 also commits three tiny canonical
 [cache-policy traces](cache/README.md). They are hand-inspectable correctness
 inputs; the larger stochastic experiment traces are regenerated from the

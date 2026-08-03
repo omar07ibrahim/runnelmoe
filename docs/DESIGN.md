@@ -219,10 +219,13 @@ but raises the frozen synthetic context cap to 1,024. Its token-major K/V state
 uses 16-token pages charged at full admitted capacity. Stable three-pass
 streaming attention allocates no score vector proportional to context. The
 fixture and boundary tests exercise multi-page mechanics only; this is not a
-large-model performance claim. Continuous batching, expert-task transactions,
-RNG/output composition, and the bounded actor remain incomplete until the
-rest of M5 lands. Weights remain eagerly resident in M5, so live cache-leased
-expert execution remains an explicit system gap.
+large-model performance claim. A fallibly preallocated Rust sampler now
+implements the frozen SplitMix64/top-k/top-p arithmetic and is checked against
+an independently generated Python vector set; preview does not publish RNG
+state. Continuous batching, expert-task transactions, atomic RNG/output
+composition, and the bounded actor remain incomplete until the rest of M5
+lands. Weights remain eagerly resident in M5, so live cache-leased expert
+execution remains an explicit system gap.
 
 ## Error model
 

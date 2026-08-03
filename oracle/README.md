@@ -17,6 +17,7 @@ python -m pip install -r oracle/requirements.txt
 python -m oracle.generate --check
 python -m oracle.generate --check --spec fixtures/tiny-v2/spec.json
 python -m oracle.generate --check --spec fixtures/tiny-v3/spec.json
+python -m oracle.sampling --check
 python -m unittest discover -s oracle/tests -v
 ```
 
@@ -27,6 +28,7 @@ change:
 python -m oracle.generate --write
 python -m oracle.generate --write --spec fixtures/tiny-v2/spec.json
 python -m oracle.generate --write --spec fixtures/tiny-v3/spec.json
+python -m oracle.sampling --write
 ```
 
 The default command remains the frozen all-float32 adapter-v1 fixture. The
@@ -43,6 +45,19 @@ compares floating-point values with the tolerances declared by the fixture. It
 never rewrites files. PyTorch recomputes complete prefixes and all experts;
 Rust independently executes incremental scalar KV state and only selected
 experts.
+
+## Independent sampling oracle
+
+`sampling.py` is a Python-standard-library reference for the M5 SplitMix64,
+top-k/top-p, stable-softmax, and categorical-selection contract. It accepts
+binary32 values as raw hexadecimal bit patterns and visits candidates in the
+order frozen by ADR 0007. Its committed vectors and custody details are
+documented in [`fixtures/scheduler/README.md`](../fixtures/scheduler/README.md).
+
+The vector checker validates a closed canonical JSON schema, recomputes every
+valid and invalid case, verifies the semantic vector identity, and then
+requires byte equality with independent regeneration. Production code does not
+import this oracle, and the oracle does not consume production outputs.
 
 ## Independent cache-policy oracle
 

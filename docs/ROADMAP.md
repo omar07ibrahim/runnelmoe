@@ -104,7 +104,7 @@ M5 timing is evidence, not an acceptance condition. The hard gates are exact
 per-request semantics, the frozen numerical tolerance, transaction rollback,
 complete logical-ledger identities, bounded queues, deterministic sampling and
 trace replay, cancellation/deadline cleanup, and maximum service lag/runnable
-gap. Tiny adapter v3 will extend the generated fixture to 1,024 positions solely
+gap. Tiny adapter v3 extends the generated fixture to 1,024 positions solely
 to exercise multi-page state and streaming attention; it is not a large-model
 or natural-language performance claim.
 

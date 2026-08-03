@@ -147,5 +147,9 @@ jobs:
         run: python -m oracle.generate --check
       - name: Verify committed adapter-v2 oracle vectors
         run: python -m oracle.generate --check --spec fixtures/tiny-v2/spec.json
+      - name: Verify committed adapter-v3 oracle vectors
+        run: python -m oracle.generate --check --spec fixtures/tiny-v3/spec.json
+      - name: Verify committed sampling vectors
+        run: python -m oracle.sampling --check
       - name: Test the independent oracle
         run: python -m unittest discover -s oracle/tests -v
