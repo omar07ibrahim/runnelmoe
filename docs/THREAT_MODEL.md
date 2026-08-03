@@ -93,7 +93,10 @@ access must place a reviewed gateway in front, outside this project's default.
   process RSS. RunnelMoE uses explicit reads and reports this limitation.
 - Floating-point agreement is tolerance-based across compilers/ISAs.
 - Local processes with the same user privileges can observe files and may be
-  able to inspect process memory.
+  able to inspect process memory or modify an already-open regular file.
+- Descriptor-relative traversal prevents pathname redirection, but it is not
+  hostile same-UID isolation. Every demanded page is still authenticated
+  before use.
 - The M1 eager convenience reader is for a trusted local directory that is not
   concurrently replaced. Descriptor-relative race resistance and transactional
   publication are M2 gates.

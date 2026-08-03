@@ -125,8 +125,9 @@ memory ledger, publication, cache leases, and scheduling close in M2 and M5.
 
 ## Artifact contract
 
-RMOA version 1 is specified by [the format contract](FORMAT.md), ADR-0002, and
-[the M1 runtime decision](adr/0003-tiny-reference-runtime.md).
+RMOA version 1 is specified by [the format contract](FORMAT.md), ADR-0002,
+[the M1 runtime decision](adr/0003-tiny-reference-runtime.md), and
+[the verified data-plane decision](adr/0004-verified-data-plane.md).
 The bounded JSON manifest points only to lowercase SHA-256 object IDs in a
 derived `objects/sha256/` namespace. Tensor descriptors have a semantic role,
 dtype, shape, logical length, object digest, and a required digest-bound page
@@ -141,13 +142,18 @@ ranges. The artifact ID is the SHA-256 of the exact canonical manifest bytes.
 The configured runtime budget is partitioned explicitly:
 
     total = object_and_policy_metadata + waiter_and_lease_metadata
-          + sequence_state + kernel_scratch + resident_page_capacity
-          + in_flight_buffer_capacity + request_output_trace_queues
+          + sequence_state + kernel_scratch + page_pool_capacity
+          + request_output_trace_queues
           + admission_reserve
 
+    page_pool_used = loading_bytes + resident_bytes + retiring_bytes
+    loading_bytes <= max_in_flight_bytes <= page_pool_capacity
+
 Capacity, including alignment padding, is reserved before every allocation or
-I/O submission and released exactly once by its owner. A shared physical page
-buffer is charged once; each waiter and lease is charged separately.
+I/O submission and released exactly once by its owner. The in-flight limit is
+a subset cap within the page pool, not a second allocation pool. A shared
+physical page buffer is charged once as it moves from loading through resident
+or retiring; each waiter and lease is charged separately.
 Configuration is rejected if the minimum executable operation cannot fit.
 Cache policies operate on fixed-size pages so byte capacity and offline
 optimal comparisons are unambiguous. Large tensors are streamed as ordered

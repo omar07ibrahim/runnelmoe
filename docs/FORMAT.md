@@ -26,6 +26,20 @@ claiming publisher authenticity.
 Object and page-table filenames are derived only from their digest. Manifest
 strings never supply paths.
 
+RMOA is the portable single-artifact import/export layout. The M2 runtime CAS
+uses a separate internal namespace with digest-named manifests:
+
+    cas/
+      transaction.lock
+      manifests/sha256/<artifact digest>
+      page-tables/sha256/<page-table digest>
+      objects/sha256/<object digest>
+      staging/<validated random stage name>
+
+The bytes in a CAS manifest leaf are identical to standalone `manifest.json`,
+and its filename is their artifact digest. The internal layout and transaction
+semantics are fixed by ADR-0004; they do not change the RMOA wire contract.
+
 ## JSON rules
 
 The generic parser rejects duplicate keys before materializing an object and
@@ -159,25 +173,30 @@ fallback walks fixed path components with directory-relative `openat`,
 the expected handles and never reopens a checked pathname. Exact length is
 checked on the retained regular-file descriptor.
 
-M2 ingestion will create a randomly named sibling staging file with
-`O_CREAT | O_EXCL` and mode 0600. It writes with bounded buffers, verifies
-length and hashes, flushes and `fsync`s the file, then publishes without
+M2 ingestion creates a randomly named file in the retained CAS staging
+directory with `O_CREAT | O_EXCL` and mode 0600. It writes with bounded
+buffers, verifies the on-disk descriptor's length and hashes, flushes and
+`fsync`s the file, then publishes without
 replacement using `renameat2(RENAME_NOREPLACE)`. Where unavailable, a
 same-directory `linkat`-then-unlink fallback provides no-replace publication.
 The parent directory is `fsync`ed. Page tables publish before objects and the
-manifest publishes last. Cancellation may leave complete verified but
+digest-named manifest publishes last. Cancellation may leave complete verified but
 unreferenced content-addressed files as well as unaddressed staging files.
 Orphans are safe to ignore and may be garbage-collected only by comparing
-digests against retained manifests; partial files are never addressable.
+digests against every retained digest-named manifest; partial files are never
+addressable. M2 does not delete manifests, so each one is a garbage-collection
+root.
 
 The M2 project CAS will have a configured disk budget; the host default is the
 smaller of 2 GiB and available bytes above the mandatory 2 GiB filesystem
 reserve.
 Staging and orphan bytes count against it. Ingestion and garbage collection
 hold a project-owned transaction lock. On cancellation, newly published
-digests are removed only if no retained manifest references them. Garbage
-collection uses retained directory descriptors, rejects unexpected entries,
-and deletes only unreferenced regular digest files; it never follows links.
+digests remain safe orphans unless a later complete garbage-collection plan
+proves them unreferenced. Garbage collection uses retained directory
+descriptors, validates its complete mark and deletion plan before the first
+unlink, rejects unexpected entries, and deletes only unreferenced regular
+digest files; it never follows links.
 
 ## Verified reads
 

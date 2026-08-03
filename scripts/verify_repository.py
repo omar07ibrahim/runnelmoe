@@ -74,6 +74,7 @@ REQUIRED = {
     "docs/adr/0001-clean-room-and-system-boundaries.md",
     "docs/adr/0002-immutable-tensor-objects.md",
     "docs/adr/0003-tiny-reference-runtime.md",
+    "docs/adr/0004-verified-data-plane.md",
     "docs/diagrams/runtime.dot",
     "docs/reviews/M0_REVIEW.md",
     "docs/reviews/M1_REVIEW.md",
