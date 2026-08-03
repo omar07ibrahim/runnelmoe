@@ -169,6 +169,50 @@ remains credited above only as prior art for the broader constrained-memory
 inference problem. Results from another implementation are never accepted as
 RunnelMoE measurements.
 
+## Kernel and numeric-format sources
+
+M4 uses specifications and vendor/compiler documentation as primary sources:
+
+- [NVIDIA CUDA Math API: `__nv_bfloat16`](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-math-api/cuda_math_api/struct____nv__bfloat16.html)
+  records the BF16 bit fields and round-to-nearest-even conversion semantics;
+  documentation only was consulted, and the project uses no CUDA code. The
+  publisher documentation is proprietary and was consulted citation-only on
+  2026-08-03 under the
+  [NVIDIA Technology Access Terms of Use](https://developer.nvidia.com/legal/terms).
+- [Rust `is_x86_feature_detected!`](https://doc.rust-lang.org/std/macro.is_x86_feature_detected.html)
+  defines the standard runtime feature-detection boundary used before native
+  dispatch. The page was consulted on 2026-08-03; Rust standard-library
+  documentation is available under
+  [Apache-2.0](https://github.com/rust-lang/rust/blob/main/LICENSE-APACHE) or
+  [MIT](https://github.com/rust-lang/rust/blob/main/LICENSE-MIT).
+- [Rust Reference: external blocks](https://doc.rust-lang.org/stable/reference/items/external-blocks.html)
+  defines the explicit C ABI and unsafe-call obligations. The page was
+  consulted on 2026-08-03; the Reference is available under
+  [Apache-2.0](https://github.com/rust-lang/reference/blob/master/LICENSE-APACHE)
+  or [MIT](https://github.com/rust-lang/reference/blob/master/LICENSE-MIT).
+- [GCC x86 function attributes](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/x86-Function-Attributes.html)
+  define function-local ISA targeting and the requirement for caller-side
+  feature checks. Version 15.2 was consulted on 2026-08-03; the GCC manual is
+  licensed under
+  [GNU FDL 1.3 or later](https://gcc.gnu.org/onlinedocs/gcc/GNU-Free-Documentation-License.html)
+  with its stated invariant sections and cover texts.
+- [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html)
+  is the primary instruction/intrinsic semantics reference. The mutable guide
+  was consulted citation-only on 2026-08-03 under Intel's proprietary
+  [Terms of Use](https://www.intel.com/content/www/us/en/legal/terms-of-use.html).
+- Nicholas J. Higham, [*Accuracy and Stability of Numerical Algorithms*,
+  Chapter 3: Basics](https://epubs.siam.org/doi/10.1137/1.9780898718027.ch3),
+  second edition, SIAM, 2002, is the source for the standard `gamma(k)`
+  roundoff notation and inner-product forward-error analysis. It was consulted
+  citation-only on 2026-08-03 under the publisher's all-rights-reserved notice
+  shown on the linked record; no book text, figure, or table is reproduced.
+
+These sources are cited for contracts only. No sample or library source,
+intrinsic wrapper, test vector, benchmark result, build script, or prose was
+copied. The preregistered BF16 conversion, C kernel, Rust wrapper, tests,
+fixtures, and measurement harness will be independently implemented. The Kimi
+K3 C repository is not consulted for M4 implementation details.
+
 ## Contribution rule
 
 Before introducing any third-party implementation material, stop and amend

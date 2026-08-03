@@ -9,7 +9,9 @@ request scheduling, and honest measurement.
 > Project status: M0 design/provenance, the M1 tiny-reference runtime, the M2
 > verified out-of-core data plane, and M3 cache-policy research have passed
 > their milestone gates. M3 closes a synthetic modeled-traffic gate, not a
-> runtime speedup gate; it makes no production-policy recommendation.
+> runtime speedup gate; it makes no production-policy recommendation. The M4
+> compact-BF16/AVX2 kernel contract is preregistered, not yet implemented or
+> measured.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling

@@ -142,6 +142,85 @@ The simulator's `instant-between-events-v1` prefetch abstraction is an I/O
 volume and pollution model. M3 reports no simulator throughput, storage
 latency, overlap, TTFT, or runtime speedup from it.
 
+### M4 BF16 expert GEMV
+
+M4 compares one independently callable safe-Rust reference with one C AVX2
+candidate over the same row-major BF16 matrix and f32 input/output. Widening is
+exact; accumulation is f32; neither path uses FMA, fast-math, FP contraction,
+threading, allocation, BF16-to-f32 weight staging, or logging inside the
+primary timed call. Both use the preregistered temporary output workspace and
+identical validated final copy. The candidate is entered only after runtime
+AVX2 detection. The scalar path remains executable on every supported host.
+
+Correctness precedes timing. Each backend is checked against an independent
+f64 decoded-BF16 accumulator with the forward-error bound frozen in
+[ADR-0006](adr/0006-bf16-avx2-expert-kernel.md). Cross-backend absolute,
+relative, and ULP differences are diagnostic because ill-conditioned
+cancellation can amplify legal accumulation-order differences. The compact
+tiny adapter separately requires exact routes, expert IDs, and greedy tokens
+plus the existing model `atol = 1e-5`, `rtol = 1e-4` logit/route-weight gate. A
+nonfinite value, validation error, sanitizer failure, or parity failure
+invalidates timing.
+
+The fixed single-thread cells are tail `257 x 513` with 1,019 calls, L2
+`512 x 512` with 512 calls, LLC boundary `2,048 x 2,048` with 32 calls,
+streaming expand `8,192 x 2,048` with eight calls, and streaming contract
+`2,048 x 8,192` with eight calls. Each observation performs approximately
+134.2 million element-products. Expand and contract are the two preregistered
+primary cells; the others expose tails, call overhead, and working-set changes
+descriptively. Natural and deliberately offset addresses are retained rather
+than assuming allocator alignment. Two-worker streaming diagnostics bind their
+workers one-to-one to two recorded distinct physical cores, verify singleton
+affinity and residency, and report aggregate throughput only. The one-node
+host supports no multi-NUMA comparison.
+
+The closed grid has five natural scalar/AVX2 cells, three vector-offset
+scalar/AVX2 cells, two two-worker streaming scalar/AVX2 cells, and three
+safe-Rust scalar-BF16/staged-f32 cells. Every one of the thirteen cells has five
+excluded complete warmup pairs and 30 complete measured pairs, producing
+exactly 780 timing rows. A frozen domain-separated SHA-256 stream shuffles the
+thirteen cell children and each balanced set of fifteen baseline/candidate and
+fifteen candidate/baseline pairs. Outputs are consumed, every order and failure
+remains raw, and no outlier is removed. The primary comparison is paired
+AVX2/scalar elapsed time. Per-cell descriptive statistics, paired differences
+and ratios, and a deterministic 10,000-resample 95% percentile-bootstrap
+median interval are generated from raw rows. Cells are not pooled; intervals
+are unadjusted exploratory descriptions and no omnibus result is permitted.
+
+Every cell must have all 30 measured pairs (60 variant rows) succeed before it
+receives a paired interval or interval-based statement. A failed or timed-out
+row remains in the fixed 780-row artifact with its status; that cell is marked
+incomplete, reports status counts only, and cannot satisfy any claim rule.
+Successful partners are never treated as replacement pairs. The bootstrap
+resamples the 30 complete paired ratios with replacement, not individual
+variant rows. ADR-0006 freezes its domain-separated SHA-256 u64 stream,
+unbiased index rejection, ordinary even-sample median, and zero-based
+nearest-rank endpoint indices 249 and 9,749.
+
+Every repeated call passes through the same `std::hint::black_box` input,
+status, and output barrier for both variants and contributes one call-indexed
+output word to a timed batch sink. The sink and exact executed-call count are
+validated after timing; consuming only the final overwritten output is not
+accepted as an anti-elision control.
+
+An exploratory cell-specific lower-time statement requires all correctness
+gates and an unadjusted ratio interval wholly below one, with the multiplicity
+caveat retained. The only preregistered general claim rule is the conjunction of
+both natural one-thread streaming orientations: both observed median ratios
+must be at or below 0.95 and both upper bounds below one. This does not claim a
+confidence-bounded minimum 5% effect. Favorable timing is not an acceptance
+gate. Negative or ambiguous results remain publishable and no post-hoc cell
+can replace a primary cell.
+
+The secondary safe-Rust dequantization-strategy diagnostic compares repeated
+scalar BF16 calls with one timed BF16-to-f32 staging pass into preallocated
+scratch plus the same ascending-order scalar f32 call batch. It includes
+staging time and records that f32 scratch adds twice the BF16 source size, for
+three-times simultaneous peak; a persistent preexpanded-only strategy retains
+twice the BF16 bytes after discarding its source. It introduces no second native
+ABI and cannot support the primary AVX2-versus-scalar claim. Logical BF16
+bytes/s is a workload rate, not measured hardware bandwidth.
+
 ### Scheduling
 
 - **goodput:** requests completing within their declared deadline per second;

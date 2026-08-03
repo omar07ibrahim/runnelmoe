@@ -121,6 +121,7 @@ REQUIRED = {
     "docs/adr/0003-tiny-reference-runtime.md",
     "docs/adr/0004-verified-data-plane.md",
     "docs/adr/0005-cache-policy-research.md",
+    "docs/adr/0006-bf16-avx2-expert-kernel.md",
     "docs/diagrams/runtime.dot",
     "docs/reviews/M0_REVIEW.md",
     "docs/reviews/M1_REVIEW.md",

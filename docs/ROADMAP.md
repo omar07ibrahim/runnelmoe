@@ -62,12 +62,19 @@ runtime-performance evidence.
 
 ## M4 — kernels and portability
 
-- [ ] A narrow C ABI provides runtime-dispatched AVX2 on this host while scalar
-  remains independently testable.
+- [ ] Tiny adapter v2 retains compact BF16 expert matrices; a narrow C ABI
+  provides runtime-dispatched AVX2 while safe Rust scalar remains independently
+  testable and tiny v1 remains unchanged.
 - [ ] Sanitizer and differential tests cover alignment, tails, special values,
   compact representation decoding, and unsupported ISA fallback.
-- [ ] Any speedup claim has warmups, repetitions, dispersion, machine metadata,
-  raw data, and token/logit parity.
+- [ ] Append-only evidence retains paired warmups/repetitions, uncertainty,
+  machine metadata, raw data, and token/logit parity; any speedup claim meets
+  the preregistered cell-specific threshold.
+
+The accepted architecture, numerical bounds, sanitizer gate, fixed benchmark
+cells, and no-speedup fallback are frozen in
+[ADR-0006](adr/0006-bf16-avx2-expert-kernel.md). A favorable timing is not
+required to close M4.
 
 ## M5 — state and multi-request scheduling
 
