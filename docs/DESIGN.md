@@ -23,7 +23,8 @@ Default fixture dimensions are intentionally hand-inspectable: vocabulary 32,
 hidden width 8, one decoder block, four experts, top two selected, expert width
 12, and a short context cap. Weights are deterministically formula-generated
 from tensor ID and row-major index; there is no seed and no downloaded data.
-Seeded sampling is deliberately deferred to the scheduler/serving milestones.
+The M5 runtime provides deterministic seeded sampling primitives; scheduler
+integration and the serving policy surface remain milestone work.
 
 Tiny-v1 deliberately has no positional encoding. In this one-layer fixture,
 the final-token result is therefore invariant to permutations of the preceding
@@ -210,9 +211,18 @@ The M5 scheduler contract is frozen in
 [ADR-0007](adr/0007-transactional-paged-scheduling.md) and is being implemented
 in independently testable vertical slices. The completed state slice supports
 adapter v3, checked request-bounded page layouts, eager fallible page
-allocation, nonwrapping model/state identities, and allocation-free K/V commit
-permits. Compatibility calls compute against an unpublished bound candidate,
-so a failed first token leaves the caller's unbound shell unchanged.
+allocation, nonwrapping model/state/transaction identities, and allocation-free
+K/V commit permits. Compatibility calls compute against an unpublished bound
+candidate, so a failed first token leaves the caller's unbound shell unchanged.
+
+Tiny-model construction validates the complete closed 22-tensor role, shape,
+and dtype table before requesting payload bytes. The direct verified-artifact
+path decodes borrowed slices without transient tensor copies; ordered staging,
+f32/BF16 decode buffers, shapes, and expert arrays reserve fallibly. Model
+identity is assigned only after every weight has validated and all owned
+storage exists, so injected failure at any reservation cannot publish or
+consume an identity. The callback-based store boundary remains responsible for
+fallibly producing its owned byte vector before returning it to the runtime.
 
 Tiny adapter v3 retains the generated tiny equations and compact BF16 experts
 but raises the frozen synthetic context cap to 1,024. Its token-major K/V state
@@ -222,10 +232,16 @@ fixture and boundary tests exercise multi-page mechanics only; this is not a
 large-model performance claim. A fallibly preallocated Rust sampler now
 implements the frozen SplitMix64/top-k/top-p arithmetic and is checked against
 an independently generated Python vector set; preview does not publish RNG
-state. Continuous batching, expert-task transactions, atomic RNG/output
-composition, and the bounded actor remain incomplete until the rest of M5
-lands. Weights remain eagerly resident in M5, so live cache-leased expert
-execution remains an explicit system gap.
+state. The sealed `DecoderAdapter` now splits token work into prepare, owned
+expert tasks, validated contributions, deterministic rank-order finish, and a
+single-use state commit. Complete model/state/revision/position/transaction
+identity follows every phase. A higher-ranked synchronous callback prevents a
+validated commit capability from escaping into an outer future; all fallible
+work precedes its allocation-free apply. The fixed 192-byte tiny-adapter scratch
+is reused through the full 1,024-position context without growth. Continuous
+batching, the scheduler's composite RNG/output commit, and the bounded actor
+remain incomplete until the rest of M5 lands. Weights remain eagerly resident
+in M5, so live cache-leased expert execution remains an explicit system gap.
 
 ## Error model
 

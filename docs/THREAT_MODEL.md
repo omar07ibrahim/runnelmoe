@@ -50,6 +50,7 @@ The cross-milestone system invariants are:
 | Duplicate concurrent load | one cache-owned in-flight generation; bounded waiters share completion/error | deterministic worker-gate and concurrent fan-out tests | M2 |
 | Use-after-evict | explicit page leases; retire before reclaim; rounded payload charge retained through final lease | eviction/invalidation/shutdown state tests | M2 |
 | Integer overflow/shape confusion | checked arithmetic and exact dtype/byte/shape validation | generated mutation corpus | M1 |
+| Valid model construction allocation failure or partial publication | closed tensor table; borrowed verified bytes; fallible owned-buffer reservations; model identity assigned last | every-reservation injection, callback failure, impossible-host allocation, and retry parity tests | M1/M5 |
 | NaN/Inf or unstable routing | finite checks and specified score/tie policy | special-value and tie tests | M1 |
 | Compression bomb | compression absent from and rejected by RMOA v1 | exact-schema tests | M1 |
 | Memory/queue denial of service | eager metadata caps; 64-byte-quantized page-pool ledger; bounded entries, loads, workers, queues, waiters, leases, and traces | exact budget, queue saturation, hostile configuration, and failed-admission tests | M1/M2/M5 |
@@ -61,7 +62,7 @@ The cross-milestone system invariants are:
 | Cache-trace allocation or oracle explosion | canonical closed JSONL schema; file/line/page/event/prediction caps; complete validation before replay; uniform-geometry MIN; explicit state cap on variable-byte DP | adversarial parser corpus, deterministic arbitrary-byte smoke, oversized configuration tests, and exhaustive tiny differentials | M3 |
 | Slow client or abandoned SSE | deadlines, bounded output channel, disconnect cancellation | stalled/disconnect black-box tests | M6 |
 | High-cardinality telemetry | bounded metric labels; IDs only in sampled traces | metrics cardinality test | M6 |
-| Secret/prompt disclosure | allowlisted output and content-redacted errors | CLI stderr capture now; server log capture next | M1/M6 |
+| Secret/prompt disclosure | allowlisted output; tokenless typed errors; metadata-only `Debug` for models, tensors, adapter work, sampling previews, and reusable scratch | sentinel debug/error tests now; server log capture next | M1/M5/M6 |
 | Illegal SIMD or memory unsafety | scalar fallback, runtime CPUID, narrow C ABI | sanitizer/random differential tests | M4 |
 | Dependency or CI compromise | lockfiles, exact dependencies, pinned CI action revisions | CI and release audit | ongoing |
 | Disk exhaustion | no committed checkpoints; allocation-aware CAS ceiling, staging/orphan accounting, and mandatory filesystem reserve | exact injected budget arithmetic and stable reserve endpoints | M1/M2 |
@@ -116,9 +117,10 @@ deficits, RNG, high-water counters, or another request's admission plan.
 M5's logical ledger is exact only for declared semantic payload capacities and
 fixed metadata charges. Allocator control blocks, executor internals, code
 pages, and filesystem page cache remain outside it; fresh-child `VmHWM` and a
-configured reserve are separate evidence. When implemented, the generated
-width-8, 1,024-position adapter-v3 fixture demonstrates page/streaming
-mechanics, not hostile tenant isolation or production long-context behavior.
+configured reserve are separate evidence. The generated width-8,
+1,024-position adapter-v3 fixture now demonstrates paged state, streaming
+attention, fixed scratch, and transactional adapter mechanics; it does not
+demonstrate hostile tenant isolation or production long-context behavior.
 
 ## Abuse cases for later serving
 
@@ -132,6 +134,10 @@ access must place a reviewed gateway in front, outside this project's default.
 ## Residual risks
 
 - SHA-256 cannot identify a malicious but internally consistent model.
+- Bounded error-message construction and the earlier format-parser layer still
+  use standard-library allocation paths that may abort under catastrophic host
+  exhaustion. Runtime model success-path capacities are fallible and identity
+  is unpublished on error, but end-to-end allocator control remains incomplete.
 - Resource accounting cannot exactly predict allocator, runtime, or kernel page
   overhead; RSS evidence and a reserve are required.
 - Memory-mapped or cached filesystem data may affect host page cache outside

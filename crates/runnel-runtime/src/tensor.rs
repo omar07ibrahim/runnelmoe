@@ -2,10 +2,10 @@ use std::{collections::BTreeMap, fmt};
 
 use crate::{Result, RuntimeError};
 
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 pub struct Tensor {
-    shape: Box<[usize]>,
-    data: Box<[f32]>,
+    shape: Vec<usize>,
+    data: Vec<f32>,
 }
 
 impl fmt::Debug for Tensor {
@@ -44,10 +44,7 @@ impl Tensor {
         if data.iter().any(|value| !value.is_finite()) {
             return Err(invalid(role, "values must be finite"));
         }
-        Ok(Self {
-            shape: shape.into_boxed_slice(),
-            data: data.into_boxed_slice(),
-        })
+        Ok(Self { shape, data })
     }
 
     #[must_use]
