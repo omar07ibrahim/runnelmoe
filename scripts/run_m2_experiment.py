@@ -31,7 +31,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HARNESS_VERSION = "runnel.m2-evidence/1"
+HARNESS_VERSION = "runnel.m2-evidence/2"
 BINARY_RELATIVE = "target/release/runnel"
 OUTPUT_BASE_RELATIVE = "benchmarks/raw"
 COMMAND = (BINARY_RELATIVE, "data-plane-demo", "--json")
@@ -294,6 +294,22 @@ def _mapping(value: Any, label: str) -> Mapping[str, Any]:
     return value
 
 
+def _require_exact_keys(
+    value: Mapping[str, Any], expected: Sequence[str], label: str
+) -> None:
+    expected_keys = set(expected)
+    actual_keys = set(value)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(str(key) for key in actual_keys - expected_keys)
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected " + ", ".join(unexpected))
+        raise EvidenceError(f"data-plane output field {label} has " + "; ".join(details))
+
+
 def _copy_json(value: Any) -> Any:
     return json.loads(canonical_json(value))
 
@@ -311,6 +327,7 @@ def validate_observability(demo: Mapping[str, Any]) -> None:
     _nonnegative_integer(metrics.get("wait_nanoseconds"), "metrics.wait_nanoseconds")
     _nonnegative_integer(metrics.get("io_nanoseconds"), "metrics.io_nanoseconds")
     rss = _mapping(metrics.get("observed_rss"), "metrics.observed_rss")
+    _require_exact_keys(rss, ("resident_bytes", "peak_bytes"), "metrics.observed_rss")
     _nonnegative_integer(
         rss.get("resident_bytes"), "metrics.observed_rss.resident_bytes"
     )
@@ -338,12 +355,12 @@ def project_correctness(demo: Mapping[str, Any]) -> dict[str, Any]:
         "accounted",
         "trace_events_dropped",
     )
-    missing_metrics = [name for name in stable_metric_names if name not in metrics]
-    if missing_metrics:
-        raise EvidenceError(
-            "data-plane output lacks stable metric fields: "
-            + ", ".join(missing_metrics)
-        )
+    volatile_metric_names = ("wait_nanoseconds", "io_nanoseconds", "observed_rss")
+    _require_exact_keys(
+        metrics,
+        stable_metric_names + volatile_metric_names,
+        "metrics",
+    )
     top_level_names = (
         "schema_version",
         "fixtures",
@@ -353,14 +370,11 @@ def project_correctness(demo: Mapping[str, Any]) -> dict[str, Any]:
         "generated_text",
         "parity",
         "generation_cache",
+        "forced_eviction_generation",
         "trace",
         "cache_capacity_bytes",
     )
-    missing = [name for name in top_level_names if name not in demo]
-    if missing:
-        raise EvidenceError(
-            "data-plane output lacks correctness fields: " + ", ".join(missing)
-        )
+    _require_exact_keys(demo, top_level_names + ("metrics",), "root")
     projection = {name: _copy_json(demo[name]) for name in top_level_names}
     projection["metrics"] = {
         name: _copy_json(metrics[name]) for name in stable_metric_names
@@ -371,48 +385,112 @@ def project_correctness(demo: Mapping[str, Any]) -> dict[str, Any]:
 def validate_correctness_projection(projection: Mapping[str, Any]) -> None:
     """Enforce the fixed deterministic M2 parity and eviction gate."""
 
-    if projection.get("schema_version") != 1:
-        raise EvidenceError("unsupported data-plane demo schema version")
+    def require_exact_integer(
+        container: Mapping[str, Any], name: str, expected: int, label: str
+    ) -> int:
+        value = _nonnegative_integer(container.get(name), f"{label}.{name}")
+        if value != expected:
+            raise EvidenceError(f"unexpected {label} field {name}")
+        return value
+
+    def require_exact_integer_list(
+        value: Any, expected: Sequence[int], label: str
+    ) -> list[int]:
+        if not isinstance(value, list) or len(value) != len(expected):
+            raise EvidenceError(f"unexpected {label}")
+        checked = []
+        for index, expected_value in enumerate(expected):
+            actual = _nonnegative_integer(value[index], f"{label}[{index}]")
+            if actual != expected_value:
+                raise EvidenceError(f"unexpected {label}")
+            checked.append(actual)
+        return checked
+
+    _require_exact_keys(
+        projection,
+        (
+            "schema_version",
+            "fixtures",
+            "prompt",
+            "max_new_tokens",
+            "generated_ids",
+            "generated_text",
+            "parity",
+            "generation_cache",
+            "forced_eviction_generation",
+            "trace",
+            "cache_capacity_bytes",
+            "metrics",
+        ),
+        "correctness projection",
+    )
+    require_exact_integer(projection, "schema_version", 2, "root")
     if projection.get("parity") is not True:
         raise EvidenceError("data-plane numerical/token parity failed")
-    if projection.get("prompt") != "moe":
+    if not isinstance(projection.get("prompt"), str) or projection["prompt"] != "moe":
         raise EvidenceError("data-plane demo used an unexpected prompt")
-    if projection.get("max_new_tokens") != 4:
-        raise EvidenceError("data-plane demo used an unexpected generation length")
-    if projection.get("generated_ids") != [15, 11, 20, 9]:
+    require_exact_integer(projection, "max_new_tokens", 4, "root")
+    generated_ids = projection.get("generated_ids")
+    if not isinstance(generated_ids, list) or len(generated_ids) != 4:
         raise EvidenceError("data-plane generated IDs differ from the golden fixture")
-    if projection.get("generated_text") != "njsh":
+    for index, expected in enumerate((15, 11, 20, 9)):
+        value = _nonnegative_integer(generated_ids[index], f"generated_ids[{index}]")
+        if value != expected:
+            raise EvidenceError("data-plane generated IDs differ from the golden fixture")
+    if (
+        not isinstance(projection.get("generated_text"), str)
+        or projection["generated_text"] != "njsh"
+    ):
         raise EvidenceError("data-plane generated text differs from the golden fixture")
 
     fixtures = _mapping(projection.get("fixtures"), "fixtures")
+    _require_exact_keys(fixtures, ("tiny", "multi_page"), "fixtures")
     tiny = _mapping(fixtures.get("tiny"), "fixtures.tiny")
     multi_page = _mapping(fixtures.get("multi_page"), "fixtures.multi_page")
-    expected_fixture_fields = (
-        (
-            tiny,
-            "artifact_id",
-            "sha256:e49321cefc980ab59cd449341edfc624ccfc4b0b703cd175184e056d296d9ed3",
-        ),
-        (tiny, "object_length", 7_904),
-        (
-            multi_page,
-            "artifact_id",
-            "sha256:15feda585327bf8e25c124692de1b2e101315185e427b811a07b8eaca54e1630",
-        ),
-        (
-            multi_page,
-            "object_digest",
-            "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
-        ),
-        (multi_page, "object_length", 131_089),
+    fixture_fields = (
+        "artifact_id",
+        "object_digest",
+        "object_length",
+        "page_table_digest",
+        "page_table_length",
     )
-    for fixture, name, expected in expected_fixture_fields:
-        if fixture.get(name) != expected:
-            raise EvidenceError(f"unexpected pinned fixture field {name}")
+    expected_fixtures = {
+        "tiny": {
+            "artifact_id": "sha256:e49321cefc980ab59cd449341edfc624ccfc4b0b703cd175184e056d296d9ed3",
+            "object_digest": "sha256:6b2b8a1bbb2854084b1e1fe1e5787a9cfdb021b397e774fc7dbef79ac9d24bf6",
+            "object_length": 7_904,
+            "page_table_digest": "sha256:29383b56a150f9e5705f3666ca7707f21bc3fbd663ffd7249f4ecb938da6a62d",
+            "page_table_length": 96,
+        },
+        "multi_page": {
+            "artifact_id": "sha256:15feda585327bf8e25c124692de1b2e101315185e427b811a07b8eaca54e1630",
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "object_length": 131_089,
+            "page_table_digest": "sha256:d748ae45084baf6759c34321fb1f110151dfb33be390f4118d8a196cf0b2a4ab",
+            "page_table_length": 160,
+        },
+    }
+    for label, fixture in (("tiny", tiny), ("multi_page", multi_page)):
+        _require_exact_keys(fixture, fixture_fields, f"fixtures.{label}")
+        for name, expected in expected_fixtures[label].items():
+            if isinstance(expected, int):
+                require_exact_integer(fixture, name, expected, f"fixtures.{label}")
+            elif not isinstance(fixture.get(name), str) or fixture[name] != expected:
+                raise EvidenceError(f"unexpected pinned fixture field {label}.{name}")
 
     generation = _mapping(projection.get("generation_cache"), "generation_cache")
+    _require_exact_keys(
+        generation,
+        ("completed_generated_tokens", "physical_read_bytes", "bytes_per_generated_token"),
+        "generation_cache",
+    )
     ratio = _mapping(
         generation.get("bytes_per_generated_token"),
+        "generation_cache.bytes_per_generated_token",
+    )
+    _require_exact_keys(
+        ratio,
+        ("numerator_bytes", "denominator_tokens"),
         "generation_cache.bytes_per_generated_token",
     )
     expected_generation = {
@@ -420,20 +498,343 @@ def validate_correctness_projection(projection: Mapping[str, Any]) -> None:
         "physical_read_bytes": 7_904,
     }
     for name, expected in expected_generation.items():
-        if generation.get(name) != expected:
-            raise EvidenceError(f"unexpected generation-cache field {name}")
-    if ratio.get("numerator_bytes") != 7_904 or ratio.get("denominator_tokens") != 4:
-        raise EvidenceError("generation bytes-per-token ratio is not exact")
+        require_exact_integer(generation, name, expected, "generation_cache")
+    require_exact_integer(
+        ratio, "numerator_bytes", 7_904, "generation_cache.bytes_per_generated_token"
+    )
+    require_exact_integer(
+        ratio, "denominator_tokens", 4, "generation_cache.bytes_per_generated_token"
+    )
+
+    forced = _mapping(
+        projection.get("forced_eviction_generation"),
+        "forced_eviction_generation",
+    )
+    _require_exact_keys(
+        forced,
+        (
+            "full_generation_parity",
+            "cache_capacity_bytes",
+            "tensor_count",
+            "tensor_page_accesses",
+            "interference_page_accesses",
+            "tensor_page",
+            "interference_page",
+            "metrics",
+            "trace",
+        ),
+        "forced_eviction_generation",
+    )
+    if forced.get("full_generation_parity") is not True:
+        raise EvidenceError("full-generation parity under forced eviction failed")
+    expected_forced_fields = {
+        "cache_capacity_bytes": 65_536,
+        "tensor_count": 22,
+        "tensor_page_accesses": 22,
+        "interference_page_accesses": 1,
+    }
+    for name, expected in expected_forced_fields.items():
+        require_exact_integer(forced, name, expected, "forced_eviction_generation")
+    if forced["cache_capacity_bytes"] != projection.get("cache_capacity_bytes"):
+        raise EvidenceError("forced and fixed-trace cache capacities differ")
+    tensor_page = _mapping(
+        forced.get("tensor_page"),
+        "forced_eviction_generation.tensor_page",
+    )
+    _require_exact_keys(
+        tensor_page,
+        ("object_digest", "page_size", "page_index", "logical_bytes"),
+        "forced_eviction_generation.tensor_page",
+    )
+    expected_tensor_page = {
+        "object_digest": tiny["object_digest"],
+        "page_size": 65_536,
+        "page_index": 0,
+        "logical_bytes": 7_904,
+    }
+    for name, expected in expected_tensor_page.items():
+        if isinstance(expected, int):
+            require_exact_integer(
+                tensor_page,
+                name,
+                expected,
+                "forced_eviction_generation.tensor_page",
+            )
+        elif tensor_page.get(name) != expected:
+            raise EvidenceError(f"unexpected forced-eviction tensor-page field {name}")
+    interference = _mapping(
+        forced.get("interference_page"),
+        "forced_eviction_generation.interference_page",
+    )
+    _require_exact_keys(
+        interference,
+        ("object_digest", "page_size", "page_index", "logical_bytes"),
+        "forced_eviction_generation.interference_page",
+    )
+    expected_interference = {
+        "object_digest": multi_page["object_digest"],
+        "page_size": 65_536,
+        "page_index": 0,
+        "logical_bytes": 65_536,
+    }
+    for name, expected in expected_interference.items():
+        if isinstance(expected, int):
+            require_exact_integer(
+                interference,
+                name,
+                expected,
+                "forced_eviction_generation.interference_page",
+            )
+        elif interference.get(name) != expected:
+            raise EvidenceError(f"unexpected forced-eviction interference field {name}")
+    forced_metrics = _mapping(
+        forced.get("metrics"),
+        "forced_eviction_generation.metrics",
+    )
+    _require_exact_keys(
+        forced_metrics,
+        (
+            "demand_bytes",
+            "physical_read_bytes",
+            "hits",
+            "misses",
+            "admissions",
+            "evictions",
+            "coalesced_demands",
+            "prefetch",
+            "accounted",
+            "trace_events_dropped",
+        ),
+        "forced_eviction_generation.metrics",
+    )
+    expected_forced_metrics = {
+        "demand_bytes": 239_424,
+        "physical_read_bytes": 81_344,
+        "hits": 20,
+        "misses": 3,
+        "admissions": 3,
+        "evictions": 2,
+        "coalesced_demands": 0,
+        "trace_events_dropped": 0,
+    }
+    for name, expected in expected_forced_metrics.items():
+        require_exact_integer(
+            forced_metrics,
+            name,
+            expected,
+            "forced_eviction_generation.metrics",
+        )
+    expected_demand_bytes = (
+        forced["tensor_page_accesses"] * tensor_page["logical_bytes"]
+        + forced["interference_page_accesses"] * interference["logical_bytes"]
+    )
+    if forced_metrics["demand_bytes"] != expected_demand_bytes:
+        raise EvidenceError("forced-eviction demand-byte equation does not balance")
+    if forced_metrics["misses"] != forced_metrics["admissions"]:
+        raise EvidenceError("forced-eviction miss/admission counts differ")
+    if forced_metrics["evictions"] != forced_metrics["admissions"] - 1:
+        raise EvidenceError("forced-eviction eviction/admission counts are inconsistent")
+    if (
+        forced_metrics["hits"] + forced_metrics["misses"]
+        != forced["tensor_page_accesses"] + forced["interference_page_accesses"]
+    ):
+        raise EvidenceError("forced-eviction demand outcome counts do not balance")
+    forced_prefetch = _mapping(
+        forced_metrics.get("prefetch"),
+        "forced_eviction_generation.metrics.prefetch",
+    )
+    _require_exact_keys(
+        forced_prefetch,
+        ("bytes", "coalesced", "late", "useful", "wasted", "redundant", "dropped"),
+        "forced_eviction_generation.metrics.prefetch",
+    )
+    for name in (
+        "bytes",
+        "coalesced",
+        "late",
+        "useful",
+        "wasted",
+        "redundant",
+        "dropped",
+    ):
+        require_exact_integer(
+            forced_prefetch,
+            name,
+            0,
+            "forced_eviction_generation.metrics.prefetch",
+        )
+    forced_accounted = _mapping(
+        forced_metrics.get("accounted"),
+        "forced_eviction_generation.metrics.accounted",
+    )
+    _require_exact_keys(
+        forced_accounted,
+        (
+            "active_loads",
+            "page_pool_bytes",
+            "inflight_bytes",
+            "resident_bytes",
+            "retiring_bytes",
+            "leases",
+        ),
+        "forced_eviction_generation.metrics.accounted",
+    )
+    expected_forced_accounted = {
+        "active_loads": 0,
+        "page_pool_bytes": 7_936,
+        "inflight_bytes": 0,
+        "resident_bytes": 7_936,
+        "retiring_bytes": 0,
+        "leases": 0,
+    }
+    for name, expected in expected_forced_accounted.items():
+        require_exact_integer(
+            forced_accounted,
+            name,
+            expected,
+            "forced_eviction_generation.metrics.accounted",
+        )
+
+    forced_trace = _mapping(
+        forced.get("trace"),
+        "forced_eviction_generation.trace",
+    )
+    _require_exact_keys(
+        forced_trace,
+        ("access", "event_count", "outcomes", "events"),
+        "forced_eviction_generation.trace",
+    )
+    if forced_trace.get("access") != "demand":
+        raise EvidenceError("forced-eviction trace must contain demand accesses")
+    require_exact_integer(
+        forced_trace,
+        "event_count",
+        31,
+        "forced_eviction_generation.trace",
+    )
+    forced_schedule = [
+        ("miss", False, 7_904),
+        ("load_started", False, 7_904),
+        ("admitted", False, 7_904),
+        ("miss", True, 65_536),
+        ("evicted", False, 7_904),
+        ("load_started", True, 65_536),
+        ("admitted", True, 65_536),
+        ("miss", False, 7_904),
+        ("evicted", True, 65_536),
+        ("load_started", False, 7_904),
+        ("admitted", False, 7_904),
+    ] + [("hit", False, 7_904)] * 20
+    expected_forced_events = [
+        {
+            "sequence": sequence,
+            "outcome": outcome,
+            "reason": "demand",
+            "object_digest": (
+                multi_page["object_digest"] if uses_interference else tiny["object_digest"]
+            ),
+            "page_size": 65_536,
+            "page_index": 0,
+            "logical_bytes": logical_bytes,
+        }
+        for sequence, (outcome, uses_interference, logical_bytes) in enumerate(
+            forced_schedule
+        )
+    ]
+    forced_events = forced_trace.get("events")
+    if not isinstance(forced_events, list) or len(forced_events) != len(
+        expected_forced_events
+    ):
+        raise EvidenceError("forced-eviction normalized raw trace differs from the gate")
+    for index, (event_value, expected_event) in enumerate(
+        zip(forced_events, expected_forced_events, strict=True)
+    ):
+        event = _mapping(
+            event_value,
+            f"forced_eviction_generation.trace.events[{index}]",
+        )
+        _require_exact_keys(
+            event,
+            (
+                "sequence",
+                "outcome",
+                "reason",
+                "object_digest",
+                "page_size",
+                "page_index",
+                "logical_bytes",
+            ),
+            f"forced_eviction_generation.trace.events[{index}]",
+        )
+        for name in ("outcome", "reason", "object_digest"):
+            if event.get(name) != expected_event[name]:
+                raise EvidenceError(
+                    "forced-eviction normalized raw trace differs from the gate"
+                )
+        for name in ("sequence", "page_size", "page_index", "logical_bytes"):
+            require_exact_integer(
+                event,
+                name,
+                expected_event[name],
+                f"forced_eviction_generation.trace.events[{index}]",
+            )
+    forced_outcomes = _mapping(
+        forced_trace.get("outcomes"),
+        "forced_eviction_generation.trace.outcomes",
+    )
+    expected_forced_outcomes = {
+        "hit": 20,
+        "miss": 3,
+        "load_started": 3,
+        "load_coalesced": 0,
+        "late_prefetch": 0,
+        "prefetch_coalesced": 0,
+        "admitted": 3,
+        "evicted": 2,
+        "retired": 0,
+        "load_failed": 0,
+        "cancelled": 0,
+        "prefetch_useful": 0,
+        "prefetch_wasted": 0,
+        "prefetch_redundant": 0,
+        "prefetch_dropped": 0,
+    }
+    _require_exact_keys(
+        forced_outcomes,
+        tuple(expected_forced_outcomes),
+        "forced_eviction_generation.trace.outcomes",
+    )
+    for name, expected in expected_forced_outcomes.items():
+        require_exact_integer(
+            forced_outcomes,
+            name,
+            expected,
+            "forced_eviction_generation.trace.outcomes",
+        )
+    for metric_name, outcome_name in (
+        ("hits", "hit"),
+        ("misses", "miss"),
+        ("admissions", "admitted"),
+        ("evictions", "evicted"),
+    ):
+        if forced_metrics[metric_name] != forced_outcomes[outcome_name]:
+            raise EvidenceError("forced-eviction trace and metric counts differ")
 
     trace = _mapping(projection.get("trace"), "trace")
-    if trace.get("access") != "demand":
+    _require_exact_keys(
+        trace,
+        ("access", "page_indices", "page_lengths", "event_count", "outcomes", "events"),
+        "trace",
+    )
+    if not isinstance(trace.get("access"), str) or trace["access"] != "demand":
         raise EvidenceError("M2 trace must contain demand accesses")
-    if trace.get("page_indices") != [0, 1, 0, 2, 2]:
-        raise EvidenceError("M2 trace indices differ from the pinned trace")
-    if trace.get("page_lengths") != [65_536, 65_536, 17]:
-        raise EvidenceError("M2 trace page lengths differ from the pinned fixture")
-    if trace.get("event_count") != 16:
-        raise EvidenceError("M2 trace emitted an unexpected event count")
+    require_exact_integer_list(
+        trace.get("page_indices"), (0, 1, 0, 2, 2), "trace.page_indices"
+    )
+    require_exact_integer_list(
+        trace.get("page_lengths"), (65_536, 65_536, 17), "trace.page_lengths"
+    )
+    require_exact_integer(trace, "event_count", 16, "trace")
     expected_events = [
         {
             "sequence": sequence,
@@ -465,8 +866,36 @@ def validate_correctness_projection(projection: Mapping[str, Any]) -> None:
             )
         )
     ]
-    if trace.get("events") != expected_events:
+    trace_events = trace.get("events")
+    if not isinstance(trace_events, list) or len(trace_events) != len(expected_events):
         raise EvidenceError("M2 normalized raw trace differs from the pinned trace")
+    for index, (event_value, expected_event) in enumerate(
+        zip(trace_events, expected_events, strict=True)
+    ):
+        event = _mapping(event_value, f"trace.events[{index}]")
+        _require_exact_keys(
+            event,
+            (
+                "sequence",
+                "outcome",
+                "reason",
+                "object_digest",
+                "page_size",
+                "page_index",
+                "logical_bytes",
+            ),
+            f"trace.events[{index}]",
+        )
+        for name in ("outcome", "reason", "object_digest"):
+            if not isinstance(event.get(name), str) or event[name] != expected_event[name]:
+                raise EvidenceError("M2 normalized raw trace differs from the pinned trace")
+        for name in ("sequence", "page_size", "page_index", "logical_bytes"):
+            require_exact_integer(
+                event,
+                name,
+                expected_event[name],
+                f"trace.events[{index}]",
+            )
     outcomes = _mapping(trace.get("outcomes"), "trace.outcomes")
     expected_outcomes = {
         "hit": 1,
@@ -485,11 +914,10 @@ def validate_correctness_projection(projection: Mapping[str, Any]) -> None:
         "prefetch_redundant": 0,
         "prefetch_dropped": 0,
     }
+    _require_exact_keys(outcomes, tuple(expected_outcomes), "trace.outcomes")
     for name, expected in expected_outcomes.items():
-        if outcomes.get(name) != expected:
-            raise EvidenceError(f"unexpected M2 trace outcome {name}")
-    if projection.get("cache_capacity_bytes") != 65_536:
-        raise EvidenceError("M2 cache capacity differs from the one-page gate")
+        require_exact_integer(outcomes, name, expected, "trace.outcomes")
+    require_exact_integer(projection, "cache_capacity_bytes", 65_536, "root")
 
     metrics = _mapping(projection.get("metrics"), "metrics")
     expected_metrics = {
@@ -502,13 +930,14 @@ def validate_correctness_projection(projection: Mapping[str, Any]) -> None:
         "coalesced_demands": 0,
         "trace_events_dropped": 0,
     }
+    _require_exact_keys(metrics, tuple(expected_metrics) + ("prefetch", "accounted"), "metrics")
     for name, expected in expected_metrics.items():
-        if metrics.get(name) != expected:
-            raise EvidenceError(f"unexpected M2 metric {name}")
+        require_exact_integer(metrics, name, expected, "metrics")
     prefetch = _mapping(metrics.get("prefetch"), "metrics.prefetch")
-    for name in ("bytes", "coalesced", "late", "useful", "wasted", "redundant", "dropped"):
-        if prefetch.get(name) != 0:
-            raise EvidenceError(f"unexpected M2 prefetch metric {name}")
+    prefetch_names = ("bytes", "coalesced", "late", "useful", "wasted", "redundant", "dropped")
+    _require_exact_keys(prefetch, prefetch_names, "metrics.prefetch")
+    for name in prefetch_names:
+        require_exact_integer(prefetch, name, 0, "metrics.prefetch")
     accounted = _mapping(metrics.get("accounted"), "metrics.accounted")
     expected_accounted = {
         "active_loads": 0,
@@ -518,14 +947,15 @@ def validate_correctness_projection(projection: Mapping[str, Any]) -> None:
         "retiring_bytes": 0,
         "leases": 0,
     }
+    _require_exact_keys(accounted, tuple(expected_accounted), "metrics.accounted")
     for name, expected in expected_accounted.items():
-        if accounted.get(name) != expected:
-            raise EvidenceError(f"unexpected final accounted gauge {name}")
+        require_exact_integer(accounted, name, expected, "metrics.accounted")
 
 
 def fixture_and_trace_records(projection: Mapping[str, Any]) -> dict[str, Any]:
     fixtures = _copy_json(projection["fixtures"])
     trace = _mapping(projection["trace"], "trace")
+    forced_eviction = _copy_json(projection["forced_eviction_generation"])
     trace_definition = {
         "access": _copy_json(trace["access"]),
         "page_indices": _copy_json(trace["page_indices"]),
@@ -538,6 +968,10 @@ def fixture_and_trace_records(projection: Mapping[str, Any]) -> dict[str, Any]:
         "trace": {
             "digest": digest_json(trace_definition),
             "projection": trace_definition,
+        },
+        "forced_eviction": {
+            "digest": digest_json(forced_eviction),
+            "projection": forced_eviction,
         },
     }
 
@@ -928,7 +1362,7 @@ def run_once(
     elapsed = time.perf_counter_ns() - start
     after = _usage_snapshot()
     row: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "trial_index": trial_index,
         "phase": "measured",
         "started_at_utc": started_at,
@@ -1035,11 +1469,49 @@ def build_summary(
             "value": unique[0] if len(unique) == 1 else None,
         }
 
+    forced_deterministic_paths = {
+        "demand_bytes": (
+            "forced_eviction_generation",
+            "metrics",
+            "demand_bytes",
+        ),
+        "physical_read_bytes": (
+            "forced_eviction_generation",
+            "metrics",
+            "physical_read_bytes",
+        ),
+        "hits": ("forced_eviction_generation", "metrics", "hits"),
+        "misses": ("forced_eviction_generation", "metrics", "misses"),
+        "admissions": ("forced_eviction_generation", "metrics", "admissions"),
+        "evictions": ("forced_eviction_generation", "metrics", "evictions"),
+        "trace_event_count": ("forced_eviction_generation", "trace", "event_count"),
+    }
+    forced_deterministic_metrics = {}
+    for name, path in forced_deterministic_paths.items():
+        values = demo_metric(path)
+        unique = sorted(set(values))
+        forced_deterministic_metrics[name] = {
+            "observed_sample_count": len(values),
+            "all_successful_trials_equal": (
+                bool(successful)
+                and len(unique) == 1
+                and len(values) == len(successful)
+            ),
+            "value": unique[0] if len(unique) == 1 else None,
+        }
+
     matching_count = sum(
         row.get("correctness_projection_matches_gate") is True for row in rows
     )
     parity_count = sum(
         isinstance(row.get("demo"), Mapping) and row["demo"].get("parity") is True
+        for row in rows
+    )
+    forced_parity_count = sum(
+        isinstance(row.get("demo"), Mapping)
+        and isinstance(row["demo"].get("forced_eviction_generation"), Mapping)
+        and row["demo"]["forced_eviction_generation"].get("full_generation_parity")
+        is True
         for row in rows
     )
     ratio_values: list[tuple[int, int]] = []
@@ -1061,12 +1533,40 @@ def build_summary(
         distribution["observed_sample_count"] == len(successful)
         for distribution in distributions.values()
     )
-    all_correct = bool(rows) and len(successful) == len(rows) and all(
-        row.get("correctness_projection_matches_gate") is True for row in successful
+    revalidated_successful_count = 0
+    for row in successful:
+        try:
+            demo = _mapping(row.get("demo"), "summary.demo")
+            projection = project_correctness(demo)
+            validate_correctness_projection(projection)
+            digest = digest_json(projection)
+            if (
+                digest == gate_projection_digest
+                and row.get("correctness_projection_digest") == digest
+                and row.get("correctness_projection_matches_gate") is True
+            ):
+                revalidated_successful_count += 1
+        except (EvidenceError, TypeError, ValueError):
+            pass
+    all_successful_revalidate = bool(successful) and revalidated_successful_count == len(
+        successful
     )
-    passed = all_correct and observability_complete and binary_unchanged
+    all_correct = (
+        bool(rows)
+        and len(successful) == len(rows)
+        and all_successful_revalidate
+    )
+    all_ordinary_parity = bool(rows) and parity_count == len(rows)
+    all_forced_parity = bool(rows) and forced_parity_count == len(rows)
+    passed = (
+        all_correct
+        and all_ordinary_parity
+        and all_forced_parity
+        and observability_complete
+        and binary_unchanged
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "experiment_id": experiment_id,
         "source_observations_sha256": f"sha256:{observations_digest}",
         "trial_count": len(rows),
@@ -1075,6 +1575,7 @@ def build_summary(
         "correctness": {
             "gate_projection_digest": gate_projection_digest,
             "all_measured_trials_match_gate": all_correct,
+            "all_successful_trials_revalidated": all_successful_revalidate,
             "projection_match_fraction": {
                 "numerator": matching_count,
                 "denominator": len(rows),
@@ -1084,6 +1585,11 @@ def build_summary(
                 "numerator": parity_count,
                 "denominator": len(rows),
                 "value": parity_count / len(rows) if rows else None,
+            },
+            "forced_eviction_full_generation_parity_fraction": {
+                "numerator": forced_parity_count,
+                "denominator": len(rows),
+                "value": forced_parity_count / len(rows) if rows else None,
             },
             "exact_generation_bytes_per_token": {
                 "numerator_physical_read_bytes": exact_ratio[0] if exact_ratio else None,
@@ -1095,6 +1601,11 @@ def build_summary(
                     bool(successful)
                     and len(unique_ratios) == 1
                     and len(ratio_values) == len(successful)
+                ),
+                "definition": (
+                    "one async cache-backed cold object-payload load divided by "
+                    "subsequently generated tokens; excludes metadata, the synchronous "
+                    "comparator, and the separate forced-eviction path"
                 ),
             },
             "binary_unchanged_during_experiment": binary_unchanged,
@@ -1120,8 +1631,12 @@ def build_summary(
             ),
         },
         "deterministic_cache_metrics": deterministic_metrics,
+        "deterministic_forced_eviction_metrics": forced_deterministic_metrics,
         "interpretation": {
-            "scope": "M2 parity, verified I/O accounting, and fixed-trace cache behavior",
+            "scope": (
+                "M2 full-generation parity under forced eviction, verified I/O "
+                "accounting, and fixed-trace cache behavior"
+            ),
             "performance_claim": "none; wall time characterizes this validation command only",
             "shared_host_caveat": "virtualized-host timing is noisy and uncontrolled",
         },
@@ -1220,20 +1735,24 @@ def run(arguments: argparse.Namespace) -> int:
     fixture_trace = fixture_and_trace_records(gate_projection)
     harness_invocation = effective_harness_invocation(arguments)
     experiment = {
-        "schema_version": 1,
+        "schema_version": 2,
         "experiment_id": arguments.experiment_id,
         "started_at_utc": started_at,
         "git": {"commit": commit, "dirty": False},
         "hypothesis": (
             "The asynchronous verified byte-aware cache reproduces the synchronous "
-            "exact-read baseline and the one-page cache emits the pinned eviction trace."
+            "full generation while forced to evict and authenticate a tensor-page "
+            "reload, and the one-page cache emits the pinned short-tail trace."
         ),
         "expected_mechanism": (
             "Pages are digest-verified before publication, byte-budgeted, and evicted "
             "by deterministic LRU state transitions."
         ),
         "baseline": "synchronous exact verified page reads",
-        "candidate": "asynchronous verified byte-aware one-page LRU cache",
+        "candidate": (
+            "asynchronous verified byte-aware one-page LRU cache with a "
+            "forced-eviction tensor reload"
+        ),
         "command_argv": list(COMMAND),
         "command_display": " ".join(COMMAND),
         "build": build,
@@ -1247,6 +1766,7 @@ def run(arguments: argparse.Namespace) -> int:
         },
         "fixture": fixture_trace["fixture"],
         "trace": fixture_trace["trace"],
+        "forced_eviction": fixture_trace["forced_eviction"],
         "warmup_count": arguments.warmups,
         "measured_repetitions": arguments.repetitions,
         "seed_schedule": {
@@ -1265,6 +1785,7 @@ def run(arguments: argparse.Namespace) -> int:
         "correctness_gate": {
             "passed": True,
             "parity": True,
+            "forced_eviction_full_generation_parity": True,
             "projection_digest": gate_digest,
             "projection": gate_projection,
         },
@@ -1279,6 +1800,11 @@ def run(arguments: argparse.Namespace) -> int:
             {"name": "cache_io", "unit": "nanoseconds", "direction": "lower"},
             {"name": "child_major_page_faults", "unit": "faults", "direction": "lower"},
             {"name": "physical_read_bytes", "unit": "bytes", "direction": "diagnostic"},
+            {
+                "name": "forced_eviction_physical_read_bytes",
+                "unit": "bytes",
+                "direction": "diagnostic",
+            },
             {"name": "observed_peak_rss", "unit": "bytes", "direction": "diagnostic"},
         ],
         "bootstrap": {

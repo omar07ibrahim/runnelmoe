@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use runnel_fixture::{FixtureArtifact, PAGE_SIZE};
+use runnel_fixture::{FixtureArtifact, MultiPageFixture, PAGE_SIZE};
 use runnel_format::{Artifact, Limits, TensorRecord};
 use runnel_runtime::{RuntimeError, TinyModel, TinyTokenizer};
 use runnel_store::{
@@ -118,5 +118,99 @@ async fn sync_and_async_cached_loads_preserve_numerical_results() {
         metrics.resident_bytes,
         identity.object_length.div_ceil(64) * 64
     );
+    cache.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_generation_parity_survives_forced_eviction_between_tensors() {
+    let temporary = tempfile::tempdir().unwrap();
+    let tiny_root = temporary.path().join("tiny");
+    let multi_root = temporary.path().join("multi");
+    let tiny_identity = FixtureArtifact::build().write_new(&tiny_root).unwrap();
+    let multi_identity = MultiPageFixture::build().write_new(&multi_root).unwrap();
+
+    let eager =
+        Artifact::open_with_expected_id(&tiny_root, Limits::default(), tiny_identity.artifact_id)
+            .unwrap();
+    let expected_model = TinyModel::from_artifact(&eager).unwrap();
+
+    let tiny_source = ArtifactSource::open(&tiny_root).unwrap();
+    let tiny = tiny_source
+        .open_with_expected_id(
+            Limits::default(),
+            tiny_identity.artifact_id,
+            &Control::default(),
+        )
+        .unwrap();
+    let multi_source = ArtifactSource::open(&multi_root).unwrap();
+    let multi = multi_source
+        .open_with_expected_id(
+            Limits::default(),
+            multi_identity.artifact_id,
+            &Control::default(),
+        )
+        .unwrap();
+    let interference = multi.page_specs().next().unwrap().unwrap();
+    assert_eq!(interference.length(), u64::from(PAGE_SIZE));
+
+    let async_reader =
+        AsyncReader::new(tiny.reader(), AsyncReaderConfig::new(2, 4).unwrap()).unwrap();
+    let cache = PageCache::new(
+        async_reader,
+        CacheConfig::new(u64::from(PAGE_SIZE), u64::from(PAGE_SIZE))
+            .unwrap()
+            .with_max_inflight_bytes(u64::from(PAGE_SIZE))
+            .with_max_loads(1),
+    )
+    .unwrap();
+
+    let mut tensors = BTreeMap::new();
+    for (tensor_index, tensor) in tiny.manifest().tensors.iter().enumerate() {
+        let mut bytes = Vec::with_capacity(usize::try_from(tensor.length).unwrap());
+        let specifications = tiny
+            .tensor_page_specs(tensor.id)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(specifications.len(), 1);
+        for specification in specifications {
+            let lease = cache
+                .get(specification.clone(), Control::default())
+                .await
+                .unwrap();
+            append_intersection(&mut bytes, tensor, &specification, lease.bytes());
+        }
+        assert_eq!(bytes.len(), usize::try_from(tensor.length).unwrap());
+        tensors.insert(tensor.id, bytes);
+
+        if tensor_index == 0 {
+            let interference_lease = cache
+                .get(interference.clone(), Control::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                interference_lease.bytes().len(),
+                usize::try_from(interference.length()).unwrap()
+            );
+        }
+    }
+    let forced_model = model_from_bytes(tiny.manifest(), tensors);
+
+    let prompt = TinyTokenizer.encode("moe").unwrap();
+    let expected = expected_model.generate_greedy(&prompt, 4).unwrap();
+    let actual = forced_model.generate_greedy(&prompt, 4).unwrap();
+    assert_eq!(actual, expected);
+
+    let tensor_count = u64::try_from(tiny.manifest().tensors.len()).unwrap();
+    assert_eq!(tensor_count, 22);
+    let metrics = cache.metrics();
+    assert_eq!(metrics.hits, 20);
+    assert_eq!(metrics.misses, 3);
+    assert_eq!(metrics.admissions, 3);
+    assert_eq!(metrics.evictions, 2);
+    assert_eq!(metrics.demand_bytes, 239_424);
+    assert_eq!(metrics.physical_read_bytes, 81_344);
+    assert_eq!(metrics.resident_bytes, 7_936);
+    assert_eq!(metrics.page_pool_bytes, 7_936);
     cache.shutdown();
 }

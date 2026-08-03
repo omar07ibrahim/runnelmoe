@@ -142,7 +142,7 @@ fn data_plane_demo_reports_deterministic_parity_and_accounting() {
     assert!(output.stderr.is_empty());
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["schema_version"], 2);
     assert_eq!(result["prompt"], "moe");
     assert_eq!(result["max_new_tokens"], 4);
     assert_eq!(result["generated_ids"], serde_json::json!([15, 11, 20, 9]));
@@ -158,6 +158,99 @@ fn data_plane_demo_reports_deterministic_parity_and_accounting() {
         result["generation_cache"]["bytes_per_generated_token"]["denominator_tokens"],
         4
     );
+    let forced = &result["forced_eviction_generation"];
+    assert_eq!(forced["full_generation_parity"], true);
+    assert_eq!(forced["cache_capacity_bytes"], 65_536);
+    assert_eq!(forced["tensor_count"], 22);
+    assert_eq!(forced["tensor_page_accesses"], 22);
+    assert_eq!(forced["interference_page_accesses"], 1);
+    assert_eq!(
+        forced["tensor_page"]["object_digest"],
+        result["fixtures"]["tiny"]["object_digest"]
+    );
+    assert_eq!(forced["tensor_page"]["page_size"], 65_536);
+    assert_eq!(forced["tensor_page"]["page_index"], 0);
+    assert_eq!(forced["tensor_page"]["logical_bytes"], 7_904);
+    assert_eq!(
+        forced["interference_page"]["object_digest"],
+        result["fixtures"]["multi_page"]["object_digest"]
+    );
+    assert_eq!(forced["interference_page"]["page_size"], 65_536);
+    assert_eq!(forced["interference_page"]["page_index"], 0);
+    assert_eq!(forced["interference_page"]["logical_bytes"], 65_536);
+    assert_eq!(forced["metrics"]["demand_bytes"], 239_424);
+    assert_eq!(forced["metrics"]["physical_read_bytes"], 81_344);
+    assert_eq!(forced["metrics"]["hits"], 20);
+    assert_eq!(forced["metrics"]["misses"], 3);
+    assert_eq!(forced["metrics"]["admissions"], 3);
+    assert_eq!(forced["metrics"]["evictions"], 2);
+    assert_eq!(forced["metrics"]["coalesced_demands"], 0);
+    for metric in [
+        "bytes",
+        "coalesced",
+        "late",
+        "useful",
+        "wasted",
+        "redundant",
+        "dropped",
+    ] {
+        assert_eq!(forced["metrics"]["prefetch"][metric], 0);
+    }
+    assert_eq!(forced["metrics"]["accounted"]["active_loads"], 0);
+    assert_eq!(forced["metrics"]["accounted"]["page_pool_bytes"], 7_936);
+    assert_eq!(forced["metrics"]["accounted"]["inflight_bytes"], 0);
+    assert_eq!(forced["metrics"]["accounted"]["resident_bytes"], 7_936);
+    assert_eq!(forced["metrics"]["accounted"]["retiring_bytes"], 0);
+    assert_eq!(forced["metrics"]["accounted"]["leases"], 0);
+    assert_eq!(forced["metrics"]["trace_events_dropped"], 0);
+    assert_eq!(forced["trace"]["access"], "demand");
+    assert_eq!(forced["trace"]["event_count"], 31);
+    assert_eq!(forced["trace"]["outcomes"]["hit"], 20);
+    assert_eq!(forced["trace"]["outcomes"]["miss"], 3);
+    assert_eq!(forced["trace"]["outcomes"]["load_started"], 3);
+    assert_eq!(forced["trace"]["outcomes"]["admitted"], 3);
+    assert_eq!(forced["trace"]["outcomes"]["evicted"], 2);
+    let forced_events = forced["trace"]["events"].as_array().unwrap();
+    assert_eq!(forced_events.len(), 31);
+    let prefix = [
+        ("miss", false, 7_904),
+        ("load_started", false, 7_904),
+        ("admitted", false, 7_904),
+        ("miss", true, 65_536),
+        ("evicted", false, 7_904),
+        ("load_started", true, 65_536),
+        ("admitted", true, 65_536),
+        ("miss", false, 7_904),
+        ("evicted", true, 65_536),
+        ("load_started", false, 7_904),
+        ("admitted", false, 7_904),
+    ];
+    for (sequence, event) in forced_events.iter().enumerate() {
+        let (outcome, interference, logical_bytes) = if sequence < prefix.len() {
+            prefix[sequence]
+        } else {
+            ("hit", false, 7_904)
+        };
+        assert_eq!(event["sequence"], sequence as u64);
+        assert_eq!(event["outcome"], outcome);
+        assert_eq!(event["reason"], "demand");
+        let expected_digest = if interference {
+            result["fixtures"]["multi_page"]["object_digest"]
+                .as_str()
+                .unwrap()
+        } else {
+            result["fixtures"]["tiny"]["object_digest"]
+                .as_str()
+                .unwrap()
+        };
+        assert_eq!(
+            event["object_digest"],
+            expected_digest
+        );
+        assert_eq!(event["page_size"], 65_536);
+        assert_eq!(event["page_index"], 0);
+        assert_eq!(event["logical_bytes"], logical_bytes);
+    }
 
     assert_eq!(
         result["fixtures"]["tiny"]["artifact_id"],
@@ -274,9 +367,10 @@ fn data_plane_demo_has_concise_text_output() {
     );
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(stdout.lines().count(), 5);
+    assert_eq!(stdout.lines().count(), 6);
     assert!(stdout.contains("data-plane parity: true"));
     assert!(stdout.contains("generated IDs: [15, 11, 20, 9]"));
     assert!(stdout.contains("generation cache: 7904 physical bytes / 4 completed tokens"));
+    assert!(stdout.contains("forced-eviction parity: true (2 evictions)"));
     assert!(!stdout.contains("/tmp/"));
 }

@@ -174,6 +174,49 @@ struct GenerationCacheOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct ForcedEvictionPageOutput {
+    object_digest: String,
+    page_size: u64,
+    page_index: u64,
+    logical_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ForcedEvictionMetricsOutput {
+    demand_bytes: u64,
+    physical_read_bytes: u64,
+    hits: u64,
+    misses: u64,
+    admissions: u64,
+    evictions: u64,
+    coalesced_demands: u64,
+    prefetch: PrefetchMetricsOutput,
+    accounted: AccountedGaugesOutput,
+    trace_events_dropped: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ForcedEvictionTraceOutput {
+    access: &'static str,
+    event_count: u64,
+    outcomes: TraceOutcomeCountsOutput,
+    events: Vec<NormalizedTraceEventOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct ForcedEvictionGenerationOutput {
+    full_generation_parity: bool,
+    cache_capacity_bytes: u64,
+    tensor_count: u64,
+    tensor_page_accesses: u64,
+    interference_page_accesses: u64,
+    tensor_page: ForcedEvictionPageOutput,
+    interference_page: ForcedEvictionPageOutput,
+    metrics: ForcedEvictionMetricsOutput,
+    trace: ForcedEvictionTraceOutput,
+}
+
+#[derive(Debug, Serialize)]
 struct PrefetchMetricsOutput {
     bytes: u64,
     coalesced: u64,
@@ -271,6 +314,7 @@ struct DataPlaneDemoOutput {
     generated_text: String,
     parity: bool,
     generation_cache: GenerationCacheOutput,
+    forced_eviction_generation: ForcedEvictionGenerationOutput,
     trace: DemandTraceOutput,
     cache_capacity_bytes: u64,
     metrics: DataPlaneMetricsOutput,
@@ -335,6 +379,11 @@ fn print_data_plane_demo(json: bool) -> Result<(), Box<dyn Error>> {
             output.generation_cache.physical_read_bytes,
             output.generation_cache.completed_generated_tokens,
         );
+        println!(
+            "forced-eviction parity: {} ({} evictions)",
+            output.forced_eviction_generation.full_generation_parity,
+            output.forced_eviction_generation.metrics.evictions,
+        );
         println!("trace pages: {:?}", output.trace.page_indices);
         println!(
             "cache: {} hit, {} misses, {} admissions, {} evictions, {} physical bytes",
@@ -381,12 +430,12 @@ async fn build_data_plane_demo() -> Result<DataPlaneDemoOutput, Box<dyn Error>> 
     let prompt_ids = TinyTokenizer.encode(PROMPT)?;
     let sync_generation = sync_model.generate_greedy(&prompt_ids, MAX_NEW_TOKENS)?;
     let cached_generation = cached_model.generate_greedy(&prompt_ids, MAX_NEW_TOKENS)?;
-    let parity = sync_generation == cached_generation;
-    if !parity {
+    let cached_generation_parity = sync_generation == cached_generation;
+    if !cached_generation_parity {
         return Err(io::Error::other("synchronous and cached generation differ").into());
     }
     let generated_text = TinyTokenizer.decode(&sync_generation.generated_tokens)?;
-    let generated_ids = sync_generation.generated_tokens;
+    let generated_ids = sync_generation.generated_tokens.clone();
     let completed_generated_tokens = u64::try_from(generated_ids.len())?;
     if completed_generated_tokens == 0 {
         return Err(io::Error::other("tiny generation produced no completed tokens").into());
@@ -422,6 +471,59 @@ async fn build_data_plane_demo() -> Result<DataPlaneDemoOutput, Box<dyn Error>> 
         return Err(io::Error::other("multi-page fixture geometry changed").into());
     }
 
+    // PageSpec retains its authenticated object descriptor, while SyncReader is
+    // deliberately stateless. One global cache can therefore exercise pages
+    // from both retained artifacts without reopening either pathname.
+    let interference_page = page_specification(&specifications, 0)?.clone();
+    let forced_reader = AsyncReader::new(tiny_stored.reader(), AsyncReaderConfig::new(2, 4)?)?;
+    let forced_cache = PageCache::new(
+        forced_reader,
+        CacheConfig::new(u64::from(PAGE_SIZE), u64::from(PAGE_SIZE))?
+            .with_max_inflight_bytes(u64::from(PAGE_SIZE))
+            .with_max_loads(1)
+            .with_trace_capacity(64),
+    )?;
+    let (forced_tensors, tensor_page_accesses, interference_page_accesses) =
+        collect_cached_tensor_bytes_with_interference(
+            &tiny_stored,
+            &forced_cache,
+            &interference_page,
+        )
+        .await?;
+    let forced_model = model_from_verified_tensor_bytes(tiny_stored.manifest(), forced_tensors)?;
+    let forced_generation = forced_model.generate_greedy(&prompt_ids, MAX_NEW_TOKENS)?;
+    let forced_generation_parity = sync_generation == forced_generation;
+    if !forced_generation_parity {
+        return Err(io::Error::other(
+            "forced-eviction cached generation differs from synchronous generation",
+        )
+        .into());
+    }
+    let tensor_count = u64::try_from(tiny_stored.manifest().tensors.len())?;
+    let forced_metrics = forced_cache.metrics();
+    validate_forced_eviction_metrics(
+        forced_metrics,
+        tensor_count,
+        tensor_page_accesses,
+        interference_page_accesses,
+        tiny_identity.object_length,
+        interference_page.length(),
+    )?;
+    let forced_trace_events = forced_cache.trace_sink().drain();
+    let forced_trace_outcomes = count_trace_outcomes(&forced_trace_events)?;
+    let normalized_forced_trace = normalize_trace_events(&forced_trace_events)?;
+    let tiny_object_digest = tiny_identity.object_digest.to_string();
+    let multi_object_digest = multi_identity.object_digest.to_string();
+    validate_forced_eviction_trace(
+        &normalized_forced_trace,
+        &forced_trace_outcomes,
+        &tiny_object_digest,
+        &multi_object_digest,
+    )?;
+    forced_cache.shutdown();
+
+    let parity = cached_generation_parity && forced_generation_parity;
+
     let trace_reader = AsyncReader::new(multi_stored.reader(), AsyncReaderConfig::new(2, 4)?)?;
     let trace_cache = PageCache::new(
         trace_reader,
@@ -448,10 +550,9 @@ async fn build_data_plane_demo() -> Result<DataPlaneDemoOutput, Box<dyn Error>> 
     let trace_outcomes = count_trace_outcomes(&trace_events)?;
     validate_trace_outcomes(&trace_outcomes, trace_events.len())?;
     let normalized_trace = normalize_trace_events(&trace_events)?;
-    let multi_object_digest = multi_identity.object_digest.to_string();
     validate_normalized_trace(&normalized_trace, &multi_object_digest)?;
     let output = DataPlaneDemoOutput {
-        schema_version: 1,
+        schema_version: 2,
         fixtures: DataPlaneFixturesOutput {
             tiny: tiny_identity.into(),
             multi_page: multi_identity.into(),
@@ -467,6 +568,58 @@ async fn build_data_plane_demo() -> Result<DataPlaneDemoOutput, Box<dyn Error>> 
             bytes_per_generated_token: ExactBytesPerTokenOutput {
                 numerator_bytes: tiny_metrics.physical_read_bytes,
                 denominator_tokens: completed_generated_tokens,
+            },
+        },
+        forced_eviction_generation: ForcedEvictionGenerationOutput {
+            full_generation_parity: forced_generation_parity,
+            cache_capacity_bytes: u64::from(PAGE_SIZE),
+            tensor_count,
+            tensor_page_accesses,
+            interference_page_accesses,
+            tensor_page: ForcedEvictionPageOutput {
+                object_digest: tiny_object_digest,
+                page_size: u64::from(PAGE_SIZE),
+                page_index: 0,
+                logical_bytes: tiny_identity.object_length,
+            },
+            interference_page: ForcedEvictionPageOutput {
+                object_digest: interference_page.key().object().to_string(),
+                page_size: interference_page.key().page_size(),
+                page_index: interference_page.key().index(),
+                logical_bytes: interference_page.length(),
+            },
+            metrics: ForcedEvictionMetricsOutput {
+                demand_bytes: forced_metrics.demand_bytes,
+                physical_read_bytes: forced_metrics.physical_read_bytes,
+                hits: forced_metrics.hits,
+                misses: forced_metrics.misses,
+                admissions: forced_metrics.admissions,
+                evictions: forced_metrics.evictions,
+                coalesced_demands: forced_metrics.coalesced_demands,
+                prefetch: PrefetchMetricsOutput {
+                    bytes: forced_metrics.prefetch_bytes,
+                    coalesced: forced_metrics.coalesced_prefetches,
+                    late: forced_metrics.late_prefetches,
+                    useful: forced_metrics.useful_prefetches,
+                    wasted: forced_metrics.wasted_prefetches,
+                    redundant: forced_metrics.redundant_prefetches,
+                    dropped: forced_metrics.dropped_prefetches,
+                },
+                accounted: AccountedGaugesOutput {
+                    active_loads: forced_metrics.active_loads,
+                    page_pool_bytes: forced_metrics.page_pool_bytes,
+                    inflight_bytes: forced_metrics.inflight_bytes,
+                    resident_bytes: forced_metrics.resident_bytes,
+                    retiring_bytes: forced_metrics.retiring_bytes,
+                    leases: forced_metrics.leases,
+                },
+                trace_events_dropped: forced_metrics.trace_events_dropped,
+            },
+            trace: ForcedEvictionTraceOutput {
+                access: "demand",
+                event_count: u64::try_from(forced_trace_events.len())?,
+                outcomes: forced_trace_outcomes,
+                events: normalized_forced_trace,
             },
         },
         trace: DemandTraceOutput {
@@ -574,6 +727,71 @@ fn validate_normalized_trace(
     Ok(())
 }
 
+fn validate_forced_eviction_trace(
+    events: &[NormalizedTraceEventOutput],
+    outcomes: &TraceOutcomeCountsOutput,
+    tensor_object_digest: &str,
+    interference_object_digest: &str,
+) -> Result<(), Box<dyn Error>> {
+    const PREFIX: [(&str, bool, u64); 11] = [
+        ("miss", false, 7_904),
+        ("load_started", false, 7_904),
+        ("admitted", false, 7_904),
+        ("miss", true, 65_536),
+        ("evicted", false, 7_904),
+        ("load_started", true, 65_536),
+        ("admitted", true, 65_536),
+        ("miss", false, 7_904),
+        ("evicted", true, 65_536),
+        ("load_started", false, 7_904),
+        ("admitted", false, 7_904),
+    ];
+    if events.len() != 31 {
+        return Err(io::Error::other("forced-eviction trace length changed").into());
+    }
+    for (sequence, event) in events.iter().enumerate() {
+        let (outcome, uses_interference, logical_bytes) = if sequence < PREFIX.len() {
+            PREFIX[sequence]
+        } else {
+            ("hit", false, 7_904)
+        };
+        let expected_digest = if uses_interference {
+            interference_object_digest
+        } else {
+            tensor_object_digest
+        };
+        if event.sequence != u64::try_from(sequence)?
+            || event.outcome != outcome
+            || event.reason != "demand"
+            || event.object_digest != expected_digest
+            || event.page_size != u64::from(PAGE_SIZE)
+            || event.page_index != 0
+            || event.logical_bytes != logical_bytes
+        {
+            return Err(io::Error::other("forced-eviction normalized trace changed").into());
+        }
+    }
+    let exact_outcomes = outcomes.hit == 20
+        && outcomes.miss == 3
+        && outcomes.load_started == 3
+        && outcomes.admitted == 3
+        && outcomes.evicted == 2
+        && outcomes.load_coalesced == 0
+        && outcomes.late_prefetch == 0
+        && outcomes.prefetch_coalesced == 0
+        && outcomes.retired == 0
+        && outcomes.load_failed == 0
+        && outcomes.cancelled == 0
+        && outcomes.prefetch_useful == 0
+        && outcomes.prefetch_wasted == 0
+        && outcomes.prefetch_redundant == 0
+        && outcomes.prefetch_dropped == 0;
+    if !exact_outcomes {
+        return Err(io::Error::other("forced-eviction trace outcomes changed").into());
+    }
+    Ok(())
+}
+
 fn count_trace_outcomes(events: &[TraceEvent]) -> Result<TraceOutcomeCountsOutput, Box<dyn Error>> {
     let mut counts = TraceOutcomeCountsOutput::default();
     for event in events {
@@ -665,6 +883,102 @@ async fn collect_cached_tensor_bytes(
         tensors.insert(tensor.id, bytes);
     }
     Ok(tensors)
+}
+
+async fn collect_cached_tensor_bytes_with_interference(
+    stored: &StoredArtifact,
+    cache: &PageCache,
+    interference_page: &PageSpec,
+) -> Result<(BTreeMap<u64, Vec<u8>>, u64, u64), Box<dyn Error>> {
+    let mut tensors = BTreeMap::new();
+    let mut tensor_page_accesses = 0_u64;
+    let mut interference_page_accesses = 0_u64;
+    for (tensor_index, tensor) in stored.manifest().tensors.iter().enumerate() {
+        let mut bytes = Vec::with_capacity(tensor_length(tensor)?);
+        for specification in stored.tensor_page_specs(tensor.id)? {
+            let specification = specification?;
+            let lease = cache
+                .get(specification.clone(), Control::unbounded())
+                .await?;
+            append_intersection(&mut bytes, tensor, &specification, lease.bytes())?;
+            drop(lease);
+            tensor_page_accesses = tensor_page_accesses
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("tensor-page access count overflow"))?;
+        }
+        require_tensor_length(tensor, &bytes)?;
+        tensors.insert(tensor.id, bytes);
+
+        if tensor_index == 0 {
+            let interference = cache
+                .get(interference_page.clone(), Control::unbounded())
+                .await?;
+            if u64::try_from(interference.bytes().len())? != interference_page.length() {
+                return Err(io::Error::other("interference page length changed").into());
+            }
+            drop(interference);
+            interference_page_accesses = interference_page_accesses
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("interference-page access count overflow"))?;
+        }
+    }
+    Ok((tensors, tensor_page_accesses, interference_page_accesses))
+}
+
+fn validate_forced_eviction_metrics(
+    metrics: MetricsSnapshot,
+    tensor_count: u64,
+    tensor_page_accesses: u64,
+    interference_page_accesses: u64,
+    tensor_page_bytes: u64,
+    interference_page_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    if tensor_count < 2 || tensor_page_accesses != tensor_count || interference_page_accesses != 1 {
+        return Err(io::Error::other("forced-eviction access schedule changed").into());
+    }
+    let expected_demands = tensor_count
+        .checked_add(interference_page_accesses)
+        .ok_or_else(|| io::Error::other("forced-eviction access count overflow"))?;
+    let expected_demand_bytes = tensor_page_bytes
+        .checked_mul(tensor_count)
+        .and_then(|bytes| bytes.checked_add(interference_page_bytes))
+        .ok_or_else(|| io::Error::other("forced-eviction byte count overflow"))?;
+    let expected_physical_bytes = tensor_page_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(interference_page_bytes))
+        .ok_or_else(|| io::Error::other("forced-eviction physical byte count overflow"))?;
+    let expected_hits = expected_demands
+        .checked_sub(3)
+        .ok_or_else(|| io::Error::other("forced-eviction hit count underflow"))?;
+    let final_tensor_charge = tensor_page_bytes
+        .div_ceil(64)
+        .checked_mul(64)
+        .ok_or_else(|| io::Error::other("forced-eviction tensor charge overflow"))?;
+    let exact = metrics.demand_bytes == expected_demand_bytes
+        && metrics.physical_read_bytes == expected_physical_bytes
+        && metrics.hits == expected_hits
+        && metrics.misses == 3
+        && metrics.admissions == 3
+        && metrics.evictions == 2
+        && metrics.coalesced_demands == 0
+        && metrics.prefetch_bytes == 0
+        && metrics.coalesced_prefetches == 0
+        && metrics.late_prefetches == 0
+        && metrics.useful_prefetches == 0
+        && metrics.wasted_prefetches == 0
+        && metrics.redundant_prefetches == 0
+        && metrics.dropped_prefetches == 0
+        && metrics.active_loads == 0
+        && metrics.inflight_bytes == 0
+        && metrics.retiring_bytes == 0
+        && metrics.leases == 0
+        && metrics.page_pool_bytes == final_tensor_charge
+        && metrics.resident_bytes == final_tensor_charge
+        && metrics.trace_events_dropped == 0;
+    if !exact {
+        return Err(io::Error::other("forced-eviction cache accounting changed").into());
+    }
+    Ok(())
 }
 
 fn append_intersection(

@@ -16,6 +16,10 @@ MULTI_OBJECT_DIGEST = (
     "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89"
     "b6f0134874c9803f8782b100b39c854ae"
 )
+TINY_OBJECT_DIGEST = (
+    "sha256:6b2b8a1bbb2854084b1e1fe1e5787a9"
+    "cfdb021b397e774fc7dbef79ac9d24bf6"
+)
 
 
 def demo_trace_events() -> list[dict]:
@@ -51,19 +55,53 @@ def demo_trace_events() -> list[dict]:
     ]
 
 
+def demo_forced_eviction_events() -> list[dict]:
+    prefix = (
+        ("miss", False, 7_904),
+        ("load_started", False, 7_904),
+        ("admitted", False, 7_904),
+        ("miss", True, 65_536),
+        ("evicted", False, 7_904),
+        ("load_started", True, 65_536),
+        ("admitted", True, 65_536),
+        ("miss", False, 7_904),
+        ("evicted", True, 65_536),
+        ("load_started", False, 7_904),
+        ("admitted", False, 7_904),
+    )
+    schedule = list(prefix) + [("hit", False, 7_904)] * 20
+    return [
+        {
+            "sequence": sequence,
+            "outcome": outcome,
+            "reason": "demand",
+            "object_digest": (
+                MULTI_OBJECT_DIGEST if interference else TINY_OBJECT_DIGEST
+            ),
+            "page_size": 65_536,
+            "page_index": 0,
+            "logical_bytes": logical_bytes,
+        }
+        for sequence, (outcome, interference, logical_bytes) in enumerate(schedule)
+    ]
+
+
 def demo_output() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "fixtures": {
             "tiny": {
                 "artifact_id": (
                     "sha256:e49321cefc980ab59cd449341edfc624c"
                     "cfc4b0b703cd175184e056d296d9ed3"
                 ),
-                "object_digest": "sha256:" + "2" * 64,
+                "object_digest": TINY_OBJECT_DIGEST,
                 "object_length": 7_904,
-                "page_table_digest": "sha256:" + "3" * 64,
-                "page_table_length": 80,
+                "page_table_digest": (
+                    "sha256:29383b56a150f9e5705f3666ca7707f2"
+                    "1bc3fbd663ffd7249f4ecb938da6a62d"
+                ),
+                "page_table_length": 96,
             },
             "multi_page": {
                 "artifact_id": (
@@ -72,8 +110,11 @@ def demo_output() -> dict:
                 ),
                 "object_digest": MULTI_OBJECT_DIGEST,
                 "object_length": 131_089,
-                "page_table_digest": "sha256:" + "6" * 64,
-                "page_table_length": 144,
+                "page_table_digest": (
+                    "sha256:d748ae45084baf6759c34321fb1f1101"
+                    "51dfb33be390f4118d8a196cf0b2a4ab"
+                ),
+                "page_table_length": 160,
             },
         },
         "prompt": "moe",
@@ -87,6 +128,74 @@ def demo_output() -> dict:
             "bytes_per_generated_token": {
                 "numerator_bytes": 7_904,
                 "denominator_tokens": 4,
+            },
+        },
+        "forced_eviction_generation": {
+            "full_generation_parity": True,
+            "cache_capacity_bytes": 65_536,
+            "tensor_count": 22,
+            "tensor_page_accesses": 22,
+            "interference_page_accesses": 1,
+            "tensor_page": {
+                "object_digest": TINY_OBJECT_DIGEST,
+                "page_size": 65_536,
+                "page_index": 0,
+                "logical_bytes": 7_904,
+            },
+            "interference_page": {
+                "object_digest": MULTI_OBJECT_DIGEST,
+                "page_size": 65_536,
+                "page_index": 0,
+                "logical_bytes": 65_536,
+            },
+            "metrics": {
+                "demand_bytes": 239_424,
+                "physical_read_bytes": 81_344,
+                "hits": 20,
+                "misses": 3,
+                "admissions": 3,
+                "evictions": 2,
+                "coalesced_demands": 0,
+                "prefetch": {
+                    "bytes": 0,
+                    "coalesced": 0,
+                    "late": 0,
+                    "useful": 0,
+                    "wasted": 0,
+                    "redundant": 0,
+                    "dropped": 0,
+                },
+                "accounted": {
+                    "active_loads": 0,
+                    "page_pool_bytes": 7_936,
+                    "inflight_bytes": 0,
+                    "resident_bytes": 7_936,
+                    "retiring_bytes": 0,
+                    "leases": 0,
+                },
+                "trace_events_dropped": 0,
+            },
+            "trace": {
+                "access": "demand",
+                "event_count": 31,
+                "events": demo_forced_eviction_events(),
+                "outcomes": {
+                    "hit": 20,
+                    "miss": 3,
+                    "load_started": 3,
+                    "load_coalesced": 0,
+                    "late_prefetch": 0,
+                    "prefetch_coalesced": 0,
+                    "admitted": 3,
+                    "evicted": 2,
+                    "retired": 0,
+                    "load_failed": 0,
+                    "cancelled": 0,
+                    "prefetch_useful": 0,
+                    "prefetch_wasted": 0,
+                    "prefetch_redundant": 0,
+                    "prefetch_dropped": 0,
+                },
             },
         },
         "trace": {
@@ -302,16 +411,89 @@ class ProjectionTests(unittest.TestCase):
         with self.assertRaises(evidence.EvidenceError):
             evidence.validate_correctness_projection(projection)
 
+    def test_forced_eviction_gate_rejects_false_parity_and_inconsistent_metrics(
+        self,
+    ) -> None:
+        projection = evidence.project_correctness(demo_output())
+        projection["forced_eviction_generation"]["full_generation_parity"] = False
+        with self.assertRaises(evidence.EvidenceError):
+            evidence.validate_correctness_projection(projection)
+
+        projection = evidence.project_correctness(demo_output())
+        projection["forced_eviction_generation"]["metrics"]["evictions"] = 0
+        with self.assertRaises(evidence.EvidenceError):
+            evidence.validate_correctness_projection(projection)
+
+        projection = evidence.project_correctness(demo_output())
+        projection["forced_eviction_generation"]["metrics"]["hits"] = False
+        with self.assertRaises(evidence.EvidenceError):
+            evidence.validate_correctness_projection(projection)
+
+        projection = evidence.project_correctness(demo_output())
+        del projection["forced_eviction_generation"]["tensor_page"]["page_size"]
+        with self.assertRaises(evidence.EvidenceError):
+            evidence.validate_correctness_projection(projection)
+
+    def test_schema_two_rejects_wrong_numeric_types_and_unknown_fields(self) -> None:
+        mutations = (
+            lambda value: value.__setitem__("schema_version", 2.0),
+            lambda value: value["generated_ids"].__setitem__(0, 15.0),
+            lambda value: value["metrics"].__setitem__("hits", True),
+            lambda value: value["metrics"]["accounted"].__setitem__("leases", False),
+            lambda value: value["trace"]["events"][0].__setitem__("sequence", False),
+            lambda value: value["trace"]["outcomes"].__setitem__("hit", True),
+            lambda value: value.__setitem__("unknown_failure", False),
+            lambda value: value["forced_eviction_generation"]["trace"]["events"][
+                0
+            ].__setitem__("unknown", 0),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                output = demo_output()
+                mutate(output)
+                with self.assertRaises(evidence.EvidenceError):
+                    projection = evidence.project_correctness(output)
+                    evidence.validate_correctness_projection(projection)
+
+    def test_fixture_schema_requires_pinned_page_table_identity(self) -> None:
+        projection = evidence.project_correctness(demo_output())
+        del projection["fixtures"]["tiny"]["page_table_digest"]
+        with self.assertRaises(evidence.EvidenceError):
+            evidence.validate_correctness_projection(projection)
+
+        projection = evidence.project_correctness(demo_output())
+        projection["fixtures"]["multi_page"]["page_table_length"] = 160.0
+        with self.assertRaises(evidence.EvidenceError):
+            evidence.validate_correctness_projection(projection)
+
     def test_fixture_and_trace_digests_are_stable_and_domain_separated(self) -> None:
         projection = evidence.project_correctness(demo_output())
         first = evidence.fixture_and_trace_records(projection)
         second = evidence.fixture_and_trace_records(copy.deepcopy(projection))
         self.assertEqual(first, second)
         self.assertNotEqual(first["fixture"]["digest"], first["trace"]["digest"])
+        self.assertNotEqual(first["fixture"]["digest"], first["forced_eviction"]["digest"])
+        self.assertNotEqual(first["trace"]["digest"], first["forced_eviction"]["digest"])
+
+        changed = copy.deepcopy(projection)
+        changed["forced_eviction_generation"]["metrics"]["physical_read_bytes"] += 1
+        changed_records = evidence.fixture_and_trace_records(changed)
+        self.assertEqual(first["fixture"], changed_records["fixture"])
+        self.assertEqual(first["trace"], changed_records["trace"])
+        self.assertNotEqual(
+            first["forced_eviction"], changed_records["forced_eviction"]
+        )
 
     def test_trace_gate_rejects_wrong_event_order_or_identity(self) -> None:
         projection = evidence.project_correctness(demo_output())
         projection["trace"]["events"][4]["page_index"] = 2
+        with self.assertRaises(evidence.EvidenceError):
+            evidence.validate_correctness_projection(projection)
+
+        projection = evidence.project_correctness(demo_output())
+        projection["forced_eviction_generation"]["trace"]["events"][4][
+            "object_digest"
+        ] = MULTI_OBJECT_DIGEST
         with self.assertRaises(evidence.EvidenceError):
             evidence.validate_correctness_projection(projection)
 
@@ -400,6 +582,18 @@ class StatisticsTests(unittest.TestCase):
             ],
             1_976.0,
         )
+        self.assertEqual(
+            summary["deterministic_forced_eviction_metrics"][
+                "physical_read_bytes"
+            ]["value"],
+            81_344,
+        )
+        self.assertEqual(
+            summary["deterministic_forced_eviction_metrics"]["trace_event_count"][
+                "value"
+            ],
+            31,
+        )
         self.assertEqual(summary["correctness"]["outcome"], "fail")
 
     def test_summary_cannot_pass_with_missing_observability(self) -> None:
@@ -426,6 +620,84 @@ class StatisticsTests(unittest.TestCase):
             summary["correctness"]["all_successful_trials_have_observability"]
         )
         self.assertEqual(summary["correctness"]["outcome"], "fail")
+
+    def test_summary_cannot_pass_with_false_forced_eviction_parity(self) -> None:
+        valid_output = demo_output()
+        valid_projection = evidence.project_correctness(valid_output)
+        evidence.validate_correctness_projection(valid_projection)
+        gate_digest = evidence.digest_json(valid_projection)
+
+        output = copy.deepcopy(valid_output)
+        output["forced_eviction_generation"]["full_generation_parity"] = False
+        summary = evidence.build_summary(
+            experiment_id="m2-false-forced-parity",
+            rows=[
+                {
+                    "status": "ok",
+                    "wall_time_nanoseconds": 10,
+                    "correctness_projection_matches_gate": True,
+                    "correctness_projection_digest": gate_digest,
+                    "child_page_faults": {"major": 0, "minor": 1},
+                    "demo": output,
+                }
+            ],
+            gate_projection_digest=gate_digest,
+            observations_digest="1" * 64,
+            binary_unchanged=True,
+            bootstrap_seed=1,
+            bootstrap_resamples=100,
+        )
+        self.assertEqual(
+            summary["correctness"][
+                "forced_eviction_full_generation_parity_fraction"
+            ],
+            {"numerator": 0, "denominator": 1, "value": 0.0},
+        )
+        self.assertEqual(summary["correctness"]["outcome"], "fail")
+
+    def test_summary_revalidates_ordinary_parity_before_pass(self) -> None:
+        valid_output = demo_output()
+        valid_projection = evidence.project_correctness(valid_output)
+        evidence.validate_correctness_projection(valid_projection)
+        gate_digest = evidence.digest_json(valid_projection)
+
+        def summarize(output: dict) -> dict:
+            return evidence.build_summary(
+                experiment_id="m2-summary-revalidation",
+                rows=[
+                    {
+                        "status": "ok",
+                        "wall_time_nanoseconds": 10,
+                        "correctness_projection_matches_gate": True,
+                        "correctness_projection_digest": gate_digest,
+                        "child_page_faults": {"major": 0, "minor": 1},
+                        "demo": output,
+                    }
+                ],
+                gate_projection_digest=gate_digest,
+                observations_digest="1" * 64,
+                binary_unchanged=True,
+                bootstrap_seed=1,
+                bootstrap_resamples=100,
+            )
+
+        valid_summary = summarize(valid_output)
+        self.assertTrue(
+            valid_summary["correctness"]["all_successful_trials_revalidated"]
+        )
+        self.assertEqual(valid_summary["correctness"]["outcome"], "pass")
+
+        false_parity = copy.deepcopy(valid_output)
+        false_parity["parity"] = False
+        invalid_summary = summarize(false_parity)
+        self.assertEqual(
+            invalid_summary["correctness"]["parity_pass_fraction"],
+            {"numerator": 0, "denominator": 1, "value": 0.0},
+        )
+        self.assertFalse(
+            invalid_summary["correctness"]["all_successful_trials_revalidated"]
+        )
+        self.assertEqual(invalid_summary["correctness"]["outcome"], "fail")
 
 
 if __name__ == "__main__":

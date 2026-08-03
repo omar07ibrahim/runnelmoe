@@ -186,6 +186,16 @@ fixture. Sync and async runs must agree on verified bytes, routes, logits, and
 generated tokens under a controlled trace with forced eviction; raw trace and
 RSS evidence must accompany any measured claim.
 
+The deterministic numerical trace uses one global one-page cache over retained
+page specifications from both fixtures. After the first tiny-model tensor is
+copied, demand for a full interference page evicts the tiny tensor page; the
+next tensor demand evicts the interference page and authenticates a reload.
+The remaining tensors hit that reloaded page. The cache-backed model's complete
+`Generation` value—step logits, route scores and expert IDs/weights, and
+tokens—must equal the synchronous model exactly. A separate fixed
+`[0, 1, 0, 2, 2]` trace covers repeated full-page eviction and the 17-byte tail.
+Both normalized traces and their deterministic counters are evidence fields.
+
 Descriptor-relative access prevents pathname redirection but does not isolate
 the CAS from a malicious process with the same UID that can modify an already
 open regular file. Same-UID hostile mutation remains outside the threat model;
