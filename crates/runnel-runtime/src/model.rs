@@ -1,20 +1,31 @@
 use std::{
     collections::BTreeMap,
+    fmt,
     mem::size_of,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use runnel_format::{Artifact, DType, Manifest, TensorRecord};
-use runnel_kernels::{
-    BackendKind, BackendRequest, Bf16Matrix, Capabilities, FiniteInput, GemvWorkspace, KernelError,
-    PreparedGemv, select_backend,
-};
+use runnel_kernels::{BackendKind, BackendRequest, Bf16Matrix, Capabilities, select_backend};
 
 use crate::{
-    EOS_TOKEN, Result, RuntimeError, StateLayout, Tensor, TensorCatalog,
-    attention::streaming_causal_attention, state::SequenceState,
+    DecoderAdapter, EOS_TOKEN, Result, RuntimeError, StateLayout, Tensor, TensorCatalog,
+    state::SequenceState,
 };
 
+#[cfg(test)]
+use crate::attention::streaming_causal_attention;
+#[cfg(test)]
+use runnel_kernels::KernelError;
+
+mod transaction;
+
+pub use transaction::{
+    TinyExpertContribution, TinyExpertTask, TinyPendingStateCommit, TinyPreparedToken,
+    TinyStateCommitPermit, TinyWorkspace,
+};
+
+#[cfg(test)]
 const RMS_EPSILON: f32 = 1.0 / 4096.0;
 const COMPATIBILITY_PAGE_TOKENS: usize = 16;
 static NEXT_MODEL_INSTANCE_ID: CheckedModelIdCounter = CheckedModelIdCounter::new(1);
@@ -157,11 +168,21 @@ pub struct Generation {
     pub steps: Vec<StepOutput>,
 }
 
-#[derive(Debug)]
 pub struct TinyModel {
     config: TinyConfig,
     instance_id: u64,
     weights: Weights,
+}
+
+impl fmt::Debug for TinyModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TinyModel")
+            .field("config", &self.config)
+            .field("instance_id", &self.instance_id)
+            .field("weights", &"<redacted>")
+            .finish()
+    }
 }
 
 impl TinyModel {
@@ -537,15 +558,14 @@ impl TinyModel {
 
     pub fn forward_token(&self, state: &mut SequenceState, token: u32) -> Result<StepOutput> {
         let token_index = usize::try_from(token).map_err(|_| RuntimeError::InvalidToken {
-            token,
             vocab_size: self.config.vocab_size,
         })?;
         if token_index >= self.config.vocab_size {
             return Err(RuntimeError::InvalidToken {
-                token,
                 vocab_size: self.config.vocab_size,
             });
         }
+        let mut workspace = <Self as DecoderAdapter>::new_workspace(self)?;
 
         if state.layout().is_none() {
             if state.model_instance_id().is_some()
@@ -560,113 +580,75 @@ impl TinyModel {
             let layout =
                 self.state_layout(self.config.context_length, COMPATIBILITY_PAGE_TOKENS)?;
             let mut candidate = self.new_sequence_state(layout)?;
-            let output = self.forward_token_bound(&mut candidate, token, token_index)?;
+            let output = self.forward_token_bound(&mut candidate, token, &mut workspace)?;
             *state = candidate;
             return Ok(output);
         }
 
-        self.forward_token_bound(state, token, token_index)
+        self.forward_token_bound(state, token, &mut workspace)
     }
 
     fn forward_token_bound(
         &self,
         state: &mut SequenceState,
         token: u32,
-        token_index: usize,
+        workspace: &mut TinyWorkspace,
     ) -> Result<StepOutput> {
-        let layout = state.layout().ok_or(RuntimeError::InvalidState(
-            "sequence state must have a bound layout",
+        let prepared = <Self as DecoderAdapter>::prepare_token(self, state, token, workspace)?;
+        let mut tasks = <Self as DecoderAdapter>::expert_tasks(self, &prepared);
+        let first_task = tasks.next().ok_or(RuntimeError::InvalidAdapterWork(
+            "first expert task is missing",
         ))?;
-        match state.model_instance_id() {
-            Some(instance_id) if instance_id == self.instance_id => {}
-            Some(_) => return Err(RuntimeError::StateMismatch),
-            None => {
-                return Err(RuntimeError::InvalidState(
-                    "bound sequence state is missing its model identity",
-                ));
-            }
-        }
-        self.validate_state_layout(layout)?;
-        let state_id = state.state_id().ok_or(RuntimeError::InvalidState(
-            "bound sequence state is missing its state identity",
+        let second_task = tasks.next().ok_or(RuntimeError::InvalidAdapterWork(
+            "second expert task is missing",
         ))?;
-        let position = state.len();
-        if position >= layout.max_tokens() {
-            return Err(RuntimeError::ContextLimit {
-                limit: layout.max_tokens(),
-            });
+        if tasks.next().is_some() {
+            return Err(RuntimeError::InvalidAdapterWork(
+                "expert task count exceeds frozen top-k",
+            ));
         }
-        let revision = state.revision();
+        let contributions = [
+            <Self as DecoderAdapter>::execute_expert(self, first_task, workspace)?,
+            <Self as DecoderAdapter>::execute_expert(self, second_task, workspace)?,
+        ];
+        let pending =
+            <Self as DecoderAdapter>::finish_token(self, prepared, &contributions, workspace)?;
 
-        let mut residual = self.weights.token_embedding.row(token_index).to_vec();
-        let normalized = rms_norm(&residual, &self.weights.attn_norm)?;
-        let query = linear(&self.weights.attn_q, &normalized);
-        let key = linear(&self.weights.attn_k, &normalized);
-        let value = linear(&self.weights.attn_v, &normalized);
-        let mut attended = vec![0.0_f32; self.config.hidden_size];
-        streaming_causal_attention(
-            &query,
-            state.history(),
-            &key,
-            &value,
-            self.config.num_heads,
-            &mut attended,
-        )?;
-        let attention_output = linear(&self.weights.attn_out, &attended);
-        add_in_place(&mut residual, &attention_output);
-        ensure_finite(&residual, "attention residual")?;
-
-        let normalized = rms_norm(&residual, &self.weights.ffn_norm)?;
-        let scores = linear(&self.weights.router, &normalized);
-        ensure_finite(&scores, "router")?;
-        let expert_ids = stable_top_k(&scores, self.config.top_k);
-        let selected_scores: Vec<f32> = expert_ids.iter().map(|id| scores[*id]).collect();
-        let weights = softmax(&selected_scores)?;
-
-        let mut mixture = vec![0.0_f32; self.config.hidden_size];
-        match &self.weights.experts {
-            Experts::F32(experts) => {
-                accumulate_f32_experts(experts, &expert_ids, &weights, &normalized, &mut mixture)?;
-            }
-            Experts::Bf16 {
-                weights: experts,
-                dispatch,
-            } => {
-                accumulate_bf16_experts(
-                    experts,
-                    *dispatch,
-                    &expert_ids,
-                    &weights,
-                    &normalized,
-                    &mut mixture,
-                    self.config.hidden_size,
-                    self.config.expert_hidden_size,
-                )?;
-            }
-        }
-        ensure_finite(&mixture, "expert mixture")?;
-        add_in_place(&mut residual, &mixture);
-        ensure_finite(&residual, "expert residual")?;
-
-        let normalized = rms_norm(&residual, &self.weights.final_norm)?;
-        let logits = linear(&self.weights.lm_head, &normalized);
-        ensure_finite(&logits, "lm head")?;
-
-        // This is the final fallible operation. Applying the validated permit
-        // only copies into preallocated pages and publishes length/revision.
-        let permit = state.validate_append(state_id, revision, position, &key, &value)?;
-        let committed_position = permit.apply();
-        debug_assert_eq!(committed_position, position);
-
-        Ok(StepOutput {
-            input_token: token,
+        // Compatibility output owns Vecs. Reserve and populate every one
+        // before validating/applying state so allocation failure cannot follow
+        // the state linearization point.
+        let mut logits = try_vec_with_capacity(pending.logits_array().len(), "step logits")?;
+        logits.extend_from_slice(pending.logits_array());
+        let mut scores =
+            try_vec_with_capacity(pending.router_scores().len(), "step router scores")?;
+        scores.extend_from_slice(pending.router_scores());
+        let mut expert_ids = try_vec_with_capacity(pending.expert_ids().len(), "step expert IDs")?;
+        expert_ids.extend(
+            pending
+                .expert_ids()
+                .iter()
+                .map(|expert| usize::from(*expert)),
+        );
+        let mut weights =
+            try_vec_with_capacity(pending.route_weights().len(), "step route weights")?;
+        weights.extend_from_slice(pending.route_weights());
+        let output = StepOutput {
+            input_token: pending.input_token(),
             logits,
             route: RouteDecision {
                 scores,
                 expert_ids,
                 weights,
             },
-        })
+        };
+
+        <Self as DecoderAdapter>::with_validated_state_commit(
+            self,
+            state,
+            &pending,
+            <Self as DecoderAdapter>::apply_state_commit,
+        )?;
+        Ok(output)
     }
 
     fn validate_state_layout(&self, layout: StateLayout) -> Result<()> {
@@ -692,10 +674,12 @@ impl TinyModel {
                 limit: self.config.context_length,
             });
         }
-        let mut state = SequenceState::new();
-        let mut outputs = Vec::with_capacity(tokens.len());
+        let mut outputs = try_vec_with_capacity(tokens.len(), "token-step output")?;
+        let layout = self.state_layout(self.config.context_length, COMPATIBILITY_PAGE_TOKENS)?;
+        let mut state = self.new_sequence_state(layout)?;
+        let mut workspace = <Self as DecoderAdapter>::new_workspace(self)?;
         for token in tokens {
-            outputs.push(self.forward_token(&mut state, *token)?);
+            outputs.push(self.forward_token_bound(&mut state, *token, &mut workspace)?);
         }
         Ok(outputs)
     }
@@ -716,20 +700,23 @@ impl TinyModel {
             });
         }
 
-        let mut state = SequenceState::new();
-        let mut steps = Vec::with_capacity(required);
+        let mut steps = try_vec_with_capacity(required, "generation step output")?;
+        let mut generated_tokens = try_vec_with_capacity(max_new_tokens, "generated token output")?;
+        let layout = self.state_layout(self.config.context_length, COMPATIBILITY_PAGE_TOKENS)?;
+        let mut state = self.new_sequence_state(layout)?;
+        let mut workspace = <Self as DecoderAdapter>::new_workspace(self)?;
         for token in prompt {
-            steps.push(self.forward_token(&mut state, *token)?);
+            steps.push(self.forward_token_bound(&mut state, *token, &mut workspace)?);
         }
 
-        let mut generated_tokens = Vec::with_capacity(max_new_tokens);
         for index in 0..max_new_tokens {
-            let next = greedy_token(&steps.last().expect("prompt is nonempty").logits);
+            let last = steps.last().ok_or(RuntimeError::EmptySequence)?;
+            let next = greedy_token(&last.logits)?;
             generated_tokens.push(next);
             if next == EOS_TOKEN || index + 1 == max_new_tokens {
                 break;
             }
-            steps.push(self.forward_token(&mut state, next)?);
+            steps.push(self.forward_token_bound(&mut state, next, &mut workspace)?);
         }
 
         Ok(Generation {
@@ -745,6 +732,17 @@ fn dimension(value: u64, name: &str) -> Result<usize> {
             "model dimension {name} cannot be represented on this host"
         ))
     })
+}
+
+fn try_vec_with_capacity<T>(capacity: usize, resource: &'static str) -> Result<Vec<T>> {
+    let bytes = capacity
+        .checked_mul(size_of::<T>())
+        .ok_or(RuntimeError::ResourceSizeOverflow { resource })?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| RuntimeError::ResourceExhausted { resource, bytes })?;
+    Ok(values)
 }
 
 struct CheckedModelIdCounter {
@@ -878,16 +876,22 @@ pub fn stable_top_k(scores: &[f32], k: usize) -> Vec<usize> {
     indices
 }
 
-fn greedy_token(logits: &[f32]) -> u32 {
+fn greedy_token(logits: &[f32]) -> Result<u32> {
+    if logits.is_empty() {
+        return Err(RuntimeError::NonFinite("empty greedy logits"));
+    }
     let mut best = 0_usize;
     for candidate in 1..logits.len() {
         if logits[candidate] > logits[best] {
             best = candidate;
         }
     }
-    u32::try_from(best).expect("vocabulary fits u32")
+    u32::try_from(best).map_err(|_| {
+        RuntimeError::InvalidConfig("vocabulary cannot be represented by u32 token IDs".into())
+    })
 }
 
+#[cfg(test)]
 fn rms_norm(input: &[f32], weight: &Tensor) -> Result<Vec<f32>> {
     let mut sum_squares = 0.0_f32;
     for value in input {
@@ -908,14 +912,15 @@ fn rms_norm(input: &[f32], weight: &Tensor) -> Result<Vec<f32>> {
     Ok(output)
 }
 
+#[cfg(test)]
 fn linear(weight: &Tensor, input: &[f32]) -> Vec<f32> {
     let rows = weight.shape()[0];
     let columns = weight.shape()[1];
     debug_assert_eq!(columns, input.len());
     let mut output = Vec::with_capacity(rows);
-    for row in 0..rows {
+    for coefficients in weight.data().chunks_exact(columns).take(rows) {
         let mut sum = 0.0_f32;
-        for (value, coefficient) in input.iter().zip(weight.row(row)) {
+        for (value, coefficient) in input.iter().zip(coefficients) {
             sum += coefficient * value;
         }
         output.push(sum);
@@ -923,120 +928,7 @@ fn linear(weight: &Tensor, input: &[f32]) -> Vec<f32> {
     output
 }
 
-fn accumulate_f32_experts(
-    experts: &[F32ExpertWeights],
-    expert_ids: &[usize],
-    route_weights: &[f32],
-    input: &[f32],
-    mixture: &mut [f32],
-) -> Result<()> {
-    for (&expert_id, &route_weight) in expert_ids.iter().zip(route_weights) {
-        let expert = &experts[expert_id];
-        let gate = linear(&expert.gate, input);
-        ensure_finite(&gate, "f32 expert gate")?;
-        let up = linear(&expert.up, input);
-        ensure_finite(&up, "f32 expert up")?;
-        let activated: Vec<f32> = gate
-            .iter()
-            .zip(up)
-            .map(|(gate, up)| silu(*gate) * up)
-            .collect();
-        ensure_finite(&activated, "f32 expert activation")?;
-        let output = linear(&expert.down, &activated);
-        ensure_finite(&output, "f32 expert down")?;
-        for (destination, value) in mixture.iter_mut().zip(output) {
-            *destination += route_weight * value;
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn accumulate_bf16_experts(
-    experts: &[Bf16ExpertWeights],
-    dispatch: ExpertDispatch,
-    expert_ids: &[usize],
-    route_weights: &[f32],
-    input: &[f32],
-    mixture: &mut [f32],
-    hidden_size: usize,
-    expert_hidden_size: usize,
-) -> Result<()> {
-    let input = FiniteInput::new(input)
-        .map_err(|source| expert_kernel_error("expert input validation", source))?;
-    let workspace_rows = hidden_size.max(expert_hidden_size);
-    let mut workspace = GemvWorkspace::try_new(workspace_rows)
-        .map_err(|source| expert_kernel_error("expert workspace allocation", source))?;
-    let mut gate = vec![0.0_f32; expert_hidden_size];
-    let mut up = vec![0.0_f32; expert_hidden_size];
-    let mut activated = vec![0.0_f32; expert_hidden_size];
-    let mut output = vec![0.0_f32; hidden_size];
-
-    for (&expert_id, &route_weight) in expert_ids.iter().zip(route_weights) {
-        let expert = &experts[expert_id];
-        run_bf16_matrix(
-            &expert.gate,
-            input,
-            dispatch,
-            &mut workspace,
-            &mut gate,
-            "expert gate GEMV",
-        )?;
-        run_bf16_matrix(
-            &expert.up,
-            input,
-            dispatch,
-            &mut workspace,
-            &mut up,
-            "expert up GEMV",
-        )?;
-        for ((destination, &gate), &up) in activated.iter_mut().zip(&gate).zip(&up) {
-            *destination = silu(gate) * up;
-        }
-        let activated_input = FiniteInput::new(&activated)
-            .map_err(|source| expert_kernel_error("expert activation", source))?;
-        run_bf16_matrix(
-            &expert.down,
-            activated_input,
-            dispatch,
-            &mut workspace,
-            &mut output,
-            "expert down GEMV",
-        )?;
-        for (destination, &value) in mixture.iter_mut().zip(&output) {
-            *destination += route_weight * value;
-        }
-    }
-    Ok(())
-}
-
-fn run_bf16_matrix(
-    matrix: &Bf16Matrix,
-    input: FiniteInput<'_>,
-    dispatch: ExpertDispatch,
-    workspace: &mut GemvWorkspace,
-    output: &mut [f32],
-    operation: &'static str,
-) -> Result<()> {
-    let request = match dispatch.backend {
-        BackendKind::Scalar => BackendRequest::Scalar,
-        BackendKind::Avx2 => BackendRequest::Avx2,
-    };
-    let prepared = PreparedGemv::with_capabilities(matrix, input, request, dispatch.capabilities)
-        .map_err(|source| expert_kernel_error(operation, source))?;
-    debug_assert_eq!(prepared.backend(), dispatch.backend);
-    workspace
-        .set_rows(matrix.rows())
-        .map_err(|source| expert_kernel_error(operation, source))?;
-    prepared
-        .run(workspace, output)
-        .map_err(|source| expert_kernel_error(operation, source))
-}
-
-fn expert_kernel_error(operation: &'static str, source: KernelError) -> RuntimeError {
-    RuntimeError::ExpertKernel { operation, source }
-}
-
+#[cfg(test)]
 fn softmax(input: &[f32]) -> Result<Vec<f32>> {
     let maximum = input
         .iter()
@@ -1055,16 +947,7 @@ fn softmax(input: &[f32]) -> Result<Vec<f32>> {
     Ok(output)
 }
 
-fn silu(value: f32) -> f32 {
-    value / (1.0 + (-value).exp())
-}
-
-fn add_in_place(destination: &mut [f32], source: &[f32]) {
-    for (destination, source) in destination.iter_mut().zip(source) {
-        *destination += source;
-    }
-}
-
+#[cfg(test)]
 fn ensure_finite(values: &[f32], operation: &'static str) -> Result<()> {
     if values.iter().any(|value| !value.is_finite()) {
         Err(RuntimeError::NonFinite(operation))
@@ -1200,6 +1083,16 @@ mod tests {
     }
 
     #[test]
+    fn model_debug_redacts_all_weight_payloads() {
+        let model = fixture_model();
+        let debug = format!("{model:?}");
+        assert!(debug.contains("TinyModel"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("token_embedding"));
+        assert!(!debug.contains("F32("));
+    }
+
+    #[test]
     fn stable_top_k_uses_low_expert_id_for_ties() {
         assert_eq!(stable_top_k(&[1.0, 2.0, 2.0, -1.0], 2), [1, 2]);
         assert_eq!(stable_top_k(&[-0.0, 0.0, 0.0, -0.0], 4), [0, 1, 2, 3]);
@@ -1209,8 +1102,9 @@ mod tests {
 
     #[test]
     fn greedy_uses_low_token_id_for_numeric_ties() {
-        assert_eq!(greedy_token(&[-0.0, 0.0, 0.0, -0.0]), 0);
-        assert_eq!(greedy_token(&[1.0, 3.0, 3.0, 2.0]), 1);
+        assert_eq!(greedy_token(&[-0.0, 0.0, 0.0, -0.0]).unwrap(), 0);
+        assert_eq!(greedy_token(&[1.0, 3.0, 3.0, 2.0]).unwrap(), 1);
+        assert!(greedy_token(&[]).is_err());
     }
 
     #[test]

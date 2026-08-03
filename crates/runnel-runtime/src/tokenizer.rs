@@ -31,18 +31,16 @@ impl TinyTokenizer {
                 EOS_TOKEN => break,
                 BOS_TOKEN => {}
                 2..=27 => {
-                    let offset = u8::try_from(*token - 2).expect("token range is bounded");
+                    let offset = u8::try_from(*token - 2)
+                        .map_err(|_| RuntimeError::InvalidToken { vocab_size: 32 })?;
                     text.push(char::from(b'a' + offset));
                 }
                 28 => text.push(' '),
                 29 => text.push('.'),
                 30 => text.push(','),
                 31 => text.push('?'),
-                token => {
-                    return Err(RuntimeError::InvalidToken {
-                        token,
-                        vocab_size: 32,
-                    });
+                _ => {
+                    return Err(RuntimeError::InvalidToken { vocab_size: 32 });
                 }
             }
         }

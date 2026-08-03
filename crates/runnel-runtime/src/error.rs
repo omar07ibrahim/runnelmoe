@@ -16,8 +16,8 @@ pub enum RuntimeError {
     UnexpectedTensor(String),
     #[error("tensor {role} is invalid: {reason}")]
     InvalidTensor { role: String, reason: String },
-    #[error("token {token} is outside vocabulary size {vocab_size}")]
-    InvalidToken { token: u32, vocab_size: usize },
+    #[error("token is outside vocabulary size {vocab_size}")]
+    InvalidToken { vocab_size: usize },
     #[error("unsupported character at byte {byte_offset}")]
     UnsupportedCharacter { byte_offset: usize },
     #[error("token sequence is empty")]
@@ -34,6 +34,12 @@ pub enum RuntimeError {
     StateIdentityExhausted,
     #[error("paged-state revision space is exhausted")]
     StateRevisionExhausted,
+    #[error("adapter transaction identity space is exhausted")]
+    AdapterTransactionIdentityExhausted,
+    #[error("invalid adapter work: {0}")]
+    InvalidAdapterWork(&'static str),
+    #[error("invalid expert contribution: {0}")]
+    InvalidExpertContribution(&'static str),
     #[error("expected state revision {expected}, found {actual}")]
     StateRevisionMismatch { expected: u64, actual: u64 },
     #[error("invalid paged state: {0}")]
@@ -43,6 +49,8 @@ pub enum RuntimeError {
         resource: &'static str,
         bytes: usize,
     },
+    #[error("resource size overflows while reserving {resource}")]
+    ResourceSizeOverflow { resource: &'static str },
     #[error("non-finite value produced by {0}")]
     NonFinite(&'static str),
     #[error(

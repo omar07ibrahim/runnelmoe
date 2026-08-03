@@ -1,11 +1,21 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use crate::{Result, RuntimeError};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Tensor {
     shape: Box<[usize]>,
     data: Box<[f32]>,
+}
+
+impl fmt::Debug for Tensor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Tensor")
+            .field("shape", &self.shape)
+            .field("data", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Tensor {
@@ -49,11 +59,6 @@ impl Tensor {
     pub fn data(&self) -> &[f32] {
         &self.data
     }
-
-    pub(crate) fn row(&self, row: usize) -> &[f32] {
-        let width = self.shape[1];
-        &self.data[row * width..(row + 1) * width]
-    }
 }
 
 pub type TensorCatalog = BTreeMap<String, Tensor>;
@@ -62,5 +67,20 @@ fn invalid(role: &str, reason: &str) -> RuntimeError {
     RuntimeError::InvalidTensor {
         role: role.into(),
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_reports_geometry_without_tensor_payload() {
+        let tensor = Tensor::new("secret", vec![2], vec![1_234.5, -6_789.0]).unwrap();
+        let debug = format!("{tensor:?}");
+        assert!(debug.contains("shape: [2]"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("1234.5"));
+        assert!(!debug.contains("6789"));
     }
 }

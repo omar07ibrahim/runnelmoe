@@ -87,7 +87,7 @@ expert_tasks(prepared) -> ordered tasks
 execute_expert(task, workspace) -> ExpertContribution
 finish_token(prepared, contributions, workspace) -> PendingStateCommit
 pending_logits(pending) -> logits
-validate_state_commit(state, pending) -> StateCommitPermit
+with_validated_state_commit(state, pending, scoped_apply) -> result
 apply_state_commit(permit) -> committed position
 ```
 
@@ -122,19 +122,23 @@ cannot alter the numerical accumulation order.
 
 Model state carries a nonzero identity and monotonically increasing revision.
 A pending state commit can apply only to the state/revision from which it was
-prepared and can apply at most once. Adapter `validate_state_commit` performs
-fallible model/state identity, revision, position, length, and finiteness checks
-and returns a single-use `StateCommitPermit` holding exclusive state access.
+prepared and can apply at most once. Adapter `with_validated_state_commit`
+performs fallible model/state identity, revision, position, length, and
+finiteness checks, then invokes a higher-ranked synchronous callback with a
+single-use `StateCommitPermit` holding exclusive state access. The callback's
+result cannot depend on the fresh permit lifetime, so safe code cannot return
+the permit in a future or retain it across an outer asynchronous yield.
 Adapter `apply_state_commit` is allocation-free, has no public error path, and
 only copies into already validated slices before updating revision.
 
 The scheduler separately validates control state, sampler preview, output
-reservation, and request phase, then wraps the adapter permit and those
-scheduler-owned values in one `TransactionCommitPermit`. Applying the composite
-permit calls the infallible adapter apply and publishes RNG, output, and phase
-without yielding. Runtime types never validate scheduler-owned capacity. This
-two-layer fallible-permit/infallible-apply split is what lets stale/ABA
-rejection coexist with atomic K/V, RNG, and output publication.
+reservation, and request phase before entering the scoped callback. Inside the
+callback it wraps the adapter permit and those scheduler-owned values in one
+stack-local `TransactionCommitPermit`. Applying the composite permit calls the
+infallible adapter apply and publishes RNG, output, and phase without further
+fallible work, panic, or yield. Runtime types never validate scheduler-owned
+capacity. This two-layer fallible-permit/infallible-apply split is what lets
+stale/ABA rejection coexist with atomic K/V, RNG, and output publication.
 
 ### Paged K/V state
 

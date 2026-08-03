@@ -257,6 +257,43 @@ impl SequenceState {
         KvHistory { state: self }
     }
 
+    /// Captures logical and private preallocated state for rollback tests.
+    #[cfg(test)]
+    pub(crate) fn test_fingerprint(&self) -> TestStateFingerprint {
+        let mut page_bits = Vec::new();
+        let total_elements = self
+            .pages
+            .iter()
+            .map(|page| page.keys.len() + page.values.len())
+            .sum();
+        page_bits.reserve_exact(total_elements);
+        let allocations = self
+            .pages
+            .iter()
+            .map(|page| TestPageAllocation {
+                key_pointer: page.keys.as_ptr() as usize,
+                key_len: page.keys.len(),
+                key_capacity: page.keys.capacity(),
+                value_pointer: page.values.as_ptr() as usize,
+                value_len: page.values.len(),
+                value_capacity: page.values.capacity(),
+            })
+            .collect();
+        for page in &self.pages {
+            page_bits.extend(page.keys.iter().map(|value| value.to_bits()));
+            page_bits.extend(page.values.iter().map(|value| value.to_bits()));
+        }
+        TestStateFingerprint {
+            model_instance_id: self.model_instance_id,
+            state_id: self.state_id,
+            revision: self.revision,
+            layout: self.layout,
+            len: self.len,
+            page_bits,
+            allocations,
+        }
+    }
+
     pub(crate) fn validate_append<'state, 'pending>(
         &'state mut self,
         expected_state_id: StateId,
@@ -383,6 +420,29 @@ impl SequenceState {
             len: 0,
         })
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TestStateFingerprint {
+    model_instance_id: Option<u64>,
+    state_id: Option<StateId>,
+    revision: u64,
+    layout: Option<StateLayout>,
+    len: usize,
+    page_bits: Vec<u32>,
+    allocations: Vec<TestPageAllocation>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+struct TestPageAllocation {
+    key_pointer: usize,
+    key_len: usize,
+    key_capacity: usize,
+    value_pointer: usize,
+    value_len: usize,
+    value_capacity: usize,
 }
 
 impl Default for SequenceState {

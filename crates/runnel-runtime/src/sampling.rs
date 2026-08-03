@@ -4,7 +4,7 @@
 //! a surrounding token transaction may commit, but never mutates committed RNG
 //! state itself.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, fmt};
 
 use thiserror::Error;
 
@@ -26,8 +26,8 @@ pub enum SamplingError {
     VocabularyTooLarge { vocab_size: usize },
     #[error("sampling workspace has vocabulary size {workspace}, but logits have length {logits}")]
     WorkspaceSizeMismatch { workspace: usize, logits: usize },
-    #[error("logit for token {token} is not finite")]
-    NonFiniteLogit { token: usize },
+    #[error("sampling logit is not finite")]
+    NonFiniteLogit,
     #[error("sampling temperature must be finite and greater than zero")]
     InvalidTemperature,
     #[error("top-k {top_k} is outside 1..={vocab_size}")]
@@ -94,12 +94,22 @@ impl SamplingPolicy {
 /// `observed_rng_state == None` means that no sampled token has committed yet;
 /// the configured seed was used. A successful sampled commit publishes
 /// `next_rng_state`. Greedy previews always carry `None` in both fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SamplingPreview {
     token: u32,
     observed_rng_state_value: u64,
     next_rng_state_value: u64,
     rng_state_flags: u8,
+}
+
+impl fmt::Debug for SamplingPreview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SamplingPreview")
+            .field("token", &"<redacted>")
+            .field("rng_state", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SamplingPreview {
@@ -173,10 +183,20 @@ impl Default for Candidate {
 ///
 /// Construction creates every candidate slot. `preview` sorts and overwrites
 /// those slots in place and never reserves, grows, or otherwise heap-allocates.
-#[derive(Debug)]
 pub struct SamplingWorkspace {
     candidates: Vec<Candidate>,
     retained_len: usize,
+}
+
+impl fmt::Debug for SamplingWorkspace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SamplingWorkspace")
+            .field("vocab_size", &self.candidates.len())
+            .field("retained_len", &self.retained_len)
+            .field("candidate_payload", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SamplingWorkspace {
@@ -422,9 +442,9 @@ fn validate_logits(logits: &[f32], workspace_size: usize) -> SamplingResult<()> 
             logits: logits.len(),
         });
     }
-    for (token, logit) in logits.iter().enumerate() {
+    for logit in logits {
         if !logit.is_finite() {
-            return Err(SamplingError::NonFiniteLogit { token });
+            return Err(SamplingError::NonFiniteLogit);
         }
     }
     Ok(())
@@ -644,6 +664,31 @@ mod tests {
             .retained_candidates()
             .map(|candidate| candidate.token)
             .collect()
+    }
+
+    #[test]
+    fn debug_redacts_preview_rng_token_and_workspace_candidates() {
+        let preview = SamplingPreview::sampled(27, Some(123_456_789), 987_654_321);
+        let preview_debug = format!("{preview:?}");
+        assert!(preview_debug.contains("<redacted>"));
+        assert!(!preview_debug.contains("27"));
+        assert!(!preview_debug.contains("123456789"));
+        assert!(!preview_debug.contains("987654321"));
+
+        let mut workspace = SamplingWorkspace::new(4).unwrap();
+        workspace
+            .preview(
+                &[12_345.0, 23_456.0, 34_567.0, 45_678.0],
+                SamplingPolicy::Greedy,
+                None,
+            )
+            .unwrap();
+        let workspace_debug = format!("{workspace:?}");
+        assert!(workspace_debug.contains("vocab_size: 4"));
+        assert!(workspace_debug.contains("<redacted>"));
+        for sentinel in ["12345", "23456", "34567", "45678"] {
+            assert!(!workspace_debug.contains(sentinel));
+        }
     }
 
     #[test]
@@ -1118,16 +1163,14 @@ mod tests {
                 logits: 1,
             }
         );
-        for (bad, expected_token) in [
-            ([f32::NAN, 0.0], 0),
-            ([0.0, f32::INFINITY], 1),
-            ([0.0, f32::NEG_INFINITY], 1),
+        for bad in [
+            [f32::NAN, 0.0],
+            [0.0, f32::INFINITY],
+            [0.0, f32::NEG_INFINITY],
         ] {
             assert_eq!(
                 workspace.preview(&bad, policy, None).unwrap_err(),
-                SamplingError::NonFiniteLogit {
-                    token: expected_token,
-                }
+                SamplingError::NonFiniteLogit
             );
             assert_eq!(workspace.retained_len(), 0);
         }
