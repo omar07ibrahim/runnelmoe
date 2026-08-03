@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="650" viewBox="0 0 1220 650" role="img" aria-labelledby="title desc">
+<title id="title">Online traffic gap to Bélády/MIN</title>
+<desc id="desc">Median total physical byte ratio and 95 percent bootstrap interval for each policy and workload family at four MiB capacity.</desc>
+<style>text{font-family:system-ui,sans-serif;fill:#222}.title{font-size:22px;font-weight:700}.subtitle{font-size:13px;fill:#444}.axis{stroke:#555;stroke-width:1}.grid{stroke:#ddd;stroke-width:1}.label{font-size:12px}.small{font-size:10px;fill:#555}.ci{stroke-width:2}.mark{stroke:#222;stroke-width:1}</style>
+<rect width="100%" height="100%" fill="#fff"/>
+<text class="title" x="35" y="36">Online traffic gap to Bélády/MIN</text>
+<text class="subtitle" x="35" y="60">Total physical bytes / exact uniform-page optimum · 4 MiB capacity · lower is better</text>
+<line class="grid" x1="190.00" y1="92" x2="190.00" y2="565"/>
+<text class="small" x="190.00" y="585" text-anchor="middle">0.00×</text>
+<line class="grid" x1="387.00" y1="92" x2="387.00" y2="565"/>
+<text class="small" x="387.00" y="585" text-anchor="middle">0.62×</text>
+<line class="grid" x1="584.00" y1="92" x2="584.00" y2="565"/>
+<text class="small" x="584.00" y="585" text-anchor="middle">1.25×</text>
+<line class="grid" x1="781.00" y1="92" x2="781.00" y2="565"/>
+<text class="small" x="781.00" y="585" text-anchor="middle">1.87×</text>
+<line class="grid" x1="978.00" y1="92" x2="978.00" y2="565"/>
+<text class="small" x="978.00" y="585" text-anchor="middle">2.49×</text>
+<line class="grid" x1="1175.00" y1="92" x2="1175.00" y2="565"/>
+<text class="small" x="1175.00" y="585" text-anchor="middle">3.12×</text>
+<line x1="505.92" y1="92" x2="505.92" y2="565" stroke="#000" stroke-dasharray="5 4"/>
+<text class="label" x="180" y="125.00" text-anchor="end">Stationary Zipf</text>
+<line class="ci" x1="756.77" y1="101.00" x2="759.31" y2="101.00" stroke="#0072B2"/>
+<circle class="mark" cx="757.95" cy="101.00" r="5" fill="#0072B2"/>
+<line class="ci" x1="664.20" y1="113.00" x2="667.42" y2="113.00" stroke="#E69F00"/>
+<rect class="mark" x="661.25" y="108.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="670.00" y1="125.00" x2="673.80" y2="125.00" stroke="#009E73"/>
+<path class="mark" d="M672.23,119.00 L666.23,130.00 L678.23,130.00 Z" fill="#009E73"/>
+<line class="ci" x1="664.20" y1="137.00" x2="667.42" y2="137.00" stroke="#CC79A7"/>
+<path class="mark" d="M666.25,130.00 L659.25,137.00 L666.25,144.00 L673.25,137.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="664.69" y1="149.00" x2="668.12" y2="149.00" stroke="#D55E00"/>
+<path class="mark" d="M662.20,144.00 L672.20,154.00 M672.20,144.00 L662.20,154.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="180" y="200.00" text-anchor="end">Scan pollution</text>
+<line class="ci" x1="675.92" y1="176.00" x2="676.40" y2="176.00" stroke="#0072B2"/>
+<circle class="mark" cx="676.08" cy="176.00" r="5" fill="#0072B2"/>
+<line class="ci" x1="521.49" y1="188.00" x2="521.65" y2="188.00" stroke="#E69F00"/>
+<rect class="mark" x="516.65" y="183.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="545.09" y1="200.00" x2="548.19" y2="200.00" stroke="#009E73"/>
+<path class="mark" d="M546.69,194.00 L540.69,205.00 L552.69,205.00 Z" fill="#009E73"/>
+<line class="ci" x1="521.49" y1="212.00" x2="521.65" y2="212.00" stroke="#CC79A7"/>
+<path class="mark" d="M521.65,205.00 L514.65,212.00 L521.65,219.00 L528.65,212.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="737.67" y1="224.00" x2="741.22" y2="224.00" stroke="#D55E00"/>
+<path class="mark" d="M734.89,219.00 L744.89,229.00 M744.89,219.00 L734.89,229.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="180" y="275.00" text-anchor="end">Phase shift</text>
+<line class="ci" x1="519.65" y1="251.00" x2="519.65" y2="251.00" stroke="#0072B2"/>
+<circle class="mark" cx="519.65" cy="251.00" r="5" fill="#0072B2"/>
+<line class="ci" x1="719.89" y1="263.00" x2="737.92" y2="263.00" stroke="#E69F00"/>
+<rect class="mark" x="727.77" y="258.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="1099.55" y1="275.00" x2="1128.10" y2="275.00" stroke="#009E73"/>
+<path class="mark" d="M1113.93,269.00 L1107.93,280.00 L1119.93,280.00 Z" fill="#009E73"/>
+<line class="ci" x1="719.46" y1="287.00" x2="737.28" y2="287.00" stroke="#CC79A7"/>
+<path class="mark" d="M732.13,280.00 L725.13,287.00 L732.13,294.00 L739.13,287.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="726.54" y1="299.00" x2="749.51" y2="299.00" stroke="#D55E00"/>
+<path class="mark" d="M737.64,294.00 L747.64,304.00 M747.64,294.00 L737.64,304.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="180" y="350.00" text-anchor="end">Cyclic pressure</text>
+<line class="ci" x1="567.92" y1="326.00" x2="567.92" y2="326.00" stroke="#0072B2"/>
+<circle class="mark" cx="567.92" cy="326.00" r="5" fill="#0072B2"/>
+<line class="ci" x1="567.92" y1="338.00" x2="567.92" y2="338.00" stroke="#E69F00"/>
+<rect class="mark" x="562.92" y="333.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="567.88" y1="350.00" x2="567.90" y2="350.00" stroke="#009E73"/>
+<path class="mark" d="M567.89,344.00 L561.89,355.00 L573.89,355.00 Z" fill="#009E73"/>
+<line class="ci" x1="567.92" y1="362.00" x2="567.92" y2="362.00" stroke="#CC79A7"/>
+<path class="mark" d="M567.92,355.00 L560.92,362.00 L567.92,369.00 L574.92,362.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="567.92" y1="374.00" x2="567.92" y2="374.00" stroke="#D55E00"/>
+<path class="mark" d="M562.92,369.00 L572.92,379.00 M572.92,369.00 L562.92,379.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="180" y="425.00" text-anchor="end">Markov clusters</text>
+<line class="ci" x1="642.18" y1="401.00" x2="647.18" y2="401.00" stroke="#0072B2"/>
+<circle class="mark" cx="645.30" cy="401.00" r="5" fill="#0072B2"/>
+<line class="ci" x1="654.28" y1="413.00" x2="658.89" y2="413.00" stroke="#E69F00"/>
+<rect class="mark" x="652.54" y="408.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="951.92" y1="425.00" x2="960.76" y2="425.00" stroke="#009E73"/>
+<path class="mark" d="M954.79,419.00 L948.79,430.00 L960.79,430.00 Z" fill="#009E73"/>
+<line class="ci" x1="651.51" y1="437.00" x2="656.19" y2="437.00" stroke="#CC79A7"/>
+<path class="mark" d="M655.36,430.00 L648.36,437.00 L655.36,444.00 L662.36,437.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="682.66" y1="449.00" x2="688.83" y2="449.00" stroke="#D55E00"/>
+<path class="mark" d="M681.57,444.00 L691.57,454.00 M691.57,444.00 L681.57,454.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="180" y="500.00" text-anchor="end">IID uniform</text>
+<line class="ci" x1="697.70" y1="476.00" x2="700.23" y2="476.00" stroke="#0072B2"/>
+<circle class="mark" cx="699.01" cy="476.00" r="5" fill="#0072B2"/>
+<line class="ci" x1="697.29" y1="488.00" x2="700.18" y2="488.00" stroke="#E69F00"/>
+<rect class="mark" x="694.02" y="483.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="695.21" y1="500.00" x2="696.95" y2="500.00" stroke="#009E73"/>
+<path class="mark" d="M696.30,494.00 L690.30,505.00 L702.30,505.00 Z" fill="#009E73"/>
+<line class="ci" x1="697.29" y1="512.00" x2="700.18" y2="512.00" stroke="#CC79A7"/>
+<path class="mark" d="M699.02,505.00 L692.02,512.00 L699.02,519.00 L706.02,512.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="697.64" y1="524.00" x2="700.33" y2="524.00" stroke="#D55E00"/>
+<path class="mark" d="M694.55,519.00 L704.55,529.00 M704.55,519.00 L694.55,529.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<circle class="mark" cx="190.00" cy="615.00" r="5" fill="#0072B2"/>
+<text class="small" x="202" y="619">LRU</text>
+<rect class="mark" x="370.00" y="610.00" width="10" height="10" fill="#E69F00"/>
+<text class="small" x="387" y="619">SLRU</text>
+<path class="mark" d="M560.00,609.00 L554.00,620.00 L566.00,620.00 Z" fill="#009E73"/>
+<text class="small" x="572" y="619">TinyLFU</text>
+<path class="mark" d="M745.00,608.00 L738.00,615.00 L745.00,622.00 L752.00,615.00 Z" fill="#CC79A7"/>
+<text class="small" x="757" y="619">Router admit</text>
+<path class="mark" d="M925.00,610.00 L935.00,620.00 M935.00,610.00 L925.00,620.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="942" y="619">Router prefetch</text>
+<text class="small" x="35" y="642">Source: summary.json regenerated from observations.jsonl · exploratory unadjusted cells · no omnibus claim or host timing</text>
+</svg>

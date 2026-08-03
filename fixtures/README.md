@@ -5,3 +5,8 @@ M1 commits the seedless integer formula, format limits, mutation-based malformed
 corpus, artifact identity, and golden oracle outputs. The 7,904-byte checkpoint
 object is generated only into a caller-selected directory; it is not committed
 and contains no trained or third-party model weights.
+
+M3 also commits three tiny canonical
+[cache-policy traces](cache/README.md). They are hand-inspectable correctness
+inputs; the larger stochastic experiment traces are regenerated from the
+versioned Rust generator and pinned by digests rather than stored repeatedly.

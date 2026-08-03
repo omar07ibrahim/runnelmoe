@@ -46,6 +46,21 @@ The source for the architecture figure is
                                |
                          immutable RMOA objects
 
+The M3 cache simulator sits beside this production path rather than inside it:
+
+    causal trace generator ----> strict JSONL validator
+                                      |
+                     +----------------+----------------+
+                     |                |                |
+                online policies   uniform MIN    tiny exact-byte DP
+                     |                |                |
+                     +-------- checked byte ledger ----+
+
+This separation keeps workloads policy-neutral. A production-cache trace
+records decisions already made and therefore cannot validate a replacement
+policy independently. A shared golden schedule instead cross-checks the
+simulator and production cache as two implementations.
+
 ### Boundaries
 
 - **Adapter:** validates topology, maps semantic tensor roles, and owns
@@ -68,6 +83,14 @@ The source for the architecture figure is
 - **Oracle:** Python/PyTorch evaluates the documented model equations with a
   different module structure and control flow. It cannot consume production
   routing decisions or intermediate outputs as inputs.
+- **Cache-policy simulator:** validates bounded canonical traces, applies one
+  complete victim plan atomically, and reports demand, speculative, resident,
+  and normalized metadata-payload bytes separately. Router state uses exact
+  request/target-step/layer identity; same-step scores survive every page
+  demand and older targets retire deterministically. Scores protect pages only
+  for the request and target being evaluated—cross-request lookahead and
+  competing-horizon arbitration are deferred to M5. It cannot alter numerical
+  routes.
 - **Serving:** translates a documented HTTP subset into bounded runtime
   requests. It has no direct tensor, cache-policy, or filesystem access.
 
@@ -162,11 +185,14 @@ second payload copy. Entry/control-block and allocator bookkeeping are bounded
 or observed separately; process RSS remains the authoritative whole-process
 observation rather than an inferred allocator total.
 Configuration is rejected if the minimum executable operation cannot fit.
-Cache policies operate on fixed-size pages so byte capacity and offline
-optimal comparisons are unambiguous. The data-plane API exposes large tensors
-as ordered pages; the M2 tiny-runtime adapter still reconstructs complete
-verified tensors before compute. Tensors that share a physical page share its
-buffer charge.
+The production cache operates on fixed-size pages plus an aligned short tail.
+The research simulator permits unequal logical and charge bytes so online
+policies and accounting can be tested against those tails. Offline Bélády/MIN
+is called optimal only for uniform charge and uniform miss cost; a bounded
+exponential dynamic program supplies tiny variable-byte correctness cases.
+The data-plane API exposes large tensors as ordered pages; the M2 tiny-runtime
+adapter still reconstructs complete verified tensors before compute. Tensors
+that share a physical page share its buffer charge.
 
 The I/O backend owns a submitted buffer until completion or acknowledged
 cancellation. Request cancellation becomes terminal only after buffer

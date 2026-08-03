@@ -397,6 +397,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "runnel-sim"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "runnel-fixture",
+ "runnel-store",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "runnel-store"
 version = "0.1.0"
 dependencies = [

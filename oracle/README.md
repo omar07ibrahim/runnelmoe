@@ -30,3 +30,22 @@ compares floating-point values with the tolerances declared by the fixture. It
 never rewrites files. PyTorch recomputes complete prefixes and all experts;
 Rust independently executes incremental scalar KV state and only selected
 experts.
+
+## Independent cache-policy oracle
+
+`cache_policy.py` is a separate standard-library reference for the M3 online
+policy kernel. It parses the closed canonical trace independently, retains
+ordered demand and router events, and implements byte-capacity LRU, SLRU,
+TinyLFU, and router-admit with a different state layout from Rust. In
+particular, router scores use a flat `(request, target_step, layer)` map, while
+the Rust simulator uses nested ordered maps. Differential tests include
+variable-size multi-victim eviction, SLRU demotion, TinyLFU aging and strict
+admission, plus simultaneous multi-layer and multiple-outstanding router
+signals. The Python oracle does not implement speculative prefetch or consume
+Rust decisions as inputs.
+
+Run it directly on a small canonical trace with:
+
+```console
+python3 oracle/cache_policy.py --trace fixtures/cache/m2-forced-eviction.jsonl --policy lru --capacity-bytes 65536
+```

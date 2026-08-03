@@ -86,12 +86,61 @@ or requests and identify which population they represent.
   eviction;
 - **wasted prefetch:** a prefetched page is evicted or the trace ends without
   demand;
-- **prefetch coverage:** demand misses avoided by useful prefetch / all demand
-  accesses;
-- **online gap:** online-policy physical demand bytes divided by offline
-  fixed-page Belady bytes, with the equal-size-page assumption explicit.
+- **prefetch access coverage:** demand misses avoided by useful prefetch / all
+  demand accesses;
+- **admission-only optimal gap:** a non-prefetch policy's physical demand-fill
+  bytes divided by offline fixed-page Bélády bytes;
+- **cross-policy optimal gap:** total physical bytes (demand fills plus
+  prefetch fills) divided by offline fixed-page Bélády demand-fill bytes. This
+  is the primary ratio whenever speculation is enabled;
+- **prefetch precision:** useful prefetch bytes / physical prefetch bytes;
+- **prefetch waste fraction:** wasted prefetch bytes / physical prefetch bytes;
+  and
+- **prefetch byte coverage:** useful-prefetch demand-hit bytes / all demand
+  bytes. This is the M3 evidence definition; its numerator and denominator are
+  retained in every raw observation.
 
 Object-count hit rates may be diagnostic but never substitute for byte rates.
+Likewise, a prefetch policy's demand-fill reduction is a stall proxy, not an
+optimality result: speculation may merely move or amplify the same I/O.
+
+### M3 deterministic simulations
+
+Cache replay itself has no repeated timing trials. Its uncertainty population
+is the paired set of independently seeded synthetic traces. Each M3
+family/capacity/policy cell retains 30 seeds, and deterministic 10,000-resample
+bootstrap intervals describe across-trace variability. These are unadjusted,
+exploratory per-cell intervals: individual accesses are not treated as
+independent samples, families are not pooled, and no omnibus “any cell wins”
+claim is allowed. Only SLRU, TinyLFU, router-admit, and router-prefetch receive
+a below/overlapping/above-one interval position; LRU and Bélády are explicitly
+baseline/oracle and therefore not applicable. The pathological cyclic family
+is identified as such.
+
+The fixed-page suite has 128 seed-permuted experts, three 65,536-byte pages per
+expert, 4,096 measured top-2 routes after 512 generator burn-in routes, and
+32-, 64-, and 128-page capacities. Its six families are stationary harmonic
+popularity, scan pollution, phase shifts, cyclic pressure, clustered Markov
+routing, and IID uniform routing. All randomness is integer-only and every
+trace is identified by a domain-separated SHA-256 seed and content digest.
+The evidence harness independently derives the frozen seed, parses one emitted
+trace at a time, reconstructs each measured route from its six ordered page
+demands, and recomputes the measured-route digest. It rejects reused route
+digests even if replicate-specific headers make whole-trace hashes distinct.
+Burn-in routes are not emitted and their digest remains simulator-attested.
+
+Primary capture never accepts a caller-supplied binary. It requires clean HEAD,
+creates a private directory under a verified tmpfs build root, performs the
+recorded two-job locked/offline release build, and checks the commit's harness
+blob and binary hash before and after the 180 paired trace runs. Absolute
+temporary paths and inherited toolchain-home paths are not recorded. The
+archival verifier uses retained no-follow descriptors, rejects the wrong file
+set and oversized sparse files before reading, and regenerates SVG series from
+the already-built summary so chart intervals cannot diverge from JSON.
+
+The simulator's `instant-between-events-v1` prefetch abstraction is an I/O
+volume and pollution model. M3 reports no simulator throughput, storage
+latency, overlap, TTFT, or runtime speedup from it.
 
 ### Scheduling
 

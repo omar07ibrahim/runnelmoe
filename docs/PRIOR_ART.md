@@ -107,9 +107,67 @@ weights, and no Kimi license applies to this repository's original code.
   — normative RMOA manifest serialization reference, published under the
   [IETF Trust Legal Provisions](https://trustee.ietf.org/documents/trust-legal-provisions/).
 
-Policy papers used in later milestones will be added at the commit that first
-relies on them, with version, link, and license where applicable. Results from
-another implementation are never accepted as RunnelMoE measurements.
+## Cache-policy research sources
+
+M3 independently implements algorithm descriptions from primary publications:
+
+- L. A. Bélády, [“A Study of Replacement Algorithms for a Virtual-Storage
+  Computer,”](https://doi.org/10.1147/sj.52.0078) *IBM Systems Journal* 5(2),
+  1966 — the uniform-unit offline MIN reference; publisher-controlled article,
+  citation only.
+- R. Karedla, J. S. Love, and B. G. Wherry,
+  [“Caching Strategies to Improve Disk System
+  Performance,”](https://doi.org/10.1109/2.268884) *IEEE Computer* 27(3),
+  1994 — the two-segment SLRU policy; IEEE-controlled article, citation only.
+- G. Einziger, R. Friedman, and B. Manes,
+  [“TinyLFU: A Highly Efficient Cache Admission
+  Policy,”](https://arxiv.org/abs/1512.00727v2) *ACM Transactions on Storage*
+  13(4), 2017, [DOI 10.1145/3149371](https://doi.org/10.1145/3149371) — the
+  bounded frequency-admission design; article and arXiv manuscript are cited,
+  with no code or parameters copied.
+- G. Cormode and S. Muthukrishnan,
+  [“An Improved Data Stream Summary: The Count-Min Sketch and Its
+  Applications,”](https://doi.org/10.1016/j.jalgor.2003.12.001) *Journal of
+  Algorithms* 55(1), 2005 — the sketch data structure used by TinyLFU;
+  publisher-controlled article, citation only.
+- D. Berger, N. Beckmann, and M. Harchol-Balter,
+  [“Practical Bounds on Optimal Caching with Variable Object
+  Sizes,”](https://arxiv.org/abs/1711.03709) *Proceedings of the ACM on
+  Measurement and Analysis of Computing Systems* 2(2), 2018 — the source for
+  the variable-size optimal-caching complexity boundary; citation only.
+- S. Srinivasan, E. S. Davidson, and G. S. Tyson,
+  [“A Prefetch Taxonomy,”](https://doi.org/10.1109/TC.2004.1261824) *IEEE
+  Transactions on Computers* 53(2), 2004 — methodology for separating useful,
+  late, and harmful speculation; citation only.
+- D. Blackman and S. Vigna,
+  [“Scrambled Linear Pseudorandom Number
+  Generators,”](https://doi.org/10.1145/3460772) *ACM Transactions on
+  Mathematical Software* 47(4), 2021 — the xoshiro256** algorithm used for
+  reproducible synthetic routes; publisher-controlled article, citation only.
+- The authors' official
+  [xoshiro256** reference](https://prng.di.unimi.it/xoshiro256starstar.c),
+  written by David Blackman and Sebastiano Vigna, and Sebastiano Vigna's
+  [SplitMix64 reference](https://prng.di.unimi.it/splitmix64.c) identify the
+  transition and mixing constants used by the independently written Rust and
+  Python implementations. Both reference files dedicate copyright and related
+  rights to the public domain to the extent possible and include unrestricted
+  permission to use, copy, modify, and distribute as a fallback. They were
+  consulted for algorithm identity, provenance, and license verification on
+  2026-08-03; no source text, comments, tests, or file structure was copied.
+
+The project-original router-aware composition is motivated by the general
+published observations that expert routes can have exploitable correlation and
+sequence-local reuse in [EdgeMoE](https://arxiv.org/abs/2308.14352v2) and
+[MoE-Infinity](https://arxiv.org/abs/2401.14361v3). Those observations are not
+a claim of novelty for prediction itself. RunnelMoE independently defines its
+causal integer predictor, byte-accounted admission, group-atomic prefetch, and
+evaluation contract. It uses no implementation, fixture, prose, diagram,
+parameter result, or benchmark number from these works.
+
+The Kimi K3 C repository was not consulted for M3 implementation details. It
+remains credited above only as prior art for the broader constrained-memory
+inference problem. Results from another implementation are never accepted as
+RunnelMoE measurements.
 
 ## Contribution rule
 

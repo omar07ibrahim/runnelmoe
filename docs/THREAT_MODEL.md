@@ -53,6 +53,7 @@ The cross-milestone system invariants are:
 | NaN/Inf or unstable routing | finite checks and specified score/tie policy | special-value and tie tests | M1 |
 | Compression bomb | compression absent from and rejected by RMOA v1 | exact-schema tests | M1 |
 | Memory/queue denial of service | eager metadata caps; 64-byte-quantized page-pool ledger; bounded entries, loads, workers, queues, waiters, leases, and traces | exact budget, queue saturation, hostile configuration, and failed-admission tests | M1/M2/M5 |
+| Cache-trace allocation or oracle explosion | canonical closed JSONL schema; file/line/page/event/prediction caps; complete validation before replay; uniform-geometry MIN; explicit state cap on variable-byte DP | adversarial parser corpus, deterministic arbitrary-byte smoke, oversized configuration tests, and exhaustive tiny differentials | M3 |
 | Slow client or abandoned SSE | deadlines, bounded output channel, disconnect cancellation | stalled/disconnect black-box tests | M6 |
 | High-cardinality telemetry | bounded metric labels; IDs only in sampled traces | metrics cardinality test | M6 |
 | Secret/prompt disclosure | allowlisted output and content-redacted errors | CLI stderr capture now; server log capture next | M1/M6 |
@@ -76,6 +77,28 @@ during hashing, and cancellation immediately before both publication paths.
 No failure may expose verified status or release an owned payload charge before
 worker completion. Same-UID concurrent content mutation remains a documented
 residual risk, not a filesystem-isolation claim.
+
+M3 traces additionally reject non-ASCII/CR framing, a missing terminal LF,
+noncanonical JSON, unknown or duplicate fields, sequence gaps, unknown pages,
+invalid geometry, noncausal or dangling router signals, duplicate experts,
+and score overflow. The entire catalog and event stream validates before a
+policy can emit a plausible partial result. The CLI rejects symbolic-link and
+non-regular trace leaves. It performs one no-follow, nonblocking open, checks
+the retained descriptor, reads at most the 5 MiB ceiling plus one byte, and
+rejects initial/read/final length disagreement. Thus a leaf swap cannot redirect
+the read and a FIFO cannot block it. Ordinary symlinks in ancestor components,
+hard links, and equal-length writes through the same inode are documented
+same-UID residual risks, not rejected path classes. Router metadata is an
+explicit normalized scalar payload charge rather than allocator/RSS usage;
+that payload and the tiny exact-oracle state count have separate pre-replay
+ceilings.
+
+M3 evidence verification treats its own directory as untrusted. It opens the
+root, `figures` directory, and exact closed file set with retained no-follow
+descriptors; classifies every entry; sums all declared lengths before reading;
+and performs bounded reads with final metadata checks. Capture builds in a
+private tmpfs child and revalidates clean HEAD, the historical harness blob,
+and the executable digest before the staged directory is renamed into place.
 
 ## Abuse cases for later serving
 
@@ -102,5 +125,9 @@ access must place a reviewed gateway in front, outside this project's default.
 - The M1 eager convenience reader remains for a trusted local directory that is
   not concurrently replaced. M2 descriptor-relative reads and transactional
   CAS publication are the hardened runtime path.
+- The M3 simulator is not a production isolation boundary. Its instantaneous
+  prefetch model omits I/O latency, cancellation, in-flight ownership, and
+  storage contention; conclusions are limited to modeled byte traffic and
+  cache state.
 
 Security issues should follow [SECURITY.md](../SECURITY.md), not a public issue.

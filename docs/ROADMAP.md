@@ -44,11 +44,21 @@ and [generated summary](../benchmarks/raw/m2-data-plane-forced-eviction-20260803
 
 ## M3 — cache policy research
 
-- [ ] Trace replay implements byte-aware LRU, SLRU, TinyLFU, a router-aware
-  policy, and offline Belady.
-- [ ] Synthetic trace definitions, seeds, raw JSONL, analysis code, repeated
+- [x] Trace replay implements byte-aware LRU, SLRU, TinyLFU, router-aware
+  admission and prefetch, and offline Bélády/MIN.
+- [x] Synthetic trace definitions, seeds, raw JSONL, analysis code, repeated
   trials, uncertainty, and online-to-optimal gaps are committed.
-- [ ] Prefetch usefulness is reported separately from demand hits.
+- [x] Prefetch usefulness is reported separately from demand hits.
+
+Evidence: [M3 review](reviews/M3_REVIEW.md),
+[green protected CI](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30804817207),
+the schema-v2
+[experiment contract](../benchmarks/raw/m3-cache-policies-20260803/experiment.json),
+[trace ledger](../benchmarks/raw/m3-cache-policies-20260803/traces.jsonl),
+[3,240 raw observations](../benchmarks/raw/m3-cache-policies-20260803/observations.jsonl),
+and [generated summary](../benchmarks/raw/m3-cache-policies-20260803/summary.json).
+Results are exploratory synthetic modeled-byte comparisons, not
+runtime-performance evidence.
 
 ## M4 — kernels and portability
 

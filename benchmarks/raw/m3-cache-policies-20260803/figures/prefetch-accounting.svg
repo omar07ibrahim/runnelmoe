@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="650" viewBox="0 0 1220 650" role="img" aria-labelledby="title desc">
+<title id="title">Router-prefetch byte accounting</title>
+<desc id="desc">Median useful, wasted, redundant, and dropped prefetch bytes by workload at four MiB capacity.</desc>
+<style>text{font-family:system-ui,sans-serif;fill:#222}.title{font-size:22px;font-weight:700}.subtitle{font-size:13px;fill:#444}.axis{stroke:#555;stroke-width:1}.grid{stroke:#ddd;stroke-width:1}.label{font-size:12px}.small{font-size:10px;fill:#555}.ci{stroke-width:2}.mark{stroke:#222;stroke-width:1}</style>
+<rect width="100%" height="100%" fill="#fff"/>
+<defs><pattern id="diag" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M-2,2 L2,-2 M0,8 L8,0 M6,10 L10,6" stroke="#fff" stroke-width="2"/></pattern><pattern id="dots" width="8" height="8" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.5" fill="#fff"/></pattern><pattern id="cross" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M1,1 L7,7 M7,1 L1,7" stroke="#fff" stroke-width="1.5"/></pattern></defs>
+<text class="title" x="35" y="36">Router-prefetch byte accounting</text>
+<text class="subtitle" x="35" y="60">Median classified bytes · 4 MiB capacity · redundant and dropped offers perform no physical read</text>
+<line class="grid" x1="120.00" y1="545.00" x2="1170.00" y2="545.00"/>
+<text class="small" x="112.00" y="549.00" text-anchor="end">0.0 MiB</text>
+<line class="grid" x1="120.00" y1="456.00" x2="1170.00" y2="456.00"/>
+<text class="small" x="112.00" y="460.00" text-anchor="end">307.2 MiB</text>
+<line class="grid" x1="120.00" y1="367.00" x2="1170.00" y2="367.00"/>
+<text class="small" x="112.00" y="371.00" text-anchor="end">614.4 MiB</text>
+<line class="grid" x1="120.00" y1="278.00" x2="1170.00" y2="278.00"/>
+<text class="small" x="112.00" y="282.00" text-anchor="end">921.6 MiB</text>
+<line class="grid" x1="120.00" y1="189.00" x2="1170.00" y2="189.00"/>
+<text class="small" x="112.00" y="193.00" text-anchor="end">1228.8 MiB</text>
+<line class="grid" x1="120.00" y1="100.00" x2="1170.00" y2="100.00"/>
+<text class="small" x="112.00" y="104.00" text-anchor="end">1536.0 MiB</text>
+<rect class="mark" x="151.50" y="544.84" width="24.50" height="0.16" fill="#0072B2"/>
+<rect class="mark" x="180.67" y="544.57" width="24.50" height="0.43" fill="#D55E00"/>
+<rect x="180.67" y="544.57" width="24.50" height="0.43" fill="url(#diag)"/>
+<rect class="mark" x="209.83" y="426.72" width="24.50" height="118.28" fill="#009E73"/>
+<rect x="209.83" y="426.72" width="24.50" height="118.28" fill="url(#dots)"/>
+<rect class="mark" x="239.00" y="545.00" width="24.50" height="0.00" fill="#CC79A7"/>
+<text class="small" x="207.50" y="564.00" text-anchor="middle">Stationary Zipf</text>
+<rect class="mark" x="326.50" y="457.38" width="24.50" height="87.62" fill="#0072B2"/>
+<rect class="mark" x="355.67" y="539.38" width="24.50" height="5.62" fill="#D55E00"/>
+<rect x="355.67" y="539.38" width="24.50" height="5.62" fill="url(#diag)"/>
+<rect class="mark" x="384.83" y="215.71" width="24.50" height="329.29" fill="#009E73"/>
+<rect x="384.83" y="215.71" width="24.50" height="329.29" fill="url(#dots)"/>
+<rect class="mark" x="414.00" y="545.00" width="24.50" height="0.00" fill="#CC79A7"/>
+<text class="small" x="382.50" y="564.00" text-anchor="middle">Scan pollution</text>
+<rect class="mark" x="501.50" y="544.78" width="24.50" height="0.22" fill="#0072B2"/>
+<rect class="mark" x="530.67" y="544.67" width="24.50" height="0.33" fill="#D55E00"/>
+<rect x="530.67" y="544.67" width="24.50" height="0.33" fill="url(#diag)"/>
+<rect class="mark" x="559.83" y="127.96" width="24.50" height="417.04" fill="#009E73"/>
+<rect x="559.83" y="127.96" width="24.50" height="417.04" fill="url(#dots)"/>
+<rect class="mark" x="589.00" y="545.00" width="24.50" height="0.00" fill="#CC79A7"/>
+<text class="small" x="557.50" y="564.00" text-anchor="middle">Phase shift</text>
+<rect class="mark" x="676.50" y="100.00" width="24.50" height="445.00" fill="#0072B2"/>
+<rect class="mark" x="705.67" y="545.00" width="24.50" height="0.00" fill="#D55E00"/>
+<rect class="mark" x="734.83" y="545.00" width="24.50" height="0.00" fill="#009E73"/>
+<rect class="mark" x="764.00" y="545.00" width="24.50" height="0.00" fill="#CC79A7"/>
+<text class="small" x="732.50" y="564.00" text-anchor="middle">Cyclic pressure</text>
+<rect class="mark" x="851.50" y="529.14" width="24.50" height="15.86" fill="#0072B2"/>
+<rect class="mark" x="880.67" y="535.55" width="24.50" height="9.45" fill="#D55E00"/>
+<rect x="880.67" y="535.55" width="24.50" height="9.45" fill="url(#diag)"/>
+<rect class="mark" x="909.83" y="186.61" width="24.50" height="358.39" fill="#009E73"/>
+<rect x="909.83" y="186.61" width="24.50" height="358.39" fill="url(#dots)"/>
+<rect class="mark" x="939.00" y="545.00" width="24.50" height="0.00" fill="#CC79A7"/>
+<text class="small" x="907.50" y="564.00" text-anchor="middle">Markov clusters</text>
+<rect class="mark" x="1026.50" y="545.00" width="24.50" height="0.00" fill="#0072B2"/>
+<rect class="mark" x="1055.67" y="544.78" width="24.50" height="0.22" fill="#D55E00"/>
+<rect x="1055.67" y="544.78" width="24.50" height="0.22" fill="url(#diag)"/>
+<rect class="mark" x="1084.83" y="544.89" width="24.50" height="0.11" fill="#009E73"/>
+<rect x="1084.83" y="544.89" width="24.50" height="0.11" fill="url(#dots)"/>
+<rect class="mark" x="1114.00" y="545.00" width="24.50" height="0.00" fill="#CC79A7"/>
+<text class="small" x="1082.50" y="564.00" text-anchor="middle">IID uniform</text>
+<rect class="mark" x="145" y="585" width="18" height="12" fill="#0072B2"/>
+<text class="small" x="170" y="596">Useful</text>
+<rect class="mark" x="395" y="585" width="18" height="12" fill="#D55E00"/>
+<rect x="395" y="585" width="18" height="12" fill="url(#diag)"/>
+<text class="small" x="420" y="596">Wasted</text>
+<rect class="mark" x="645" y="585" width="18" height="12" fill="#009E73"/>
+<rect x="645" y="585" width="18" height="12" fill="url(#dots)"/>
+<text class="small" x="670" y="596">Redundant (no read)</text>
+<rect class="mark" x="895" y="585" width="18" height="12" fill="#CC79A7"/>
+<rect x="895" y="585" width="18" height="12" fill="url(#cross)"/>
+<text class="small" x="920" y="596">Dropped (no read)</text>
+<text class="small" x="35" y="635">Source: summary.json regenerated from observations.jsonl · byte classifications are separate from cache hits · exploratory, no host timing</text>
+</svg>

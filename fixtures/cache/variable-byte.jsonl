@@ -1,0 +1,10 @@
+{"kind":"header","schema":"runnel.cache-trace/1","trace_id":"variable-byte","page_count":3,"event_count":6,"charge_quantum":1,"prefetch_model":"instant-between-events-v1"}
+{"id":0,"logical_bytes":1,"charge_bytes":1,"class":{"kind":"shared"}}
+{"id":1,"logical_bytes":1,"charge_bytes":1,"class":{"kind":"shared"}}
+{"id":2,"logical_bytes":2,"charge_bytes":3,"class":{"kind":"shared"}}
+{"kind":"demand","sequence":0,"request":0,"step":0,"page":0}
+{"kind":"demand","sequence":1,"request":0,"step":1,"page":1}
+{"kind":"demand","sequence":2,"request":0,"step":2,"page":2}
+{"kind":"demand","sequence":3,"request":0,"step":3,"page":0}
+{"kind":"demand","sequence":4,"request":0,"step":4,"page":1}
+{"kind":"demand","sequence":5,"request":0,"step":5,"page":2}
