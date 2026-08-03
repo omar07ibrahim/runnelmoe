@@ -9,7 +9,7 @@ fn exact_row_major_case_prevents_transpose_errors() {
     let matrix = matrix_from_i16(3, 4, &[1, 2, 3, 4, -2, 1, 0, 3, 7, -1, 2, -4]);
     let input_values = [2.0, -1.0, 0.5, 3.0];
     let input = FiniteInput::new(&input_values).unwrap();
-    let mut workspace = GemvWorkspace::new(3);
+    let mut workspace = GemvWorkspace::try_new(3).unwrap();
     let mut output = [f32::NAN; 3];
     scalar_gemv(&matrix, input, &mut workspace, &mut output).unwrap();
     assert_eq!(
@@ -43,8 +43,8 @@ fn one_word_owned_prefix_preserves_each_backend_result() {
         if request == BackendRequest::Avx2 && !Capabilities::detected().avx2_available() {
             continue;
         }
-        let mut natural_workspace = GemvWorkspace::new(3);
-        let mut offset_workspace = GemvWorkspace::new(3);
+        let mut natural_workspace = GemvWorkspace::try_new(3).unwrap();
+        let mut offset_workspace = GemvWorkspace::try_new(3).unwrap();
         let mut natural_output = [f32::NAN; 3];
         let mut offset_output = [f32::NAN; 3];
         PreparedGemv::new(&natural, input, request)
@@ -109,7 +109,7 @@ fn finite_subnormals_and_cancellation_are_diagnostic_cases() {
             continue;
         }
         let prepared = PreparedGemv::new(&subnormal_matrix, subnormal_input, request).unwrap();
-        let mut workspace = GemvWorkspace::new(3);
+        let mut workspace = GemvWorkspace::try_new(3).unwrap();
         let mut output = [f32::NAN; 3];
         prepared.run(&mut workspace, &mut output).unwrap();
         assert_eq!(
@@ -131,7 +131,7 @@ fn finite_subnormals_and_cancellation_are_diagnostic_cases() {
             continue;
         }
         let prepared = PreparedGemv::new(&near_limit_matrix, near_limit_input, request).unwrap();
-        let mut workspace = GemvWorkspace::new(2);
+        let mut workspace = GemvWorkspace::try_new(2).unwrap();
         let mut output = [f32::NAN; 2];
         prepared.run(&mut workspace, &mut output).unwrap();
         assert_eq!(
@@ -204,7 +204,7 @@ fn errors_do_not_publish_partial_output() {
             continue;
         }
         let prepared = PreparedGemv::new(&matrix, input, request).unwrap();
-        let mut workspace = GemvWorkspace::new(1);
+        let mut workspace = GemvWorkspace::try_new(1).unwrap();
         let mut output = [123.0];
         assert!(matches!(
             prepared.run(&mut workspace, &mut output),
@@ -214,7 +214,7 @@ fn errors_do_not_publish_partial_output() {
     }
 
     let prepared = PreparedGemv::new(&matrix, input, BackendRequest::Scalar).unwrap();
-    let mut workspace = GemvWorkspace::new(1);
+    let mut workspace = GemvWorkspace::try_new(1).unwrap();
     let mut short_output = Vec::<f32>::new();
     assert!(matches!(
         prepared.run(&mut workspace, &mut short_output),
@@ -224,7 +224,7 @@ fn errors_do_not_publish_partial_output() {
         })
     ));
 
-    let mut wrong_workspace = GemvWorkspace::new(2);
+    let mut wrong_workspace = GemvWorkspace::try_new(2).unwrap();
     let mut output = [123.0];
     assert!(matches!(
         prepared.run(&mut wrong_workspace, &mut output),
@@ -263,7 +263,7 @@ fn finite_and_dimension_validation_is_closed() {
 }
 
 #[test]
-fn one_workspace_can_be_explicitly_resized_across_shapes() {
+fn one_workspace_can_be_explicitly_reused_across_shapes() {
     let wide = matrix_from_i16(12, 8, &[1; 12 * 8]);
     let narrow = matrix_from_i16(8, 12, &[1; 8 * 12]);
     let wide_input_values = [0.25_f32; 8];
@@ -286,22 +286,26 @@ fn one_workspace_can_be_explicitly_resized_across_shapes() {
             request,
         )
         .unwrap();
-        let mut workspace = GemvWorkspace::new(12);
+        let mut workspace = GemvWorkspace::try_new(12).unwrap();
+        let capacity = workspace.capacity();
+        assert_eq!(workspace.max_rows(), 12);
 
         let mut wide_output = [f32::NAN; 12];
         wide_prepared.run(&mut workspace, &mut wide_output).unwrap();
         assert_eq!(wide_output.map(f32::to_bits), [2.0_f32.to_bits(); 12]);
 
-        workspace.resize_rows(8);
+        workspace.set_rows(8).unwrap();
         assert_eq!(workspace.rows(), 8);
+        assert_eq!(workspace.capacity(), capacity);
         let mut narrow_output = [f32::NAN; 8];
         narrow_prepared
             .run(&mut workspace, &mut narrow_output)
             .unwrap();
         assert_eq!(narrow_output.map(f32::to_bits), [6.0_f32.to_bits(); 8]);
 
-        workspace.resize_rows(12);
+        workspace.set_rows(12).unwrap();
         assert_eq!(workspace.rows(), 12);
+        assert_eq!(workspace.capacity(), capacity);
         wide_output.fill(f32::NAN);
         wide_prepared.run(&mut workspace, &mut wide_output).unwrap();
         assert_eq!(wide_output.map(f32::to_bits), [2.0_f32.to_bits(); 12]);
@@ -318,7 +322,7 @@ fn check_backend(
     let matrix = Bf16Matrix::from_words(rows, columns, words).unwrap();
     let input = FiniteInput::new(input_values).unwrap();
     let prepared = PreparedGemv::new(&matrix, input, request).unwrap();
-    let mut workspace = GemvWorkspace::new(rows);
+    let mut workspace = GemvWorkspace::try_new(rows).unwrap();
     let mut output = vec![0.0; rows];
     prepared.run(&mut workspace, &mut output).unwrap();
 

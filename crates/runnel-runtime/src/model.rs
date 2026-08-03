@@ -964,7 +964,9 @@ fn accumulate_bf16_experts(
 ) -> Result<()> {
     let input = FiniteInput::new(input)
         .map_err(|source| expert_kernel_error("expert input validation", source))?;
-    let mut workspace = GemvWorkspace::new(hidden_size.max(expert_hidden_size));
+    let workspace_rows = hidden_size.max(expert_hidden_size);
+    let mut workspace = GemvWorkspace::try_new(workspace_rows)
+        .map_err(|source| expert_kernel_error("expert workspace allocation", source))?;
     let mut gate = vec![0.0_f32; expert_hidden_size];
     let mut up = vec![0.0_f32; expert_hidden_size];
     let mut activated = vec![0.0_f32; expert_hidden_size];
@@ -1023,7 +1025,9 @@ fn run_bf16_matrix(
     let prepared = PreparedGemv::with_capabilities(matrix, input, request, dispatch.capabilities)
         .map_err(|source| expert_kernel_error(operation, source))?;
     debug_assert_eq!(prepared.backend(), dispatch.backend);
-    workspace.resize_rows(matrix.rows());
+    workspace
+        .set_rows(matrix.rows())
+        .map_err(|source| expert_kernel_error(operation, source))?;
     prepared
         .run(workspace, output)
         .map_err(|source| expert_kernel_error(operation, source))
