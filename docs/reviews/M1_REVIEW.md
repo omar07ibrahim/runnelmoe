@@ -5,8 +5,9 @@
 - Scope: RMOA parser/verifier, deterministic artifact generator, scalar Rust
   adapter, PyTorch oracle, committed vectors, CLI, CI, and public claims
 - Local verdict: pass
-- Implementation commit: `904233cf75152e6c0df025e17a396c3290623f80`
-- Remote CI: [pass, all three jobs](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30790376933)
+- Implementation commit: `9d3454aa1ee77f0ce055dd243c90e4a7eb55e8d0`
+- Main verification commit: `1ef9ede78f85957bda6fddc21e746754ac9e63d8`
+- Remote CI: [pass, all three jobs](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30790520786)
 
 ## Acceptance evidence
 

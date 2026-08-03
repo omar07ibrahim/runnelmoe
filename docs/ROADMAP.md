@@ -24,7 +24,7 @@ exists.
   (declared tolerance), and generated tokens.
 - [x] Committed source fixtures and offline Rust tests pass from a clean
   checkout. Evidence: [M1 review](reviews/M1_REVIEW.md) and
-  [green CI](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30790376933).
+  [green main CI](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30790520786).
 
 ## M2 — out-of-core data plane
 
