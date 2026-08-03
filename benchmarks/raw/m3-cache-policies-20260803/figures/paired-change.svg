@@ -1,0 +1,198 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="1000" viewBox="0 0 1220 1000" role="img" aria-labelledby="title desc">
+<title id="title">Paired traffic change versus LRU</title>
+<desc id="desc">Exploratory median paired total physical byte ratios with unadjusted 95 percent bootstrap intervals, grouped by workload and capacity; policy colors and markers are identified in the legend.</desc>
+<style>text{font-family:system-ui,sans-serif;fill:#222}.title{font-size:22px;font-weight:700}.subtitle{font-size:13px;fill:#444}.axis{stroke:#555;stroke-width:1}.grid{stroke:#ddd;stroke-width:1}.label{font-size:12px}.small{font-size:10px;fill:#555}.ci{stroke-width:2}.mark{stroke:#222;stroke-width:1}</style>
+<rect width="100%" height="100%" fill="#fff"/>
+<text class="title" x="35" y="36">Paired traffic change versus LRU</text>
+<text class="subtitle" x="35" y="60">Candidate total physical bytes / LRU · exploratory unadjusted cells · lower is better</text>
+<line class="grid" x1="255.00" y1="82" x2="255.00" y2="885"/>
+<text class="small" x="255.00" y="905" text-anchor="middle">0.51×</text>
+<line class="grid" x1="439.00" y1="82" x2="439.00" y2="885"/>
+<text class="small" x="439.00" y="905" text-anchor="middle">1.01×</text>
+<line class="grid" x1="623.00" y1="82" x2="623.00" y2="885"/>
+<text class="small" x="623.00" y="905" text-anchor="middle">1.51×</text>
+<line class="grid" x1="807.00" y1="82" x2="807.00" y2="885"/>
+<text class="small" x="807.00" y="905" text-anchor="middle">2.01×</text>
+<line class="grid" x1="991.00" y1="82" x2="991.00" y2="885"/>
+<text class="small" x="991.00" y="905" text-anchor="middle">2.52×</text>
+<line class="grid" x1="1175.00" y1="82" x2="1175.00" y2="885"/>
+<text class="small" x="1175.00" y="905" text-anchor="middle">3.02×</text>
+<line x1="435.05" y1="82" x2="435.05" y2="885" stroke="#000" stroke-dasharray="5 4"/>
+<text class="label" x="150" y="159" text-anchor="end">Stationary Zipf</text>
+<text class="small" x="240" y="109.00" text-anchor="end">2 MiB</text>
+<line class="ci" x1="367.76" y1="90.00" x2="370.10" y2="90.00" stroke="#E69F00"/>
+<rect class="mark" x="364.42" y="85.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="371.56" y1="100.00" x2="374.21" y2="100.00" stroke="#009E73"/>
+<path class="mark" d="M372.36,94.00 L366.36,105.00 L378.36,105.00 Z" fill="#009E73"/>
+<line class="ci" x1="367.64" y1="110.00" x2="370.10" y2="110.00" stroke="#CC79A7"/>
+<path class="mark" d="M369.42,103.00 L362.42,110.00 L369.42,117.00 L376.42,110.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="369.03" y1="120.00" x2="371.39" y2="120.00" stroke="#D55E00"/>
+<path class="mark" d="M365.04,115.00 L375.04,125.00 M375.04,115.00 L365.04,125.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="151.00" text-anchor="end">4 MiB</text>
+<line class="ci" x1="373.89" y1="132.00" x2="377.16" y2="132.00" stroke="#E69F00"/>
+<rect class="mark" x="370.95" y="127.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="378.27" y1="142.00" x2="380.46" y2="142.00" stroke="#009E73"/>
+<path class="mark" d="M379.56,136.00 L373.56,147.00 L385.56,147.00 Z" fill="#009E73"/>
+<line class="ci" x1="373.89" y1="152.00" x2="377.16" y2="152.00" stroke="#CC79A7"/>
+<path class="mark" d="M375.95,145.00 L368.95,152.00 L375.95,159.00 L382.95,152.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="374.28" y1="162.00" x2="377.27" y2="162.00" stroke="#D55E00"/>
+<path class="mark" d="M371.72,157.00 L381.72,167.00 M381.72,157.00 L371.72,167.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="193.00" text-anchor="end">8 MiB</text>
+<line class="ci" x1="381.04" y1="174.00" x2="384.18" y2="174.00" stroke="#E69F00"/>
+<rect class="mark" x="377.57" y="169.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="380.99" y1="184.00" x2="385.12" y2="184.00" stroke="#009E73"/>
+<path class="mark" d="M383.02,178.00 L377.02,189.00 L389.02,189.00 Z" fill="#009E73"/>
+<line class="ci" x1="381.04" y1="194.00" x2="384.18" y2="194.00" stroke="#CC79A7"/>
+<path class="mark" d="M382.57,187.00 L375.57,194.00 L382.57,201.00 L389.57,194.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="381.46" y1="204.00" x2="384.22" y2="204.00" stroke="#D55E00"/>
+<path class="mark" d="M377.92,199.00 L387.92,209.00 M387.92,199.00 L377.92,209.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="150" y="289" text-anchor="end">Scan pollution</text>
+<text class="small" x="240" y="239.00" text-anchor="end">2 MiB</text>
+<line class="ci" x1="388.43" y1="220.00" x2="390.04" y2="220.00" stroke="#E69F00"/>
+<rect class="mark" x="384.21" y="215.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="377.74" y1="230.00" x2="379.30" y2="230.00" stroke="#009E73"/>
+<path class="mark" d="M378.64,224.00 L372.64,235.00 L384.64,235.00 Z" fill="#009E73"/>
+<line class="ci" x1="388.37" y1="240.00" x2="389.72" y2="240.00" stroke="#CC79A7"/>
+<path class="mark" d="M388.61,233.00 L381.61,240.00 L388.61,247.00 L395.61,240.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="505.97" y1="250.00" x2="508.88" y2="250.00" stroke="#D55E00"/>
+<path class="mark" d="M502.46,245.00 L512.46,255.00 M512.46,245.00 L502.46,255.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="281.00" text-anchor="end">4 MiB</text>
+<line class="ci" x1="318.45" y1="262.00" x2="318.79" y2="262.00" stroke="#E69F00"/>
+<rect class="mark" x="313.56" y="257.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="336.24" y1="272.00" x2="338.85" y2="272.00" stroke="#009E73"/>
+<path class="mark" d="M337.62,266.00 L331.62,277.00 L343.62,277.00 Z" fill="#009E73"/>
+<line class="ci" x1="318.46" y1="282.00" x2="318.79" y2="282.00" stroke="#CC79A7"/>
+<path class="mark" d="M318.56,275.00 L311.56,282.00 L318.56,289.00 L325.56,282.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="481.49" y1="292.00" x2="484.50" y2="292.00" stroke="#D55E00"/>
+<path class="mark" d="M478.02,287.00 L488.02,297.00 M488.02,287.00 L478.02,297.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="323.00" text-anchor="end">8 MiB</text>
+<line class="ci" x1="350.94" y1="304.00" x2="352.40" y2="304.00" stroke="#E69F00"/>
+<rect class="mark" x="346.43" y="299.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="351.39" y1="314.00" x2="352.96" y2="314.00" stroke="#009E73"/>
+<path class="mark" d="M351.82,308.00 L345.82,319.00 L357.82,319.00 Z" fill="#009E73"/>
+<line class="ci" x1="350.94" y1="324.00" x2="352.40" y2="324.00" stroke="#CC79A7"/>
+<path class="mark" d="M351.43,317.00 L344.43,324.00 L351.43,331.00 L358.43,324.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="401.99" y1="334.00" x2="407.19" y2="334.00" stroke="#D55E00"/>
+<path class="mark" d="M398.88,329.00 L408.88,339.00 M408.88,329.00 L398.88,339.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="150" y="419" text-anchor="end">Phase shift</text>
+<text class="small" x="240" y="369.00" text-anchor="end">2 MiB</text>
+<line class="ci" x1="451.76" y1="350.00" x2="457.14" y2="350.00" stroke="#E69F00"/>
+<rect class="mark" x="448.91" y="345.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="432.95" y1="360.00" x2="440.94" y2="360.00" stroke="#009E73"/>
+<path class="mark" d="M437.63,354.00 L431.63,365.00 L443.63,365.00 Z" fill="#009E73"/>
+<line class="ci" x1="447.78" y1="370.00" x2="453.22" y2="370.00" stroke="#CC79A7"/>
+<path class="mark" d="M449.98,363.00 L442.98,370.00 L449.98,377.00 L456.98,370.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="457.11" y1="380.00" x2="464.03" y2="380.00" stroke="#D55E00"/>
+<path class="mark" d="M454.70,375.00 L464.70,385.00 M464.70,375.00 L454.70,385.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="411.00" text-anchor="end">4 MiB</text>
+<line class="ci" x1="657.69" y1="392.00" x2="677.73" y2="392.00" stroke="#E69F00"/>
+<rect class="mark" x="667.01" y="387.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="1079.81" y1="402.00" x2="1111.55" y2="402.00" stroke="#009E73"/>
+<path class="mark" d="M1095.80,396.00 L1089.80,407.00 L1101.80,407.00 Z" fill="#009E73"/>
+<line class="ci" x1="657.21" y1="412.00" x2="677.02" y2="412.00" stroke="#CC79A7"/>
+<path class="mark" d="M671.29,405.00 L664.29,412.00 L671.29,419.00 L678.29,412.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="665.09" y1="422.00" x2="690.62" y2="422.00" stroke="#D55E00"/>
+<path class="mark" d="M677.98,417.00 L687.98,427.00 M687.98,417.00 L677.98,427.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="453.00" text-anchor="end">8 MiB</text>
+<line class="ci" x1="474.43" y1="434.00" x2="482.30" y2="434.00" stroke="#E69F00"/>
+<rect class="mark" x="471.57" y="429.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="486.12" y1="444.00" x2="493.76" y2="444.00" stroke="#009E73"/>
+<path class="mark" d="M490.18,438.00 L484.18,449.00 L496.18,449.00 Z" fill="#009E73"/>
+<line class="ci" x1="474.41" y1="454.00" x2="482.30" y2="454.00" stroke="#CC79A7"/>
+<path class="mark" d="M476.57,447.00 L469.57,454.00 L476.57,461.00 L483.57,454.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="478.01" y1="464.00" x2="484.45" y2="464.00" stroke="#D55E00"/>
+<path class="mark" d="M475.15,459.00 L485.15,469.00 M485.15,459.00 L475.15,469.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="150" y="549" text-anchor="end">Cyclic pressure</text>
+<text class="small" x="240" y="499.00" text-anchor="end">2 MiB</text>
+<line class="ci" x1="435.05" y1="480.00" x2="435.05" y2="480.00" stroke="#E69F00"/>
+<rect class="mark" x="430.05" y="475.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="435.05" y1="490.00" x2="435.05" y2="490.00" stroke="#009E73"/>
+<path class="mark" d="M435.05,484.00 L429.05,495.00 L441.05,495.00 Z" fill="#009E73"/>
+<line class="ci" x1="435.05" y1="500.00" x2="435.05" y2="500.00" stroke="#CC79A7"/>
+<path class="mark" d="M435.05,493.00 L428.05,500.00 L435.05,507.00 L442.05,500.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="435.05" y1="510.00" x2="435.05" y2="510.00" stroke="#D55E00"/>
+<path class="mark" d="M430.05,505.00 L440.05,515.00 M440.05,505.00 L430.05,515.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="541.00" text-anchor="end">4 MiB</text>
+<line class="ci" x1="435.05" y1="522.00" x2="435.05" y2="522.00" stroke="#E69F00"/>
+<rect class="mark" x="430.05" y="517.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="435.02" y1="532.00" x2="435.04" y2="532.00" stroke="#009E73"/>
+<path class="mark" d="M435.02,526.00 L429.02,537.00 L441.02,537.00 Z" fill="#009E73"/>
+<line class="ci" x1="435.05" y1="542.00" x2="435.05" y2="542.00" stroke="#CC79A7"/>
+<path class="mark" d="M435.05,535.00 L428.05,542.00 L435.05,549.00 L442.05,542.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="435.05" y1="552.00" x2="435.05" y2="552.00" stroke="#D55E00"/>
+<path class="mark" d="M430.05,547.00 L440.05,557.00 M440.05,547.00 L430.05,557.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="583.00" text-anchor="end">8 MiB</text>
+<line class="ci" x1="435.05" y1="564.00" x2="435.05" y2="564.00" stroke="#E69F00"/>
+<rect class="mark" x="430.05" y="559.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="320.10" y1="574.00" x2="321.08" y2="574.00" stroke="#009E73"/>
+<path class="mark" d="M320.88,568.00 L314.88,579.00 L326.88,579.00 Z" fill="#009E73"/>
+<line class="ci" x1="435.05" y1="584.00" x2="435.05" y2="584.00" stroke="#CC79A7"/>
+<path class="mark" d="M435.05,577.00 L428.05,584.00 L435.05,591.00 L442.05,584.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="435.05" y1="594.00" x2="435.05" y2="594.00" stroke="#D55E00"/>
+<path class="mark" d="M430.05,589.00 L440.05,599.00 M440.05,589.00 L430.05,599.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="150" y="679" text-anchor="end">Markov clusters</text>
+<text class="small" x="240" y="629.00" text-anchor="end">2 MiB</text>
+<line class="ci" x1="576.31" y1="610.00" x2="582.58" y2="610.00" stroke="#E69F00"/>
+<rect class="mark" x="573.53" y="605.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="702.95" y1="620.00" x2="710.89" y2="620.00" stroke="#009E73"/>
+<path class="mark" d="M706.97,614.00 L700.97,625.00 L712.97,625.00 Z" fill="#009E73"/>
+<line class="ci" x1="541.23" y1="630.00" x2="546.70" y2="630.00" stroke="#CC79A7"/>
+<path class="mark" d="M544.89,623.00 L537.89,630.00 L544.89,637.00 L551.89,630.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="597.75" y1="640.00" x2="602.96" y2="640.00" stroke="#D55E00"/>
+<path class="mark" d="M595.83,635.00 L605.83,645.00 M605.83,635.00 L595.83,645.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="671.00" text-anchor="end">4 MiB</text>
+<line class="ci" x1="443.26" y1="652.00" x2="447.17" y2="652.00" stroke="#E69F00"/>
+<rect class="mark" x="440.79" y="647.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="680.01" y1="662.00" x2="694.59" y2="662.00" stroke="#009E73"/>
+<path class="mark" d="M689.84,656.00 L683.84,667.00 L695.84,667.00 Z" fill="#009E73"/>
+<line class="ci" x1="441.38" y1="672.00" x2="444.61" y2="672.00" stroke="#CC79A7"/>
+<path class="mark" d="M443.61,665.00 L436.61,672.00 L443.61,679.00 L450.61,672.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="466.18" y1="682.00" x2="470.04" y2="682.00" stroke="#D55E00"/>
+<path class="mark" d="M463.73,677.00 L473.73,687.00 M473.73,677.00 L463.73,687.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="713.00" text-anchor="end">8 MiB</text>
+<line class="ci" x1="418.06" y1="694.00" x2="426.09" y2="694.00" stroke="#E69F00"/>
+<rect class="mark" x="416.04" y="689.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="628.40" y1="704.00" x2="642.09" y2="704.00" stroke="#009E73"/>
+<path class="mark" d="M636.24,698.00 L630.24,709.00 L642.24,709.00 Z" fill="#009E73"/>
+<line class="ci" x1="417.56" y1="714.00" x2="425.43" y2="714.00" stroke="#CC79A7"/>
+<path class="mark" d="M420.47,707.00 L413.47,714.00 L420.47,721.00 L427.47,714.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="432.48" y1="724.00" x2="441.90" y2="724.00" stroke="#D55E00"/>
+<path class="mark" d="M433.81,719.00 L443.81,729.00 M443.81,719.00 L433.81,729.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="150" y="809" text-anchor="end">IID uniform</text>
+<text class="small" x="240" y="759.00" text-anchor="end">2 MiB</text>
+<line class="ci" x1="434.04" y1="740.00" x2="435.42" y2="740.00" stroke="#E69F00"/>
+<rect class="mark" x="429.69" y="735.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="431.69" y1="750.00" x2="432.43" y2="750.00" stroke="#009E73"/>
+<path class="mark" d="M431.97,744.00 L425.97,755.00 L437.97,755.00 Z" fill="#009E73"/>
+<line class="ci" x1="434.04" y1="760.00" x2="435.42" y2="760.00" stroke="#CC79A7"/>
+<path class="mark" d="M434.69,753.00 L427.69,760.00 L434.69,767.00 L441.69,760.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="434.31" y1="770.00" x2="435.63" y2="770.00" stroke="#D55E00"/>
+<path class="mark" d="M429.93,765.00 L439.93,775.00 M439.93,765.00 L429.93,775.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="801.00" text-anchor="end">4 MiB</text>
+<line class="ci" x1="434.68" y1="782.00" x2="435.40" y2="782.00" stroke="#E69F00"/>
+<rect class="mark" x="430.00" y="777.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="432.36" y1="792.00" x2="433.86" y2="792.00" stroke="#009E73"/>
+<path class="mark" d="M432.75,786.00 L426.75,797.00 L438.75,797.00 Z" fill="#009E73"/>
+<line class="ci" x1="434.71" y1="802.00" x2="435.40" y2="802.00" stroke="#CC79A7"/>
+<path class="mark" d="M435.00,795.00 L428.00,802.00 L435.00,809.00 L442.00,802.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="434.92" y1="812.00" x2="435.77" y2="812.00" stroke="#D55E00"/>
+<path class="mark" d="M430.19,807.00 L440.19,817.00 M440.19,807.00 L430.19,817.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="240" y="843.00" text-anchor="end">8 MiB</text>
+<line class="ci" x1="433.36" y1="824.00" x2="435.71" y2="824.00" stroke="#E69F00"/>
+<rect class="mark" x="428.90" y="819.00" width="10" height="10" fill="#E69F00"/>
+<line class="ci" x1="430.98" y1="834.00" x2="432.87" y2="834.00" stroke="#009E73"/>
+<path class="mark" d="M431.60,828.00 L425.60,839.00 L437.60,839.00 Z" fill="#009E73"/>
+<line class="ci" x1="433.36" y1="844.00" x2="435.71" y2="844.00" stroke="#CC79A7"/>
+<path class="mark" d="M433.90,837.00 L426.90,844.00 L433.90,851.00 L440.90,844.00 Z" fill="#CC79A7"/>
+<line class="ci" x1="433.56" y1="854.00" x2="436.04" y2="854.00" stroke="#D55E00"/>
+<path class="mark" d="M429.05,849.00 L439.05,859.00 M439.05,849.00 L429.05,859.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<rect class="mark" x="200.00" y="935.00" width="10" height="10" fill="#E69F00"/>
+<text class="small" x="218" y="944">SLRU</text>
+<path class="mark" d="M445.00,934.00 L439.00,945.00 L451.00,945.00 Z" fill="#009E73"/>
+<text class="small" x="458" y="944">TinyLFU</text>
+<path class="mark" d="M685.00,933.00 L678.00,940.00 L685.00,947.00 L692.00,940.00 Z" fill="#CC79A7"/>
+<text class="small" x="698" y="944">Router admit</text>
+<path class="mark" d="M920.00,935.00 L930.00,945.00 M930.00,935.00 L920.00,945.00" fill="none" stroke="#D55E00" stroke-width="3"/>
+<text class="small" x="938" y="944">Router prefetch</text>
+<text class="small" x="35" y="982">Source: summary.json regenerated from observations.jsonl · exploratory unadjusted cells · no omnibus claim or host timing</text>
+</svg>
