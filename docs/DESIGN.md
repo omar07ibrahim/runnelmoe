@@ -13,16 +13,23 @@ exercise a complete decoder path:
 
 1. a fixed deterministic tokenizer boundary;
 2. token embedding and RMS normalization;
-3. one-head causal attention with explicit prefill/decode state;
+3. two-head causal attention with explicit prefill/decode state;
 4. stable top-2 routing with deterministic tie-breaking;
 5. independently stored gated-MLP experts and weighted dispatch;
 6. residual composition, final normalization, and LM projection; and
-7. greedy plus seeded sampling generation.
+7. deterministic greedy generation.
 
 Default fixture dimensions are intentionally hand-inspectable: vocabulary 32,
 hidden width 8, one decoder block, four experts, top two selected, expert width
-12, and a short context cap. The generator is seeded and uses no downloaded
-data.
+12, and a short context cap. Weights are deterministically formula-generated
+from tensor ID and row-major index; there is no seed and no downloaded data.
+Seeded sampling is deliberately deferred to the scheduler/serving milestones.
+
+Tiny-v1 deliberately has no positional encoding. In this one-layer fixture,
+the final-token result is therefore invariant to permutations of the preceding
+token multiset. It still exercises causal state, parser, routing, expert, and
+generation boundaries, but it is not evidence of language quality or a
+production model architecture.
 
 ## Architecture
 
@@ -90,8 +97,15 @@ Partial unverified bytes never become cache-resident.
 
 ## Runtime invariants
 
+These are end-state system invariants. M1 implements the numerical contract,
+byte identity/integrity, schema failure behavior, and an eager artifact budget
+for a trusted local directory. Descriptor-relative path safety, the complete
+memory ledger, publication, cache leases, and scheduling close in M2 and M5.
+
 1. **Numerical semantics:** stable top-k orders by descending score and then
-   ascending expert ID. Scalar f32 accumulation order is specified. Optimized
+   ascending expert ID. The scalar reference accumulates dot-product and RMS
+   input dimensions in ascending index order, attention values in ascending
+   causal-position order, and selected experts in router-rank order. Optimized
    paths meet the declared tolerance; greedy token IDs match exactly.
 2. **Identity:** every consumed byte belongs to the manifest's root identity
    and a length-checked SHA-256 object. No mutable path is trusted after open.
@@ -111,7 +125,8 @@ Partial unverified bytes never become cache-resident.
 
 ## Artifact contract
 
-RMOA version 1 is specified by [the format contract](FORMAT.md) and ADR-0002.
+RMOA version 1 is specified by [the format contract](FORMAT.md), ADR-0002, and
+[the M1 runtime decision](adr/0003-tiny-reference-runtime.md).
 The bounded JSON manifest points only to lowercase SHA-256 object IDs in a
 derived `objects/sha256/` namespace. Tensor descriptors have a semantic role,
 dtype, shape, logical length, object digest, and a required digest-bound page

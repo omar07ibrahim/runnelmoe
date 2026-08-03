@@ -1,0 +1,170 @@
+{
+  "fixture": "runnel-tiny-causal-moe-v1",
+  "generated_ids": [
+    15,
+    11,
+    20,
+    9
+  ],
+  "input_ids": [
+    1,
+    14,
+    16,
+    6
+  ],
+  "positions": [
+    {
+      "position": 0,
+      "router_scores": [
+        0.350519568,
+        1.259791851,
+        -0.452069581,
+        -0.872163892
+      ],
+      "selected_experts": [
+        1,
+        0
+      ],
+      "selected_weights": [
+        0.712851226,
+        0.287148774
+      ],
+      "source": "input",
+      "token_id": 1
+    },
+    {
+      "position": 1,
+      "router_scores": [
+        0.247952178,
+        1.294708729,
+        -0.41036582,
+        -0.8812114
+      ],
+      "selected_experts": [
+        1,
+        0
+      ],
+      "selected_weights": [
+        0.740151584,
+        0.259848416
+      ],
+      "source": "input",
+      "token_id": 14
+    },
+    {
+      "position": 2,
+      "router_scores": [
+        -0.165320367,
+        -1.077246666,
+        0.1883443,
+        0.968718767
+      ],
+      "selected_experts": [
+        3,
+        2
+      ],
+      "selected_weights": [
+        0.685760856,
+        0.314239204
+      ],
+      "source": "input",
+      "token_id": 16
+    },
+    {
+      "position": 3,
+      "router_scores": [
+        -0.926416397,
+        -0.328624785,
+        0.545811594,
+        -0.648194969
+      ],
+      "selected_experts": [
+        2,
+        1
+      ],
+      "selected_weights": [
+        0.705667973,
+        0.294332027
+      ],
+      "source": "input",
+      "token_id": 6
+    },
+    {
+      "position": 4,
+      "router_scores": [
+        -0.570136845,
+        0.335688353,
+        0.460467517,
+        -1.657125235
+      ],
+      "selected_experts": [
+        2,
+        1
+      ],
+      "selected_weights": [
+        0.531154394,
+        0.468845636
+      ],
+      "source": "generated",
+      "token_id": 15
+    },
+    {
+      "position": 5,
+      "router_scores": [
+        -0.455173343,
+        0.518869638,
+        0.009277493,
+        -0.757303178
+      ],
+      "selected_experts": [
+        1,
+        2
+      ],
+      "selected_weights": [
+        0.624710858,
+        0.375289142
+      ],
+      "source": "generated",
+      "token_id": 11
+    },
+    {
+      "position": 6,
+      "router_scores": [
+        0.905288577,
+        0.048109934,
+        -0.56737268,
+        1.63624835
+      ],
+      "selected_experts": [
+        3,
+        0
+      ],
+      "selected_weights": [
+        0.675015807,
+        0.324984133
+      ],
+      "source": "generated",
+      "token_id": 20
+    },
+    {
+      "position": 7,
+      "router_scores": [
+        -1.374272108,
+        0.346727967,
+        0.737005711,
+        -1.796283484
+      ],
+      "selected_experts": [
+        2,
+        1
+      ],
+      "selected_weights": [
+        0.596349537,
+        0.403650433
+      ],
+      "source": "generated",
+      "token_id": 9
+    }
+  ],
+  "prompt": "moe"
+}

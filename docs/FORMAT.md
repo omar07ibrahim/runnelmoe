@@ -3,6 +3,12 @@
 RMOA (RunnelMoE Object Artifact) is an immutable, content-addressed checkpoint
 format. This document is the normative version-1 contract.
 
+Implementation status matters: M1 implements the canonical manifest schema,
+limits, eager memory budget, whole-object/page-table/page verification, and a
+small local-filesystem convenience reader. Sections explicitly marked **M2
+target** define the descriptor-safe storage/publication contract and are not an
+M1 claim.
+
 ## Layout and identity
 
     artifact/
@@ -128,30 +134,32 @@ Format ceilings are checked before allocation:
 | Aggregate page-table bytes | 1 GiB |
 
 These are interoperability ceilings, not safe defaults. Unless an operator
-explicitly lowers or raises them, the runtime accepts at most a 1 MiB manifest,
+explicitly lowers or raises them, the M1 reader accepts at most a 1 MiB manifest,
 4,096 objects, 16,384 tensors, 2 GiB per object, 2 GiB aggregate object bytes,
 8 MiB per page table, and 64 MiB aggregate page-table bytes. Raising a default
-cannot exceed the format ceiling. Every ingestion, including one using
-defaults, performs a worst-case preflight that includes current CAS usage, all
-staging bytes, newly published bytes, and verified orphan entries while
-preserving the configured disk reserve. Hash loops check cancellation and
-deadline at every bounded buffer or page.
+cannot exceed the format ceiling. Its independent eager budget defaults to 256
+MiB and covers retained manifest, object, and page-table bytes.
 
-The memory budget is independent: metadata, page tables, open-handle state,
-resident pages, in-flight capacity, scratch, queues, and sequence state must be
-reserved before use.
+M2 ingestion will additionally perform a worst-case preflight that includes
+current CAS usage, all staging bytes, newly published bytes, and verified
+orphan entries while preserving the configured disk reserve. Its hash loops
+will check cancellation and deadline at every bounded buffer or page.
 
-## Filesystem and publication rules
+The full M2 runtime memory budget is independent: metadata, page tables,
+open-handle state, resident pages, in-flight capacity, scratch, queues, and
+sequence state must be reserved before use.
 
-On Linux, the loader retains file descriptors for the artifact root and both
-digest directories and resolves children with `openat2` using
+## Filesystem and publication rules — M2 target
+
+On Linux, the M2 loader will retain file descriptors for the artifact root and
+both digest directories and resolve children with `openat2` using
 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`. A portable
 fallback walks fixed path components with directory-relative `openat`,
 `O_NOFOLLOW`, and `fstat`. It requires directories/regular files owned by
 the expected handles and never reopens a checked pathname. Exact length is
 checked on the retained regular-file descriptor.
 
-Ingestion creates a randomly named sibling staging file with
+M2 ingestion will create a randomly named sibling staging file with
 `O_CREAT | O_EXCL` and mode 0600. It writes with bounded buffers, verifies
 length and hashes, flushes and `fsync`s the file, then publishes without
 replacement using `renameat2(RENAME_NOREPLACE)`. Where unavailable, a
@@ -162,8 +170,9 @@ unreferenced content-addressed files as well as unaddressed staging files.
 Orphans are safe to ignore and may be garbage-collected only by comparing
 digests against retained manifests; partial files are never addressable.
 
-The project CAS has a configured disk budget; the host default is the smaller
-of 2 GiB and available bytes above the mandatory 2 GiB filesystem reserve.
+The M2 project CAS will have a configured disk budget; the host default is the
+smaller of 2 GiB and available bytes above the mandatory 2 GiB filesystem
+reserve.
 Staging and orphan bytes count against it. Ingestion and garbage collection
 hold a project-owned transaction lock. On cancellation, newly published
 digests are removed only if no retained manifest references them. Garbage
@@ -172,12 +181,20 @@ and deletes only unreferenced regular digest files; it never follows links.
 
 ## Verified reads
 
-The storage API reads whole logical pages. It verifies the retained page-table
-entry before transitioning a buffer from `loading` to `resident`. Consumers
-may receive tensor slices only after every intersecting page verifies. Short
-reads, extra bytes, hash mismatch, mutation, cancellation, or deadline reject
-the operation; no best-effort tensor is returned.
+The M1 convenience reader assumes a trusted, non-concurrently-mutated artifact
+directory. On Unix it opens leaf files nonblocking with `O_NOFOLLOW`, rejects
+non-regular inputs, bounds each read, and eagerly verifies all declared bytes
+before exposure. It does not yet retain directory descriptors or defend
+ancestor-directory replacement.
 
-Accepted and rejected canonical vectors, every truncation boundary, overflow
-cases, reordered valid pages, and filesystem substitutions are committed with
-the M1 parser before that parser is considered supported.
+The M2 storage API will read whole logical pages. It will verify the retained
+page-table entry before transitioning a buffer from `loading` to `resident`.
+Consumers may receive tensor slices only after every intersecting page
+verifies. Short reads, extra bytes, hash mismatch, mutation, cancellation, or
+deadline reject the operation; no best-effort tensor is returned.
+
+M1 commits accepted and rejected canonical vectors, every manifest and
+page-table truncation boundary, object truncation cases, checked overflow,
+reordered valid pages, leaf symlink/FIFO rejection, and digest corruption.
+Concurrent filesystem substitution, cancellation, deadline, short positional
+read, and publication fault injection close with M2.

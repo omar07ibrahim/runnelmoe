@@ -2,12 +2,14 @@
 
 ## Assets and trust boundaries
 
-RunnelMoE protects host availability, bounded memory/disk use, numerical
-integrity, artifact identity, request isolation, and confidentiality of local
-prompts/tokens. The runtime binary and compiled adapters are trusted. Model
-artifacts, manifests, HTTP requests, client disconnect timing, and storage
-failures are untrusted. The operating system, local administrator, compiler,
-and cryptographic implementation are outside this model.
+The completed RunnelMoE system is intended to protect host availability,
+bounded memory/disk use, numerical integrity, artifact identity, request
+isolation, and confidentiality of local prompts/tokens. Controls become claims
+only at their roadmap gate. The runtime binary and compiled adapters are
+trusted. Model artifacts and manifests are untrusted; later HTTP requests,
+client disconnect timing, and storage failures join that boundary. The
+operating system, local administrator, compiler, and cryptographic
+implementation are outside this model.
 
 Version 1 is a single-user localhost service, not a hostile multi-tenant
 sandbox. SHA-256 proves byte identity against a trusted manifest; it does not
@@ -15,6 +17,14 @@ prove publisher authenticity. Users must obtain expected root digests through
 a trusted channel.
 
 ## Security invariants
+
+M1 enforces bounded canonical parsing, digest-derived leaf names, exact
+length/SHA/page verification, finite tensors and numerical outputs, a fixed
+adapter schema, an eager retained-byte budget, and content-redacted external
+errors. Its local convenience reader rejects Unix leaf symlinks and special
+files, but assumes no concurrent mutation or ancestor-directory substitution.
+
+The cross-milestone system invariants are:
 
 - Parse limits are enforced before allocation or multiplication.
 - Manifest data never supplies an absolute/relative object path or URL.
@@ -30,25 +40,25 @@ a trusted channel.
 
 ## Threats and mitigations
 
-| Threat | Controls | Verification |
-| --- | --- | --- |
-| Path traversal or symlink substitution | retained directory FDs, digest-derived names, Linux `openat2` beneath/no-symlink resolution or component-wise `openat(O_NOFOLLOW)`, `fstat`, never reopen | malicious manifest/filesystem tests |
-| Manifest allocation bomb | byte/count/rank/string caps and checked arithmetic before reserve | boundary tests and parser fuzzing |
-| Truncation, mutation, or reordered pages | exact positional reads, expected lengths, per-object/page SHA-256, opened handles | fault injection at every page |
-| Cross-artifact object replay | root manifest identity plus object role/shape binding | swap valid objects between fixtures |
-| Partial-object publication | same-directory exclusive staging, hash and `fsync`, no-replace rename/link, parent `fsync`, manifest last | cancellation/crash at each state transition |
-| Duplicate concurrent load | one in-flight owner, waiters share verified completion/error | deterministic race tests and Loom where practical |
-| Use-after-evict | reference-counted page leases; retire before reclaim | state-machine/property tests and Miri |
-| Integer overflow/shape confusion | checked add/multiply/rounding and exact dtype-byte validation | generated boundary corpus |
-| NaN/Inf metadata or unstable routing | finite/range checks and specified score/tie policy | special-value and tie tests |
-| Compression bomb | compression unsupported in RMOA v1 | reject compression flags |
-| Memory/queue denial of service | reserve capacity before allocation/submission; charge buffers, alignment, metadata, waiters, state, scratch, and channels; finite operational artifact caps | low-budget and overload tests |
-| Slow client or abandoned SSE | deadlines, bounded output channel, disconnect cancellation | black-box stalled/disconnect tests |
-| High-cardinality telemetry | bounded metric labels; IDs only in sampled trace stream | metrics cardinality test |
-| Secret/prompt disclosure | structured allowlisted fields, no bodies/tokens, sanitized errors | log capture assertions |
-| Illegal SIMD or memory unsafety | scalar fallback, runtime CPUID, narrow C ABI, sanitizer/random differential tests | M4 gate |
-| Dependency or CI compromise | lockfiles, minimal dependencies, pinned CI action revisions, dependency review | CI and release audit |
-| Disk exhaustion | artifact/result caps, free-space reserve, bounded caches, no large checkpoints | preflight and low-space tests |
+| Threat | Controls | Verification | Gate |
+| --- | --- | --- | --- |
+| Path traversal or symlink substitution | digest-derived names now; retained directory FDs plus `openat2` beneath/no-symlink or component-wise `openat(O_NOFOLLOW)` next | M1 leaf FIFO/symlink tests; M2 concurrent substitution tests | M1/M2 |
+| Manifest allocation bomb | byte/count/rank/string caps and checked arithmetic before reserve | boundary tests now; fuzzing next | M1/M2 |
+| Truncation, mutation, or reordered pages | eager exact length, whole/page SHA now; bounded positional reads and retained handles next | mutation corpus now; I/O fault injection next | M1/M2 |
+| Cross-artifact object replay | root manifest identity plus object role/shape binding | expected-ID rejection now; valid-object swap fault injection next | M1/M2 |
+| Partial-object publication | exclusive staging, hash and `fsync`, no-replace publication, manifest last | cancellation/crash at each transition | M2 |
+| Duplicate concurrent load | one in-flight owner, waiters share completion/error | race tests and Loom where practical | M2 |
+| Use-after-evict | reference-counted page leases; retire before reclaim | state-machine/property tests and Miri | M2 |
+| Integer overflow/shape confusion | checked arithmetic and exact dtype/byte/shape validation | generated mutation corpus | M1 |
+| NaN/Inf or unstable routing | finite checks and specified score/tie policy | special-value and tie tests | M1 |
+| Compression bomb | compression absent from and rejected by RMOA v1 | exact-schema tests | M1 |
+| Memory/queue denial of service | eager retained-byte cap now; full ledger/admission and bounded queues next | low-budget parser tests now; overload tests next | M1/M2/M5 |
+| Slow client or abandoned SSE | deadlines, bounded output channel, disconnect cancellation | stalled/disconnect black-box tests | M6 |
+| High-cardinality telemetry | bounded metric labels; IDs only in sampled traces | metrics cardinality test | M6 |
+| Secret/prompt disclosure | allowlisted output and content-redacted errors | CLI stderr capture now; server log capture next | M1/M6 |
+| Illegal SIMD or memory unsafety | scalar fallback, runtime CPUID, narrow C ABI | sanitizer/random differential tests | M4 |
+| Dependency or CI compromise | lockfiles, exact dependencies, pinned CI action revisions | CI and release audit | ongoing |
+| Disk exhaustion | no committed checkpoints now; reserve-aware CAS and bounded results next | disk preflight and low-space tests | M1/M2 |
 
 ## Parser rejection matrix
 
@@ -60,7 +70,7 @@ record counts; unsupported dtype/encoding; logical/stored size disagreement;
 overlap/misalignment/out-of-file ranges; missing/trailing data; digest
 mismatch; valid page reordering; and unknown required adapter fields.
 
-I/O tests inject short reads, interruption/retry, concurrent truncation,
+M2 I/O tests inject short reads, interruption/retry, concurrent truncation,
 replacement after open, and cancellation before read, during read, during
 hashing, and immediately before publication. No failure may expose verified
 status or leak accounted bytes.
@@ -84,5 +94,8 @@ access must place a reviewed gateway in front, outside this project's default.
 - Floating-point agreement is tolerance-based across compilers/ISAs.
 - Local processes with the same user privileges can observe files and may be
   able to inspect process memory.
+- The M1 eager convenience reader is for a trusted local directory that is not
+  concurrently replaced. Descriptor-relative race resistance and transactional
+  publication are M2 gates.
 
 Security issues should follow [SECURITY.md](../SECURITY.md), not a public issue.

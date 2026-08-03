@@ -1,0 +1,29 @@
+{
+  "fixture": "runnel-tiny-causal-moe-v1",
+  "full_ids": [
+    1,
+    14,
+    16,
+    6,
+    15,
+    11,
+    20,
+    9
+  ],
+  "generated_ids": [
+    15,
+    11,
+    20,
+    9
+  ],
+  "generated_text": "njsh",
+  "input_ids": [
+    1,
+    14,
+    16,
+    6
+  ],
+  "max_new_tokens": 4,
+  "prompt": "moe",
+  "stop_reason": "max_new_tokens"
+}

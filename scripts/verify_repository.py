@@ -32,12 +32,35 @@ REQUIRED = {
     ".github/PULL_REQUEST_TEMPLATE.md",
     ".github/workflows/ci.yml",
     ".gitignore",
+    "Cargo.lock",
+    "Cargo.toml",
     "CITATION.cff",
     "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "LICENSE",
     "NOTICE",
     "README.md",
+    "crates/README.md",
+    "crates/runnel-cli/Cargo.toml",
+    "crates/runnel-cli/src/main.rs",
+    "crates/runnel-cli/tests/cli.rs",
+    "crates/runnel-fixture/Cargo.toml",
+    "crates/runnel-fixture/src/lib.rs",
+    "crates/runnel-format/Cargo.toml",
+    "crates/runnel-format/README.md",
+    "crates/runnel-format/src/artifact.rs",
+    "crates/runnel-format/src/error.rs",
+    "crates/runnel-format/src/json.rs",
+    "crates/runnel-format/src/lib.rs",
+    "crates/runnel-format/src/manifest.rs",
+    "crates/runnel-format/tests/corruption.rs",
+    "crates/runnel-runtime/Cargo.toml",
+    "crates/runnel-runtime/src/error.rs",
+    "crates/runnel-runtime/src/lib.rs",
+    "crates/runnel-runtime/src/model.rs",
+    "crates/runnel-runtime/src/tensor.rs",
+    "crates/runnel-runtime/src/tokenizer.rs",
+    "crates/runnel-runtime/tests/oracle_parity.rs",
     "SECURITY.md",
     "docs/BENCHMARKING.md",
     "docs/CLAIMS.md",
@@ -50,8 +73,27 @@ REQUIRED = {
     "docs/THREAT_MODEL.md",
     "docs/adr/0001-clean-room-and-system-boundaries.md",
     "docs/adr/0002-immutable-tensor-objects.md",
+    "docs/adr/0003-tiny-reference-runtime.md",
     "docs/diagrams/runtime.dot",
     "docs/reviews/M0_REVIEW.md",
+    "docs/reviews/M1_REVIEW.md",
+    "fixtures/README.md",
+    "fixtures/tiny/README.md",
+    "fixtures/tiny/golden_logits.json",
+    "fixtures/tiny/golden_metadata.json",
+    "fixtures/tiny/golden_routes.json",
+    "fixtures/tiny/golden_tokens.json",
+    "fixtures/tiny/spec.json",
+    "oracle/README.md",
+    "oracle/__init__.py",
+    "oracle/generate.py",
+    "oracle/requirements.txt",
+    "oracle/runnel_oracle/__init__.py",
+    "oracle/runnel_oracle/model.py",
+    "oracle/runnel_oracle/spec.py",
+    "oracle/runnel_oracle/tokenizer.py",
+    "oracle/tests/__init__.py",
+    "oracle/tests/test_oracle.py",
     "rust-toolchain.toml",
     "scripts/verify_repository.py",
 }
@@ -240,6 +282,13 @@ def main() -> int:
         if path.is_symlink():
             failures.append(f"symbolic links are not allowed in source: {relative}")
             continue
+        if (
+            relative.parts[:2] == ("fixtures", "tiny")
+            and any(part in {"objects", "page-tables"} for part in relative.parts)
+        ):
+            failures.append(
+                f"{relative}: generated checkpoint bytes must not be committed"
+            )
         size = path.stat().st_size
         if size > MAX_FILE_BYTES:
             failures.append(
