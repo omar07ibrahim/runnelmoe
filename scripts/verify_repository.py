@@ -40,6 +40,7 @@ REQUIRED = {
     "LICENSE",
     "NOTICE",
     "README.md",
+    "benchmarks/README.md",
     "crates/README.md",
     "crates/runnel-cli/Cargo.toml",
     "crates/runnel-cli/src/main.rs",
@@ -124,6 +125,7 @@ REQUIRED = {
     "docs/reviews/M0_REVIEW.md",
     "docs/reviews/M1_REVIEW.md",
     "docs/reviews/M2_REVIEW.md",
+    "docs/reviews/M3_REVIEW.md",
     "fixtures/README.md",
     "fixtures/cache/README.md",
     "fixtures/cache/m2-forced-eviction.jsonl",
@@ -161,6 +163,14 @@ REQUIRED = {
     "benchmarks/raw/m2-data-plane-forced-eviction-20260803/experiment.json",
     "benchmarks/raw/m2-data-plane-forced-eviction-20260803/observations.jsonl",
     "benchmarks/raw/m2-data-plane-forced-eviction-20260803/summary.json",
+    "benchmarks/raw/m3-cache-policies-20260803/environment.json",
+    "benchmarks/raw/m3-cache-policies-20260803/experiment.json",
+    "benchmarks/raw/m3-cache-policies-20260803/figures/optimal-gap.svg",
+    "benchmarks/raw/m3-cache-policies-20260803/figures/paired-change.svg",
+    "benchmarks/raw/m3-cache-policies-20260803/figures/prefetch-accounting.svg",
+    "benchmarks/raw/m3-cache-policies-20260803/observations.jsonl",
+    "benchmarks/raw/m3-cache-policies-20260803/summary.json",
+    "benchmarks/raw/m3-cache-policies-20260803/traces.jsonl",
 }
 
 FORBIDDEN_BYTES = {

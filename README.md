@@ -6,10 +6,10 @@ available RAM. It is designed to make the hard tradeoffs visible: verified
 storage, bounded memory, asynchronous I/O, cache policy, numerical parity,
 request scheduling, and honest measurement.
 
-> Project status: M0 design/provenance, the M1 tiny-reference runtime, and the
-> M2 verified out-of-core data plane have passed their milestone gates. The M3
-> cache-policy simulator is implemented and its preregistered evidence is in
-> progress. No cache-policy performance improvement is claimed yet.
+> Project status: M0 design/provenance, the M1 tiny-reference runtime, the M2
+> verified out-of-core data plane, and M3 cache-policy research have passed
+> their milestone gates. M3 closes a synthetic modeled-traffic gate, not a
+> runtime speedup gate; it makes no production-policy recommendation.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling
@@ -47,8 +47,13 @@ The M3 research harness adds strict policy-neutral JSONL traces, byte LRU,
 SLRU, TinyLFU admission, causal router-aware admission/prefetch, uniform-page
 Bélády/MIN, and a bounded exact variable-byte oracle. It measures modeled
 physical traffic and cache pollution; it does not predict storage latency or
-runtime throughput. The production M2 cache remains independently testable and
-is not silently replaced by a research policy.
+runtime throughput. In the accepted exploratory matrix, the four candidates'
+72 unadjusted interval positions versus LRU split 29 below one, 21 overlapping
+one, and 22 above one. The workload-sensitive
+[raw summary](benchmarks/raw/m3-cache-policies-20260803/summary.json) and
+[M3 review](docs/reviews/M3_REVIEW.md) support no general winner. The production
+M2 cache remains independently testable and is not silently replaced by a
+research policy.
 
 Run the complete artifact-to-token demo after fetching the locked Rust
 dependencies once:
@@ -111,7 +116,7 @@ library.
 
 Executable milestone commands are recorded in
 [development](docs/DEVELOPMENT.md). Raw benchmark outputs, including
-environment metadata, will live under
+environment metadata, live under
 `benchmarks/raw/`; generated summaries will never be the sole evidence for a
 claim.
 

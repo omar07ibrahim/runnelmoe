@@ -176,6 +176,16 @@ python3 scripts/run_m3_experiment.py verify \
   --input benchmarks/raw/m3-cache-policies-YYYYMMDD --check
 ```
 
+The accepted schema-v2 record is
+`benchmarks/raw/m3-cache-policies-20260803/`. It was captured from clean
+implementation commit `fcbaaebb7e211a228ee75d9cab713acc2b9890ac` and published
+in commit `700de98110db58e05f5db24d29bb14f8a482cffc`. The exact canonical
+command, artifact hashes, independent review, and interpretation are in the
+[M3 review](reviews/M3_REVIEW.md). CI runs the archival `verify --check`
+command against this append-only directory. Evidence-bearing pull requests
+must use a merge commit: squashing or rebasing would discard the historical
+implementation commit whose harness blob the archival verifier checks.
+
 Capture performs a fresh two-job locked/offline release build; a caller cannot
 supply a binary. For each of 180 family/replicate pairs it validates and
 discards one expanded canonical trace, independently reconstructs the measured
