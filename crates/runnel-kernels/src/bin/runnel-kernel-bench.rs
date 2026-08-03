@@ -2755,6 +2755,26 @@ mod tests {
         }
     }
 
+    fn unit_failure_fixture() -> (CaseSpec, CellSpec, GeneratedCase, WorkerBuffers) {
+        let specification = CaseSpec {
+            id: "unit-3x5",
+            rows: 3,
+            columns: 5,
+            calls_per_worker: 4,
+            role: "test",
+        };
+        let cell = CellSpec {
+            id: "unit-cell",
+            case_id: specification.id,
+            comparison: Comparison::Avx2,
+            layout: Layout::Natural,
+            workers: 1,
+        };
+        let generated = generate_case(specification, Layout::Natural).unwrap();
+        let buffer = WorkerBuffers::new(specification, cell).unwrap();
+        (specification, cell, generated, buffer)
+    }
+
     #[test]
     fn tables_are_closed_and_resource_bounded() {
         assert_eq!(CASES.len(), 5);
@@ -3118,22 +3138,7 @@ mod tests {
 
     #[test]
     fn post_start_failure_retains_observed_batch_evidence() {
-        let specification = CaseSpec {
-            id: "unit-3x5",
-            rows: 3,
-            columns: 5,
-            calls_per_worker: 4,
-            role: "test",
-        };
-        let cell = CellSpec {
-            id: "unit-cell",
-            case_id: specification.id,
-            comparison: Comparison::Avx2,
-            layout: Layout::Natural,
-            workers: 1,
-        };
-        let generated = generate_case(specification, Layout::Natural).unwrap();
-        let buffer = WorkerBuffers::new(specification, cell).unwrap();
+        let (specification, cell, generated, buffer) = unit_failure_fixture();
         let before_usage = ResourceSnapshot {
             user_cpu_ns: 10,
             system_cpu_ns: 20,
