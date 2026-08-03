@@ -1,0 +1,586 @@
+{
+  "baseline": "synchronous exact verified page reads",
+  "binary_sha256": "sha256:6d853e6d1e8b5f35bcc0a410d0af14afeeda22e237346a9bb9cd07f9e3a194df",
+  "bootstrap": {
+    "confidence_level": 0.95,
+    "resamples": 10000,
+    "seed": 20260803
+  },
+  "build": {
+    "command_argv": [
+      "cargo",
+      "build",
+      "--release",
+      "--locked",
+      "--offline",
+      "-p",
+      "runnel"
+    ],
+    "command_display": "cargo build --release --locked --offline -p runnel",
+    "environment": {
+      "CARGO_BUILD_JOBS": "2",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_TERM_COLOR": "never",
+      "LANG": "C",
+      "LC_ALL": "C",
+      "TZ": "UTC"
+    },
+    "stderr_bytes": 1945,
+    "stdout_bytes": 0,
+    "wall_time_nanoseconds": 30563244188
+  },
+  "candidate": "asynchronous verified byte-aware one-page LRU cache",
+  "command_argv": [
+    "target/release/runnel",
+    "data-plane-demo",
+    "--json"
+  ],
+  "command_display": "target/release/runnel data-plane-demo --json",
+  "correctness_gate": {
+    "parity": true,
+    "passed": true,
+    "projection": {
+      "cache_capacity_bytes": 65536,
+      "fixtures": {
+        "multi_page": {
+          "artifact_id": "sha256:15feda585327bf8e25c124692de1b2e101315185e427b811a07b8eaca54e1630",
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "object_length": 131089,
+          "page_table_digest": "sha256:d748ae45084baf6759c34321fb1f110151dfb33be390f4118d8a196cf0b2a4ab",
+          "page_table_length": 160
+        },
+        "tiny": {
+          "artifact_id": "sha256:e49321cefc980ab59cd449341edfc624ccfc4b0b703cd175184e056d296d9ed3",
+          "object_digest": "sha256:6b2b8a1bbb2854084b1e1fe1e5787a9cfdb021b397e774fc7dbef79ac9d24bf6",
+          "object_length": 7904,
+          "page_table_digest": "sha256:29383b56a150f9e5705f3666ca7707f21bc3fbd663ffd7249f4ecb938da6a62d",
+          "page_table_length": 96
+        }
+      },
+      "generated_ids": [
+        15,
+        11,
+        20,
+        9
+      ],
+      "generated_text": "njsh",
+      "generation_cache": {
+        "bytes_per_generated_token": {
+          "denominator_tokens": 4,
+          "numerator_bytes": 7904
+        },
+        "completed_generated_tokens": 4,
+        "physical_read_bytes": 7904
+      },
+      "max_new_tokens": 4,
+      "metrics": {
+        "accounted": {
+          "active_loads": 0,
+          "inflight_bytes": 0,
+          "leases": 0,
+          "page_pool_bytes": 64,
+          "resident_bytes": 64,
+          "retiring_bytes": 0
+        },
+        "admissions": 4,
+        "coalesced_demands": 0,
+        "demand_bytes": 196642,
+        "evictions": 3,
+        "hits": 1,
+        "misses": 4,
+        "physical_read_bytes": 196625,
+        "prefetch": {
+          "bytes": 0,
+          "coalesced": 0,
+          "dropped": 0,
+          "late": 0,
+          "redundant": 0,
+          "useful": 0,
+          "wasted": 0
+        },
+        "trace_events_dropped": 0
+      },
+      "parity": true,
+      "prompt": "moe",
+      "schema_version": 1,
+      "trace": {
+        "access": "demand",
+        "event_count": 16,
+        "events": [
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "miss",
+            "page_index": 0,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 0
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "load_started",
+            "page_index": 0,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 1
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "admitted",
+            "page_index": 0,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 2
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "miss",
+            "page_index": 1,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 3
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "evicted",
+            "page_index": 0,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 4
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "load_started",
+            "page_index": 1,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 5
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "admitted",
+            "page_index": 1,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 6
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "miss",
+            "page_index": 0,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 7
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "evicted",
+            "page_index": 1,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 8
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "load_started",
+            "page_index": 0,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 9
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "admitted",
+            "page_index": 0,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 10
+          },
+          {
+            "logical_bytes": 17,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "miss",
+            "page_index": 2,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 11
+          },
+          {
+            "logical_bytes": 65536,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "evicted",
+            "page_index": 0,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 12
+          },
+          {
+            "logical_bytes": 17,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "load_started",
+            "page_index": 2,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 13
+          },
+          {
+            "logical_bytes": 17,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "admitted",
+            "page_index": 2,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 14
+          },
+          {
+            "logical_bytes": 17,
+            "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+            "outcome": "hit",
+            "page_index": 2,
+            "page_size": 65536,
+            "reason": "demand",
+            "sequence": 15
+          }
+        ],
+        "outcomes": {
+          "admitted": 4,
+          "cancelled": 0,
+          "evicted": 3,
+          "hit": 1,
+          "late_prefetch": 0,
+          "load_coalesced": 0,
+          "load_failed": 0,
+          "load_started": 4,
+          "miss": 4,
+          "prefetch_coalesced": 0,
+          "prefetch_dropped": 0,
+          "prefetch_redundant": 0,
+          "prefetch_useful": 0,
+          "prefetch_wasted": 0,
+          "retired": 0
+        },
+        "page_indices": [
+          0,
+          1,
+          0,
+          2,
+          2
+        ],
+        "page_lengths": [
+          65536,
+          65536,
+          17
+        ]
+      }
+    },
+    "projection_digest": "sha256:e5f1e605cd7a64177c4965a00ee24e2adcac16314e1c4b09d6de5015ea8bfa6e"
+  },
+  "correctness_tolerance": {
+    "absolute": 0.0,
+    "generated_tokens": "exact",
+    "relative": 0.0,
+    "routing": "exact",
+    "tensor_bytes": "exact"
+  },
+  "expected_mechanism": "Pages are digest-verified before publication, byte-budgeted, and evicted by deterministic LRU state transitions.",
+  "experiment_id": "m2-data-plane-20260803",
+  "fixture": {
+    "digest": "sha256:27022f67b9e28ed222c6f319560ec14f836023bd7445515dbbbc02fe5e7dc6ff",
+    "projection": {
+      "multi_page": {
+        "artifact_id": "sha256:15feda585327bf8e25c124692de1b2e101315185e427b811a07b8eaca54e1630",
+        "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+        "object_length": 131089,
+        "page_table_digest": "sha256:d748ae45084baf6759c34321fb1f110151dfb33be390f4118d8a196cf0b2a4ab",
+        "page_table_length": 160
+      },
+      "tiny": {
+        "artifact_id": "sha256:e49321cefc980ab59cd449341edfc624ccfc4b0b703cd175184e056d296d9ed3",
+        "object_digest": "sha256:6b2b8a1bbb2854084b1e1fe1e5787a9cfdb021b397e774fc7dbef79ac9d24bf6",
+        "object_length": 7904,
+        "page_table_digest": "sha256:29383b56a150f9e5705f3666ca7707f21bc3fbd663ffd7249f4ecb938da6a62d",
+        "page_table_length": 96
+      }
+    }
+  },
+  "git": {
+    "commit": "d7a39055d28049cf6721c4e2b8f599a39f77d7fa",
+    "dirty": false
+  },
+  "harness": {
+    "source": "scripts/run_m2_experiment.py",
+    "source_sha256": "sha256:14bf7389981468eea8cd480a5b41995a36756f15cd7d0f4bcd43a1d9c4057dbb",
+    "version": "runnel.m2-evidence/1"
+  },
+  "harness_invocation_argv": [
+    "python3",
+    "scripts/run_m2_experiment.py",
+    "m2-data-plane-20260803",
+    "--warmups",
+    "3",
+    "--repetitions",
+    "30",
+    "--timeout-seconds",
+    "30",
+    "--bootstrap-seed",
+    "20260803",
+    "--bootstrap-resamples",
+    "10000"
+  ],
+  "harness_invocation_display": "python3 scripts/run_m2_experiment.py m2-data-plane-20260803 --warmups 3 --repetitions 30 --timeout-seconds 30 --bootstrap-seed 20260803 --bootstrap-resamples 10000",
+  "hypothesis": "The asynchronous verified byte-aware cache reproduces the synchronous exact-read baseline and the one-page cache emits the pinned eviction trace.",
+  "measured_repetitions": 30,
+  "primary_metric": {
+    "direction": "higher",
+    "name": "correctness_projection_match_fraction",
+    "unit": "fraction"
+  },
+  "schema_version": 1,
+  "secondary_metrics": [
+    {
+      "direction": "lower",
+      "name": "command_wall_time",
+      "unit": "nanoseconds"
+    },
+    {
+      "direction": "lower",
+      "name": "cache_wait",
+      "unit": "nanoseconds"
+    },
+    {
+      "direction": "lower",
+      "name": "cache_io",
+      "unit": "nanoseconds"
+    },
+    {
+      "direction": "lower",
+      "name": "child_major_page_faults",
+      "unit": "faults"
+    },
+    {
+      "direction": "diagnostic",
+      "name": "physical_read_bytes",
+      "unit": "bytes"
+    },
+    {
+      "direction": "diagnostic",
+      "name": "observed_peak_rss",
+      "unit": "bytes"
+    }
+  ],
+  "seed_schedule": {
+    "bootstrap_seed": 20260803,
+    "trial_order": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29
+    ],
+    "workload_randomness": "none; fixture and trace are deterministic"
+  },
+  "started_at_utc": "2026-08-03T07:47:37Z",
+  "timeout_seconds_per_process": 30.0,
+  "trace": {
+    "digest": "sha256:825fbfa7cdbafec4fabb55faa3b307108c7bb5b082af50e44bcfc9ef5bf3e4f0",
+    "projection": {
+      "access": "demand",
+      "cache_capacity_bytes": 65536,
+      "events": [
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "miss",
+          "page_index": 0,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 0
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "load_started",
+          "page_index": 0,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 1
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "admitted",
+          "page_index": 0,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 2
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "miss",
+          "page_index": 1,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 3
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "evicted",
+          "page_index": 0,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 4
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "load_started",
+          "page_index": 1,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 5
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "admitted",
+          "page_index": 1,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 6
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "miss",
+          "page_index": 0,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 7
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "evicted",
+          "page_index": 1,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 8
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "load_started",
+          "page_index": 0,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 9
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "admitted",
+          "page_index": 0,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 10
+        },
+        {
+          "logical_bytes": 17,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "miss",
+          "page_index": 2,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 11
+        },
+        {
+          "logical_bytes": 65536,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "evicted",
+          "page_index": 0,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 12
+        },
+        {
+          "logical_bytes": 17,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "load_started",
+          "page_index": 2,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 13
+        },
+        {
+          "logical_bytes": 17,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "admitted",
+          "page_index": 2,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 14
+        },
+        {
+          "logical_bytes": 17,
+          "object_digest": "sha256:9bb8fcc8e9d6f6ca3512bcb6daf6f89b6f0134874c9803f8782b100b39c854ae",
+          "outcome": "hit",
+          "page_index": 2,
+          "page_size": 65536,
+          "reason": "demand",
+          "sequence": 15
+        }
+      ],
+      "page_indices": [
+        0,
+        1,
+        0,
+        2,
+        2
+      ],
+      "page_lengths": [
+        65536,
+        65536,
+        17
+      ]
+    }
+  },
+  "warmup_count": 3,
+  "warmup_policy": "Correctness gate first, then excluded warmups; process/file-cache effects after that are intentionally uncontrolled and captured as host noise."
+}

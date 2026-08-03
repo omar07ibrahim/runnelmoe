@@ -27,6 +27,7 @@ pub const CONTEXT_LENGTH: usize = 16;
 pub const RMS_EPSILON: f32 = 1.0 / 4096.0;
 pub const ATTENTION_SCALE: f32 = 0.5;
 pub const PAGE_SIZE: u32 = 65_536;
+pub const MULTI_PAGE_OBJECT_LENGTH: usize = 2 * PAGE_SIZE as usize + 17;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinySpec {
@@ -104,6 +105,18 @@ pub struct FixtureIdentity {
     pub page_table_length: u64,
 }
 
+/// Deterministic three-page RMOA used to exercise storage behavior that the
+/// one-page numerical fixture cannot reach. The final page is exactly 17
+/// bytes, and no generated payload is committed to the repository.
+#[derive(Debug, Clone)]
+pub struct MultiPageFixture {
+    manifest: Vec<u8>,
+    object: Vec<u8>,
+    object_digest: Digest,
+    page_table: Vec<u8>,
+    page_table_digest: Digest,
+}
+
 #[derive(Debug, Error)]
 pub enum FixtureError {
     #[error("could not {operation}: {source}")]
@@ -178,36 +191,94 @@ impl FixtureArtifact {
     /// This deterministic test helper is not the transactional M2 ingestion
     /// path and assumes its newly created root is not concurrently replaced.
     pub fn write_new(&self, root: impl AsRef<Path>) -> Result<FixtureIdentity, FixtureError> {
-        let root = root.as_ref();
-        fs::create_dir(root).map_err(|source| io("create the artifact directory", source))?;
-        let object_parent = root.join("objects");
-        let page_table_parent = root.join("page-tables");
-        fs::create_dir(&object_parent)
-            .map_err(|source| io("create the object parent directory", source))?;
-        fs::create_dir(&page_table_parent)
-            .map_err(|source| io("create the page-table parent directory", source))?;
-        let objects = object_parent.join("sha256");
-        let page_tables = page_table_parent.join("sha256");
-        fs::create_dir(&objects).map_err(|source| io("create the object directory", source))?;
-        fs::create_dir(&page_tables)
-            .map_err(|source| io("create the page-table directory", source))?;
-
-        write_file(
-            page_tables.join(self.page_table_digest.path_component()),
-            &self.page_table,
-            "write the page table",
-        )?;
-        write_file(
-            objects.join(self.object_digest.path_component()),
-            &self.object,
-            "write the tensor object",
-        )?;
-        write_file(
-            root.join("manifest.json"),
+        write_artifact_new(
+            root.as_ref(),
             &self.manifest,
-            "write the manifest",
+            self.object_digest,
+            &self.object,
+            self.page_table_digest,
+            &self.page_table,
         )?;
         Ok(self.identity())
+    }
+}
+
+impl MultiPageFixture {
+    #[must_use]
+    pub fn build() -> Self {
+        let object = (0..MULTI_PAGE_OBJECT_LENGTH)
+            .map(|index| ((index as u64 * 131 + 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let object_digest = Digest::of(&object);
+        let page_table = build_page_table(&object, object_digest);
+        let page_table_digest = Digest::of(&page_table);
+        let manifest = build_storage_manifest(
+            object_digest,
+            object.len(),
+            page_table_digest,
+            page_table.len(),
+        );
+        Self {
+            manifest,
+            object,
+            object_digest,
+            page_table,
+            page_table_digest,
+        }
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> FixtureIdentity {
+        FixtureIdentity {
+            artifact_id: Digest::of(&self.manifest),
+            object_digest: self.object_digest,
+            object_length: self.object.len() as u64,
+            page_table_digest: self.page_table_digest,
+            page_table_length: self.page_table.len() as u64,
+        }
+    }
+
+    #[must_use]
+    pub fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest
+    }
+
+    #[must_use]
+    pub fn object_bytes(&self) -> &[u8] {
+        &self.object
+    }
+
+    #[must_use]
+    pub fn page_table_bytes(&self) -> &[u8] {
+        &self.page_table
+    }
+
+    #[must_use]
+    pub fn to_parts(&self) -> ArtifactBytes {
+        ArtifactBytes {
+            manifest: self.manifest.clone(),
+            objects: [(self.object_digest, self.object.clone())].into(),
+            page_tables: [(self.page_table_digest, self.page_table.clone())].into(),
+        }
+    }
+
+    /// Materializes the source fixture for descriptor-safe import/read tests.
+    pub fn write_new(&self, root: impl AsRef<Path>) -> Result<FixtureIdentity, FixtureError> {
+        write_artifact_new(
+            root.as_ref(),
+            &self.manifest,
+            self.object_digest,
+            &self.object,
+            self.page_table_digest,
+            &self.page_table,
+        )?;
+        Ok(self.identity())
+    }
+}
+
+impl Default for MultiPageFixture {
+    fn default() -> Self {
+        Self::build()
     }
 }
 
@@ -369,6 +440,91 @@ fn build_manifest(
     .into_bytes()
 }
 
+fn build_storage_manifest(
+    object_digest: Digest,
+    object_length: usize,
+    page_table_digest: Digest,
+    page_table_length: usize,
+) -> Vec<u8> {
+    format!(
+        concat!(
+            "{{",
+            "\"adapter\":{{\"id\":\"runnel.tiny-causal-moe\",\"version\":1}},",
+            "\"format\":\"rmoa\",",
+            "\"model\":{{",
+            "\"context_length\":16,",
+            "\"expert_hidden_size\":12,",
+            "\"hidden_size\":8,",
+            "\"num_experts\":4,",
+            "\"num_heads\":2,",
+            "\"num_layers\":1,",
+            "\"top_k\":2,",
+            "\"vocab_size\":32",
+            "}},",
+            "\"objects\":[{{",
+            "\"digest\":\"{}\",",
+            "\"length\":{},",
+            "\"page_size\":65536,",
+            "\"page_table\":\"{}\",",
+            "\"page_table_length\":{}",
+            "}}],",
+            "\"tensors\":[{{",
+            "\"dtype\":\"u8\",",
+            "\"id\":0,",
+            "\"length\":{},",
+            "\"object\":\"{}\",",
+            "\"offset\":0,",
+            "\"role\":\"storage.payload\",",
+            "\"shape\":[{}]",
+            "}}],",
+            "\"tokenizer\":{{\"id\":\"runnel.ascii32\",\"version\":1,\"vocab_size\":32}},",
+            "\"version\":1",
+            "}}\n"
+        ),
+        object_digest,
+        object_length,
+        page_table_digest,
+        page_table_length,
+        object_length,
+        object_digest,
+        object_length,
+    )
+    .into_bytes()
+}
+
+fn write_artifact_new(
+    root: &Path,
+    manifest: &[u8],
+    object_digest: Digest,
+    object: &[u8],
+    page_table_digest: Digest,
+    page_table: &[u8],
+) -> Result<(), FixtureError> {
+    fs::create_dir(root).map_err(|source| io("create the artifact directory", source))?;
+    let object_parent = root.join("objects");
+    let page_table_parent = root.join("page-tables");
+    fs::create_dir(&object_parent)
+        .map_err(|source| io("create the object parent directory", source))?;
+    fs::create_dir(&page_table_parent)
+        .map_err(|source| io("create the page-table parent directory", source))?;
+    let objects = object_parent.join("sha256");
+    let page_tables = page_table_parent.join("sha256");
+    fs::create_dir(&objects).map_err(|source| io("create the object directory", source))?;
+    fs::create_dir(&page_tables).map_err(|source| io("create the page-table directory", source))?;
+
+    write_file(
+        page_tables.join(page_table_digest.path_component()),
+        page_table,
+        "write the page table",
+    )?;
+    write_file(
+        objects.join(object_digest.path_component()),
+        object,
+        "write the tensor object",
+    )?;
+    write_file(root.join("manifest.json"), manifest, "write the manifest")
+}
+
 fn write_file(path: PathBuf, bytes: &[u8], operation: &'static str) -> Result<(), FixtureError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -436,5 +592,28 @@ mod tests {
         let artifact = Artifact::open(&root, Limits::default()).unwrap();
         assert_eq!(artifact.artifact_id(), fixture.identity().artifact_id);
         assert!(fixture.write_new(&root).is_err());
+    }
+
+    #[test]
+    fn multi_page_fixture_has_two_full_pages_and_a_short_tail() {
+        let fixture = MultiPageFixture::build();
+        assert_eq!(fixture.object_bytes().len(), MULTI_PAGE_OBJECT_LENGTH);
+        assert_eq!(fixture.object_bytes().chunks(PAGE_SIZE as usize).count(), 3);
+        assert_eq!(
+            fixture
+                .object_bytes()
+                .chunks(PAGE_SIZE as usize)
+                .last()
+                .unwrap()
+                .len(),
+            17
+        );
+        assert_eq!(fixture.page_table_bytes().len(), 64 + 3 * 32);
+        let artifact = Artifact::from_bytes(fixture.to_parts(), Limits::default()).unwrap();
+        assert_eq!(artifact.artifact_id(), fixture.identity().artifact_id);
+        assert_eq!(
+            artifact.tensor_by_role("storage.payload").unwrap().bytes,
+            fixture.object_bytes()
+        );
     }
 }
