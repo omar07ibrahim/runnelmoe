@@ -33,8 +33,12 @@ page catalog and a dense event stream. Page descriptors separate:
 
 Events are demand accesses or router signals. A router signal contains only
 integer fixed-point scores and targets a later request step. The generator
-emits a prediction before the target route is revealed. Online policy APIs
-never receive a trace suffix. The fill model is
+emits a prediction before the target route is revealed. Online policy state
+receives the current event plus an immutable catalog-only view; its type cannot
+expose the event suffix. A separate accounting prepass derives one metadata
+ceiling scalar from the validated event stream before constructing policy
+state. That scalar is used only to guard and report normalized metadata, never
+to rank, admit, prefetch, or evict a page. The fill model is
 `instant-between-events-v1`: a successful prefetch is resident before the next
 event. It models traffic and cache pollution, not storage latency, overlap,
 TTFT, or throughput.
@@ -42,7 +46,11 @@ TTFT, or throughput.
 All input limits are explicit. Validation rejects unknown or duplicate fields,
 noncanonical lines, sequence gaps, invalid page geometry, unknown references,
 noncausal signals, excessive prediction lists, and arithmetic overflow before
-replay begins.
+replay begins. File input is opened once with no-follow and nonblocking flags,
+classified through the retained descriptor, and read through a `limit + 1`
+ceiling. A size change is rejected. This closes leaf replacement and FIFO
+blocking races; ancestor symlinks, hard links, and equal-length same-inode
+mutation remain outside the filesystem-isolation claim.
 
 ### Policies
 
@@ -69,6 +77,24 @@ cache entries, router support of at least eight observations, minimum router
 score 100,000 ppm, at most two predicted experts, at most six pages, and at
 most six page fills per signal. These parameters are frozen before the measured
 seeds; favorable measurements are not required for milestone acceptance.
+
+Router state is keyed by request, target step, and layer. A later signal cannot
+overwrite another layer or another outstanding target. Signals older than the
+current demand step retire, while same-step signals remain live for every page
+of that step. The reported router metadata value is a deterministic normalized
+payload charge, not allocator telemetry:
+
+```text
+active signal payload = 24 + 8 * selected_prediction_count bytes
+```
+
+The 24-byte record covers request, target step, layer, and count fields; each
+prediction covers its expert and fixed-point score. An instrumentation-only
+prepass outside online policy state derives an exact ceiling from all nonempty
+post-threshold/top-K signals. Replay receives only that scalar, tracks checked
+current and peak payload, and confirms that the complete signal stream consumes
+the ceiling. Heap allocator overhead is deliberately excluded and must be
+observed through RSS in an integration benchmark rather than guessed here.
 
 Victim plans are complete before resident state changes. Oversized pages are
 served and bypassed. Checked counters enforce:
@@ -116,13 +142,23 @@ in for popularity. SHA-256 derives every seed and pins each generated trace.
 The complete matrix is 180 traces by three capacities by six policies, or
 3,240 unaggregated rows.
 
+The seed domain, Xoshiro256** transition, unbiased bounded draw, permutation,
+family parameters, predictor saturation and ceil-halving, and route-digest
+encoding are part of the closed experiment contract. During capture, an
+independent Python parser checks each generated canonical trace, reconstructs
+all 4,096 measured top-2 routes, and recomputes their domain-separated digest.
+The 512 burn-in routes are not present in the emitted JSONL, so the full-route
+digest remains simulator-attested and is labeled as such.
+
 Primary comparisons use paired trace seeds. Each cell reports count, mean,
 median, sample deviation, p50, p95, minimum, maximum, and a deterministic
 10,000-resample 95% percentile bootstrap interval for paired ratios and
 differences. These intervals describe variability across generated workloads,
-not simulator timing. An effect is called improved or regressed only when its
-complete interval is respectively below or above one; otherwise it is
-inconclusive. Families are not pooled into a universal result.
+not simulator timing. They are unadjusted, exploratory per-cell descriptions.
+Their position below, across, or above one is recorded only for the four online
+candidate policies; LRU is the baseline and Bélády is the oracle, so both are
+not applicable. Families are not pooled and no “at least one cell improves” or
+other omnibus conclusion is permitted.
 
 The primary online-to-optimal ratio is total physical bytes divided by uniform
 Bélády demand-fill bytes. Non-prefetch admission policies additionally report
@@ -134,8 +170,24 @@ Expanded stochastic traces are regenerated from committed generator
 definitions instead of stored. A trace ledger records seeds, parameters, and
 digests; raw observations, environment, experiment contract, summary, and SVGs
 are append-only evidence. The complete M3 evidence directory is capped at
-16 MiB. CI runs a bounded smoke matrix; the full matrix is produced from one
-clean commit.
+16 MiB. The capture harness performs a fresh locked, offline release build in
+a private tmpfs directory from a clean commit, records the toolchain and closed
+build command, and rechecks HEAD, the commit's harness blob, and the binary hash
+before publication. Verification opens the exact evidence file set through
+retained no-follow descriptors, sums sizes before reads, and regenerates every
+summary and figure from bounded raw ledgers. CI runs a bounded smoke matrix;
+the full matrix is produced from one clean commit.
+
+### Pre-capture audit amendment
+
+An independent pre-capture review on 2026-08-03 found that the original wording
+could be read as an uncorrected existential test across 72 eligible cells. No
+primary evidence had been captured. This amendment removes that omnibus claim,
+marks baseline/oracle comparisons not applicable, and makes the intervals
+explicitly exploratory. It weakens the permitted inference and does not select
+a favorable family, capacity, or policy. The same review required self-build
+provenance, independent measured-route reconstruction, summary-sourced figures,
+and bounded archival reads before the first accepted run.
 
 ## Consequences
 
@@ -160,6 +212,16 @@ complexity.
   Caching with Variable Object Sizes,” *Proceedings of the ACM on Measurement
   and Analysis of Computing Systems* 2(2), 2018,
   [arXiv:1711.03709](https://arxiv.org/abs/1711.03709).
+- D. Blackman and S. Vigna, “Scrambled Linear Pseudorandom Number
+  Generators,” *ACM Transactions on Mathematical Software* 47(4), 2021,
+  [DOI 10.1145/3460772](https://doi.org/10.1145/3460772). The independently
+  written deterministic generator follows the published xoshiro256**
+  transition. The authors' official
+  [xoshiro256**](https://prng.di.unimi.it/xoshiro256starstar.c) and
+  [SplitMix64](https://prng.di.unimi.it/splitmix64.c) reference files were
+  consulted for algorithm identity and provenance only; each carries a public
+  domain dedication with an unrestricted-use fallback permission. No source
+  text was copied.
 - Router-aware motivation comes from the high-level observations in
   [EdgeMoE](https://arxiv.org/abs/2308.14352v2) and
   [MoE-Infinity](https://arxiv.org/abs/2401.14361v3). No code or reported

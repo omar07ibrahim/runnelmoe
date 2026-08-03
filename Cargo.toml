@@ -4,6 +4,7 @@ members = [
     "crates/runnel-fixture",
     "crates/runnel-format",
     "crates/runnel-runtime",
+    "crates/runnel-sim",
     "crates/runnel-store",
 ]
 resolver = "2"

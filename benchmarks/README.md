@@ -53,3 +53,21 @@ forced-eviction trace and therefore does not close the stronger M2 gate.
 Shared-host wall times characterize these validation commands only and support
 no speedup claim. Experiment directories are append-only; use a new ID for
 every repetition.
+
+## M3 cache-policy evidence contract
+
+The first accepted M3 directory will contain exactly `environment.json`,
+`experiment.json`, `traces.jsonl`, `observations.jsonl`, `summary.json`, and
+three SVGs below `figures/`. The schema-v2 harness fresh-builds the simulator
+from a named clean commit in private tmpfs, independently validates each
+generated measured route, retains all 3,240 unaggregated policy rows, and
+derives both JSON summaries and chart series from those rows. Verification
+uses bounded retained descriptors and checks the harness blob from the recorded
+commit rather than assuming the current working copy is identical.
+
+The 10,000-resample intervals are unadjusted, exploratory descriptions within
+each family/capacity/policy cell. LRU is the baseline, Bélády/MIN is the
+uniform-page oracle, and neither receives an online-candidate outcome. No M3
+traffic result or policy recommendation belongs in this README until the raw
+directory is committed, independently audited, and linked from the claim
+ledger.

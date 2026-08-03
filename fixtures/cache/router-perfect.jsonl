@@ -1,0 +1,4 @@
+{"kind":"header","schema":"runnel.cache-trace/1","trace_id":"router-perfect","page_count":1,"event_count":2,"charge_quantum":64,"prefetch_model":"instant-between-events-v1"}
+{"id":0,"logical_bytes":4096,"charge_bytes":4096,"class":{"kind":"expert","layer":0,"expert":3,"ordinal":0}}
+{"kind":"router_signal","sequence":0,"request":0,"target_step":0,"layer":0,"predictions":[{"expert":3,"score_ppm":900000}]}
+{"kind":"demand","sequence":1,"request":0,"step":0,"page":0}

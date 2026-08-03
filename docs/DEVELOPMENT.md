@@ -137,3 +137,49 @@ parameters, but the record always preserves the fully expanded invocation.
 The schema-v1 `benchmarks/raw/m2-data-plane-20260803/` run is retained as a
 preliminary append-only record; it does not combine full-generation parity with
 forced eviction. Use a new experiment ID when reproducing either procedure.
+
+## M3 cache-policy verification
+
+The simulator and both independent policy references use no model download.
+Run the full workspace gate plus the deterministic matrix smoke test:
+
+```console
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+cargo test --workspace --all-targets --locked --offline
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --offline
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s oracle/tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -v
+cargo run --locked --offline -p runnel-sim --bin runnel-cache-sim -- matrix --family markov_clusters --replicate 0 --measured-steps 64
+```
+
+The Rust tests include byte-ledger identities, malformed trace bytes, retained
+descriptor replacement/FIFO/growth cases, exact and brute-force oracle
+comparisons, a real M2 `PageCache` cross-check, prefetch classification, and
+Rust-versus-Python online-policy differentials. The 64-step matrix is a
+functional smoke test, not accepted research evidence or a timing result.
+
+### Capture and verify the primary M3 matrix
+
+Capture requires a clean implementation commit, at least 2 GiB plus the
+16 MiB evidence allowance free on the repository filesystem, and a Linux
+tmpfs build root with sufficient memory. The harness creates and later removes
+only its own private mode-0700 child below that build root:
+
+```console
+python3 scripts/run_m3_experiment.py capture \
+  --build-root /dev/shm \
+  --output benchmarks/raw/m3-cache-policies-YYYYMMDD \
+  --commit <full-40-character-HEAD>
+
+python3 scripts/run_m3_experiment.py verify \
+  --input benchmarks/raw/m3-cache-policies-YYYYMMDD --check
+```
+
+Capture performs a fresh two-job locked/offline release build; a caller cannot
+supply a binary. For each of 180 family/replicate pairs it validates and
+discards one expanded canonical trace, independently reconstructs the measured
+routes and digest, then records the 18 policy/capacity observations. It checks
+clean HEAD, the historical harness blob, and the executable hash again before
+atomic publication. The resulting intervals are unadjusted exploratory
+per-cell descriptions and support no omnibus “any policy wins” claim.
