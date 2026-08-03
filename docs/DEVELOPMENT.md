@@ -12,7 +12,7 @@ Captured 2026-08-03 without recording credentials:
 | Swap | 8 GiB total |
 | Root filesystem | ext4 on NVMe; free space is a required live preflight |
 | Rust | rustc/cargo 1.97.1; rustfmt and clippy in the pinned toolchain |
-| Python | CPython 3.12.3; oracle dependencies will be pinned with M1 |
+| Python | CPython 3.12.3; exact CPU-oracle closure in `oracle/requirements.txt` |
 | Native compiler | GCC 13.3; additional kernel tooling is not required by M0 |
 | Measurement | perf 6.17 |
 | Packaging | Docker 29.1; no local image build authorized by default |
@@ -39,12 +39,46 @@ trees, disable incremental compilation for evidence builds, and remove only
 project-owned reproducible artifacts when reclaiming space. Never download the
 Kimi K3 checkpoint or another multi-gigabyte model.
 
-## Baseline check
+## M1 environment
 
-M0 needs only Python 3.12:
+The repository contract uses only Python 3.12 standard-library modules. Rust is
+pinned by `rust-toolchain.toml` and Cargo resolves exactly `Cargo.lock`. The
+independent oracle is optional for ordinary CLI use and has an exact CPU-only
+dependency closure:
 
-    python3 scripts/verify_repository.py
+```console
+python3 -m venv .venv
+.venv/bin/python -m pip install --disable-pip-version-check --no-deps -r oracle/requirements.txt
+```
 
-From M1, Rust is pinned by `rust-toolchain.toml`; the fixture generator pins
-its Python dependencies in the oracle environment. Exact commands are added to
-this file only after local and CI verification.
+Installing PyTorch consumes substantial temporary and installed disk space, so
+run the disk guard first. No command downloads a model checkpoint.
+
+## Complete M1 verification
+
+From the repository root:
+
+```console
+python3 scripts/verify_repository.py
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+.venv/bin/python -m oracle.generate --check
+.venv/bin/python -m unittest discover -s oracle/tests -v
+cargo run --locked -p runnel -- demo --prompt moe --max-new-tokens 4 --json
+```
+
+After dependencies have been fetched once, append `--offline` to Cargo test,
+Clippy, documentation, and run commands for a network-independent replay.
+`oracle.generate --check` is non-mutating and uses no network.
+
+To inspect the actual tiny RMOA layout, choose a new output directory:
+
+```console
+cargo run --locked -p runnel -- fixture --output /tmp/runnel-tiny-rmoa --json
+cargo run --locked -p runnel -- generate --artifact /tmp/runnel-tiny-rmoa --prompt moe --max-new-tokens 4 --strategy greedy --json
+```
+
+The fixture command refuses an existing output root. Generated object and page
+table bytes are disposable and excluded from source control.

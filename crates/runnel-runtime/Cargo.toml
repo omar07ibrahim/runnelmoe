@@ -1,0 +1,22 @@
+[package]
+name = "runnel-runtime"
+description = "Safe scalar reference runtime for RunnelMoE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+runnel-format = { path = "../runnel-format" }
+thiserror.workspace = true
+
+[dev-dependencies]
+runnel-fixture = { path = "../runnel-fixture" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

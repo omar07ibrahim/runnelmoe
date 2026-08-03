@@ -6,12 +6,11 @@ available RAM. It is designed to make the hard tradeoffs visible: verified
 storage, bounded memory, asynchronous I/O, cache policy, numerical parity,
 request scheduling, and honest measurement.
 
-> Project status: M0 design/provenance gate verified; M1 implementation is in
-> progress. There are no performance claims yet.
-> The planned first supported model is a tiny deterministic synthetic adapter
-> created by this project.
+> Project status: M0 design/provenance is verified. The M1 tiny-reference
+> runtime is implemented and undergoing its milestone review/CI gate. There
+> are no performance or out-of-core execution claims yet.
 
-The planned runtime's central contract is simple: a configured
+The runtime's central contract is simple: a configured
 resident-memory ceiling
 must remain enforceable while expert tensors move between an immutable
 content-addressed object store, a bounded DRAM cache, and compute. Corrupt or
@@ -28,13 +27,33 @@ platform and local runtime for studying those interactions under explicit
 resource budgets. It is not a claim that commodity CPUs make frontier-scale
 models practical.
 
+## Current executable slice
+
+M1 supplies a strict, eager-memory-budgeted RMOA artifact reader; a
+formula-generated 7,904-byte synthetic tensor object; scalar Rust tokenization,
+two-head causal attention, stable top-2 MoE routing, and greedy generation; an
+independently organized vectorized PyTorch oracle; and a black-box CLI. The
+fixture contains no trained data or committed weight file.
+
+Run the complete artifact-to-token demo after fetching the locked Rust
+dependencies once:
+
+```console
+cargo run --locked -p runnel -- demo --prompt moe --max-new-tokens 4 --json
+```
+
+The stable fixture result is generated IDs `[15, 11, 20, 9]`, decoded as
+`"njsh"`. This is a systems-test vector, not language-model-quality evidence.
+See [development](docs/DEVELOPMENT.md) for the complete verification suite.
+
 ## Architecture contract
 
-- Rust will own parsing, scheduling, resource accounting, and the safe runtime.
+- Rust owns parsing and the scalar reference runtime; later milestones add
+  storage, cache, scheduling, kernels, and serving.
 - A narrow C ABI will contain measured SIMD kernels; scalar Rust will stay the
   correctness baseline.
-- Python/PyTorch will be used only as an independently structured oracle, fixture
-  generator, and analysis environment.
+- Python/PyTorch is used only as an independently structured oracle, golden
+  vector generator, and analysis environment.
 - CI and demos will use tiny generated data. No proprietary or multi-gigabyte
   checkpoint will be required.
 - Network listeners, when added, will bind to loopback by default.
@@ -51,8 +70,9 @@ library.
 
     python3 scripts/verify_repository.py
 
-Later milestone commands will be added only after they are executable. Raw
-benchmark outputs, including environment metadata, will live under
+Executable milestone commands are recorded in
+[development](docs/DEVELOPMENT.md). Raw benchmark outputs, including
+environment metadata, will live under
 `benchmarks/raw/`; generated summaries will never be the sole evidence for a
 claim.
 

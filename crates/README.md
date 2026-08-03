@@ -1,6 +1,11 @@
 # Runtime crates
 
-The Rust workspace begins in M1. Planned boundaries are format validation,
-model/runtime semantics, storage/cache, scheduling, kernels, CLI, and serving.
-Crates will be introduced only with an executable vertical test rather than as
-empty interface scaffolding.
+The M1 Rust workspace contains four executable boundaries:
+
+- `runnel-format`: strict canonical RMOA parsing and byte verification;
+- `runnel-fixture`: formula-derived tiny artifact generation;
+- `runnel-runtime`: scalar tiny-adapter inference and generation; and
+- `runnel`: black-box fixture, generate, and self-contained demo commands.
+
+Storage/cache, scheduling, kernels, and serving arrive only with later vertical
+milestones, never as empty interface scaffolding.

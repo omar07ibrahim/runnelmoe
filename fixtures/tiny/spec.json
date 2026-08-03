@@ -1,0 +1,127 @@
+{
+  "artifact": {
+    "artifact_id": "sha256:e49321cefc980ab59cd449341edfc624ccfc4b0b703cd175184e056d296d9ed3",
+    "object_digest": "sha256:6b2b8a1bbb2854084b1e1fe1e5787a9cfdb021b397e774fc7dbef79ac9d24bf6",
+    "object_length": 7904,
+    "page_table_digest": "sha256:29383b56a150f9e5705f3666ca7707f21bc3fbd663ffd7249f4ecb938da6a62d",
+    "page_table_length": 96
+  },
+  "comparison": {
+    "atol": 0.00001,
+    "rtol": 0.0001
+  },
+  "equations": {
+    "attention": "causal_softmax((q @ transpose(k)) * 2^-1) @ v, independently per head",
+    "block": "embedding -> RMSNorm -> 2-head MHA -> residual -> RMSNorm -> top-2 MoE -> residual",
+    "expert": "down(silu(gate(x)) * up(x))",
+    "final": "RMSNorm -> lm_head",
+    "linear_bias": false,
+    "positional_encoding": "none",
+    "rms_norm": "x * reciprocal_sqrt(mean(x * x) + 2^-12) * weight",
+    "router": "scores = x @ transpose(router); order by score descending then expert ID ascending; softmax only selected scores"
+  },
+  "fixture_version": 1,
+  "generation_fixture": {
+    "max_new_tokens": 4,
+    "prompt": "moe",
+    "strategy": "greedy"
+  },
+  "identity": "runnel-tiny-causal-moe-v1",
+  "model": {
+    "context_length": 16,
+    "expert_hidden_size": 12,
+    "hidden_size": 8,
+    "num_experts": 4,
+    "num_heads": 2,
+    "num_layers": 1,
+    "top_k": 2,
+    "vocab_size": 32
+  },
+  "numeric": {
+    "accumulation_order": "Rust scalar reference: input dimensions ascend in dot products and RMS sums; causal positions ascend in attention sums; selected experts accumulate in router-rank order",
+    "attention_scale_power_of_two": -1,
+    "dtype": "float32",
+    "greedy_tie_break": "lowest_token_id",
+    "rms_norm_epsilon_power_of_two": -12,
+    "selected_router_softmax": "float32"
+  },
+  "tensor_recipe": {
+    "center": 14,
+    "description": "For each role's declared tensor ID t and zero-based row-major flat index i, integer = ((37 * (t + 1) + 17 * (i + 1)) mod 29) - 14. Ordinary value = integer / 2^5. Norm value = 1 + integer / 2^6.",
+    "modulus": 29,
+    "multiplier_index": 17,
+    "multiplier_tensor": 37,
+    "normalization_base": 1,
+    "normalization_denominator_power_of_two": 6,
+    "normalization_tensor_ids": [
+      1,
+      6,
+      20
+    ],
+    "ordinary_denominator_power_of_two": 5,
+    "storage_order": "row-major"
+  },
+  "tensors": [
+    {"id": 0, "role": "token_embedding", "shape": [32, 8]},
+    {"id": 1, "role": "layers.0.attn_norm", "shape": [8]},
+    {"id": 2, "role": "layers.0.attn_q", "shape": [8, 8]},
+    {"id": 3, "role": "layers.0.attn_k", "shape": [8, 8]},
+    {"id": 4, "role": "layers.0.attn_v", "shape": [8, 8]},
+    {"id": 5, "role": "layers.0.attn_out", "shape": [8, 8]},
+    {"id": 6, "role": "layers.0.ffn_norm", "shape": [8]},
+    {"id": 7, "role": "layers.0.router", "shape": [4, 8]},
+    {"id": 8, "role": "layers.0.experts.0.gate", "shape": [12, 8]},
+    {"id": 9, "role": "layers.0.experts.0.up", "shape": [12, 8]},
+    {"id": 10, "role": "layers.0.experts.0.down", "shape": [8, 12]},
+    {"id": 11, "role": "layers.0.experts.1.gate", "shape": [12, 8]},
+    {"id": 12, "role": "layers.0.experts.1.up", "shape": [12, 8]},
+    {"id": 13, "role": "layers.0.experts.1.down", "shape": [8, 12]},
+    {"id": 14, "role": "layers.0.experts.2.gate", "shape": [12, 8]},
+    {"id": 15, "role": "layers.0.experts.2.up", "shape": [12, 8]},
+    {"id": 16, "role": "layers.0.experts.2.down", "shape": [8, 12]},
+    {"id": 17, "role": "layers.0.experts.3.gate", "shape": [12, 8]},
+    {"id": 18, "role": "layers.0.experts.3.up", "shape": [12, 8]},
+    {"id": 19, "role": "layers.0.experts.3.down", "shape": [8, 12]},
+    {"id": 20, "role": "final_norm", "shape": [8]},
+    {"id": 21, "role": "lm_head", "shape": [32, 8]}
+  ],
+  "tokenizer": {
+    "bos_token_id": 1,
+    "encode_prepends_bos": true,
+    "eos_token_id": 0,
+    "tokens": [
+      "<eos>",
+      "<bos>",
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "f",
+      "g",
+      "h",
+      "i",
+      "j",
+      "k",
+      "l",
+      "m",
+      "n",
+      "o",
+      "p",
+      "q",
+      "r",
+      "s",
+      "t",
+      "u",
+      "v",
+      "w",
+      "x",
+      "y",
+      "z",
+      " ",
+      ".",
+      ",",
+      "?"
+    ]
+  }
+}
