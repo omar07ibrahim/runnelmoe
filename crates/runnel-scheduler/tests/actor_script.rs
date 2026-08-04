@@ -680,3 +680,7 @@ mod common;
 #[cfg(feature = "actor-stress-instrumentation")]
 #[path = "actor_script/golden.rs"]
 mod golden;
+
+#[cfg(feature = "actor-stress-instrumentation")]
+#[path = "actor_script/race.rs"]
+mod race;
