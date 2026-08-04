@@ -25,8 +25,9 @@ mod wave;
 #[cfg(any(test, feature = "actor-stress-instrumentation"))]
 #[doc(hidden)]
 pub use actor::{
-    ActorDisconnectDisposition, ActorProbe, ActorProbeSnapshot, ActorPumpHold,
-    ActorRequestDropWitness, ActorRequestDropWitnessSink, ActorWakeWitness, SubmitCommandWitness,
+    ActorAcceptedRequestWitness, ActorDisconnectDisposition, ActorProbe, ActorProbeSnapshot,
+    ActorPumpHold, ActorReceiveWitness, ActorRequestDropWitness, ActorRequestDropWitnessSink,
+    ActorWakeWitness, SubmitCommandWitness,
 };
 pub use actor::{
     ActorShutdownReport, RequestCancellation, RequestHandle, SchedulerActor, SchedulerClient,

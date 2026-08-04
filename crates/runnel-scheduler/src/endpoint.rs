@@ -1482,6 +1482,11 @@ impl fmt::Debug for EndpointReceiver {
 }
 
 impl EndpointReceiver {
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pub(crate) const fn stress_identity(&self) -> (usize, u64) {
+        (self.key.index(), self.key.generation().get())
+    }
+
     pub(crate) fn snapshot(&self) -> SchedulerResult<EndpointSnapshot> {
         snapshot_for(&self.table, self.key)
     }

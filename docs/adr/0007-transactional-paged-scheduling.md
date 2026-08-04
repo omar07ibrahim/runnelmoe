@@ -971,12 +971,17 @@ drain and receiver-drop actions run on that producer, cancellation runs on the
 opposite producer, and wake action ordinal `a` runs on producer `a mod 2`.
 
 The fault-free request-ID contract starts at one. Each successful engine
-admission consumes exactly the next consecutive ID in its admission
-linearization order; a rejected offer consumes no ID. The golden's serialized
-IDs must therefore be `1..N` in its successful-admission order. A race history
-derives the same consecutive assignment from its witnessed admission order.
-Identity exhaustion or a gap, duplicate, or out-of-order assignment invalidates
-the run rather than defining another transcript.
+admission consumes exactly the next consecutive ID in owner-FIFO order; a
+rejected offer consumes no ID. The golden's serialized IDs must therefore be
+`1..N` in its successful-admission order. For every fresh actor, the witnessed
+`ready_commit_sequence` starts at one and is unique and contiguous across all
+64 in-range offers. It orders transitions into the owner's ready FIFO; it is
+structural FIFO evidence, not an API or engine-admission linearization point.
+The 142 exhausted offers do not call the actor and have zero command witnesses.
+A race history sorts accepted submissions by ready sequence and requires their
+request IDs to be exactly `1..N`; it never validates IDs in producer response
+order. Identity exhaustion or a gap, duplicate, or out-of-order assignment
+invalidates the run rather than defining another transcript.
 
 An accepted request stores its cancellation authority separately from its sole
 receiver. Dropping the receiver does not drop that authority; it remains usable
@@ -996,16 +1001,19 @@ second explicit-disconnect call. Wake is global and never inspects the selected
 request.
 
 For this bounded corpus, the 16 control slots use a frozen deterministic reuse
-rule so stale-authority evidence is independently replayable. Initial binds
-consume slot indices `0..15` in ascending order. Recycling appends the freed
-index to the free stack, and the next successful admission binds the most
-recently recycled index (LIFO), incrementing its generation and making every
-older authority for that slot stale. A rejected admission consumes no slot and
-does not change this stack. The Python capture verifier replays this rule from
-accepted submissions and quiescent receiver drops; a cleanup disposition that
-does not match the derived current generation invalidates the capture. This
-reuse rule affects structural capture custody but not semantic transcript
-bytes.
+rule. Initial binds consume slot indices `0..15` in ascending order. Recycling
+appends the freed index to the free stack, and the next successful admission
+binds the most recently recycled index (LIFO), incrementing its generation and
+making every older authority for that slot stale. A rejected admission consumes
+no slot and does not change this stack. The serialized golden independently
+replays this exact rule because every action is followed by acknowledged
+quiescence. A concurrent race history instead validates accepted control
+identities, monotone generation changes, stale-generation protection, and
+witnessed control-word chains; it does not infer recycle order from destructor
+or semantic-recorder append order. Focused control-registry tests freeze exact
+LIFO allocation. This deliberately narrows the race claim without weakening the
+allocator contract or inventing an unwitnessed owner order. The reuse rule
+affects structural capture custody but not semantic transcript bytes.
 
 #### Golden execution, cleanup, and race witnesses
 
@@ -1076,35 +1084,426 @@ not an action-record alternative. In particular, allocation failure is
 distinguished from the expected bounded-capacity `resource_exhausted`
 admission result even though both share the public error category.
 
-The genuine race uses the identical actions and producer assignment for 32
-repetitions. After initial actor quiescence, both producers wait behind one
-start barrier and then execute their own action subsequence in original action
-ordinal order without cross-producer gates. After both producer tasks join, the
-coordinator waits for quiescence and performs the identical ordered cleanup
-used by the golden execution. The 4,096 pump-entry cap is the delta from barrier
-release through completed shutdown. Each operation records invocation and
-response interval counters plus a structural witness:
+The genuine race uses the identical actions and producer assignment for exactly
+32 independent repetitions. Each repetition constructs a fresh authenticated
+model, actor, recorder, accepted-request registry, interval counter, and
+preallocated history. After acknowledged initial quiescence, both producers
+wait behind one three-party Tokio barrier and then execute only their own
+518/506-action subsequences in original action-ordinal order. There are no
+cross-producer gates, retries, sleeps, or scheduler hints after barrier release.
+The coordinator joins both tasks, reaches acknowledged quiescence, and performs
+the golden's ordered cleanup. One repetition has a 20-second hard timeout and
+the complete 32-repetition command has a 15-minute hard timeout. Timeout,
+panic, missing or duplicate record, recorder failure, unresolved action, or a
+diagnostic bound violation invalidates the run; the harness never retries a
+failed repetition. The 4,096 pump-entry cap is the delta from barrier release
+through completed shutdown.
 
-- a submit records command-slot index and ticket and, if it reached ready
-  commit, its ready-commit sequence; an accepted response also records the
-  assigned request ID;
-- cancel and disconnect record control-slot identity and the generation-bound
-  packed control word before and after their load/CAS decision;
-- drain records endpoint slot/generation, drained-event count before and after,
-  and any consumed output identity; and
-- wake records whether dirty was already set and the park epoch observed before
-  the wake and after its acknowledgement.
+Every scripted action reserves two values from fresh shared-counter storage
+initialized to zero; each reservation records `fetch_add(1) + 1`. The
+invocation value is taken immediately before target lookup or scheduler API
+entry. The response value is taken only after the result, all structural
+witnesses, and any complete accepted-state entry have been published. Exactly
+1,024 actions therefore produce exactly the unique values `1..2048`. Cleanup
+uses a separate counter domain. Per-producer program order is binding, and
+`A.response < B.invocation` creates a cross-thread real-time edge. Invocation
+adjacency, response adjacency, the numeric order of overlapping intervals, and
+recorder append order are never linearization points. Every repetition must
+contain at least one pair of cross-producer intervals that overlap
+(`A.invocation < B.response` and `B.invocation < A.response`) and in which both
+actions reach a non-sentinel shared command, control, endpoint, or wake
+boundary. Exhausted-submit and unavailable-target no-ops cannot satisfy this
+requirement; releasing the start barrier alone is not accepted as proof of a
+genuine race.
 
-Zero/sentinel witness fields are required for an operation that never reaches
-the corresponding boundary. Shared interval counters establish only invocation,
-response, per-producer, and response-before-later-invocation constraints. The
-independent checker must choose a linearization consistent with those edges and
-the structural witnesses; it must not use an adjacent counter value as the
-linearization point or infer a total order from it. It then matches every
-acceptance, typed rejection, cancellation, drop, drain, output, terminal, and
-cleanup effect. Every repetition resolves each accepted request exactly once,
-preserves committed-token semantics, resolves or deliberately drops every
-receiver, and ends with zero request and shared ledger use.
+The accepted-request registry publishes one mutex-protected entry containing
+request ID, cancellation authority, accepted identity witness, and receiver
+ownership before publishing the submit response counter. It never publishes
+those fields piecemeal. The command, control, and endpoint slot numbers are
+three distinct namespaces and are never compared as though they shared an
+allocator. Their complete identities are respectively `(slot, ticket)`,
+`(slot, generation)`, and `(slot, generation)`. An accepted response carries
+its request ID plus the exact control and endpoint identities returned by the
+accepted handle; a response-order observer cannot reconstruct these values.
+
+The packed control word is frozen as bit 0 cancellation, bit 1 receiver
+disconnection, bit 2 terminal, and bits 3 through 63 generation. Valid live
+generations are `1..=2^61-1`. Flags are monotone within one generation; a bind
+increments that slot's generation and clears all three flags. Cancellation
+sets bit 0, disconnection sets bits 0 and 1 atomically, and terminal publication
+sets bit 2. Cancellation's `already_requested` and `already_terminal` results
+leave the word unchanged. Disconnection leaves the word unchanged only when bit
+1 was already set; otherwise it sets bits 0 and 1 even if bit 2 was already set,
+in which case its disposition is `already_terminal`. A stale-generation
+decision cannot modify the observed word. Serialized words are exactly 16
+lowercase hexadecimal digits so JSON number precision is never part of the
+contract.
+
+Each operation records its interval plus a closed structural witness:
+
+- a submit records command slot, nonzero ticket, and nonzero ready sequence if
+  it reached ready commit; engine acceptance additionally records the request,
+  control, and endpoint identities;
+- cancel and destructor disconnect record the control slot, expected
+  generation, and packed word loaded before and resulting after their final
+  load/CAS decision;
+- drain records a primary endpoint pop and the optional opportunistic EOF pop,
+  each with endpoint slot/generation, drained count before and after, and any
+  consumed output identity; a separate boolean identifies an already-cached
+  EOF that entered neither endpoint boundary; and
+- wake records whether dirty was already set and the park epochs observed
+  before the signal and after acknowledgement.
+
+An unreached boundary has `boundary=false` and all remaining raw fields zero or
+null. A primary cached-EOF result has both endpoint witnesses at that sentinel
+and `cached_eof=true`; every other result has `cached_eof=false`. A successful
+wake requires `after_park_epoch > before_park_epoch`. Concurrent wakes may
+coalesce on one later park epoch, and `dirty_was_set` does not attribute a pump
+entry to a unique signal.
+
+The compact capture is one JSON document with closed schema
+`runnel.actor-race-history/1`, exact `repetition_count=32`, and repetitions
+indexed `0..31`. It is UTF-8 without a BOM, contains only the ASCII string
+literals or pattern-constrained strings defined below, uses lexicographically
+sorted object keys, compact `,`/`:` separators with no other whitespace, and
+ends in exactly one LF byte. Every permitted string is emitted literally;
+backslash escape spellings, including equivalent `\/` or `\u` forms, are
+noncanonical and rejected. Integers are unsigned canonical decimal JSON
+integers: no sign, leading zero (except
+zero itself), fraction, or exponent, and at most `u64::MAX`; `UInt` below means
+exactly this type. `Hex64` is exactly
+16 lowercase hexadecimal digits; `Sha256` is `sha256:` followed by exactly 64
+lowercase hexadecimal digits. Parsers reject duplicate or unknown keys, an
+array of the wrong length, nesting deeper than 16, a string longer than 128
+bytes, or a string that matches neither an enumerated literal nor its stated
+pattern. The complete file is bounded to 33,554,432
+bytes before parsing and after encoding. A writer that exceeds the bound fails
+the run; it never truncates, compresses, retries, or changes representation.
+
+The exact top-level objects and key sets are:
+
+```text
+Capture = {
+  "repetition_count": 32,
+  "repetitions": [Repetition; 32],
+  "schema": "runnel.actor-race-history/1",
+  "workload": Workload
+}
+
+Workload = {
+  "artifact_id":
+    "sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c",
+  "artifact_object_sha256":
+    "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab",
+  "artifact_page_table_sha256":
+    "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
+  "model_spec_sha256":
+    "sha256:ed57d7961e65c76223c169cabebaff9c02d8293da026abb0c0c0a22d38079845",
+  "specification": "runnel-m5-actor-stress-v1",
+  "vector_file_sha256":
+    "sha256:eca1faeee91a41d19d98be7ffdad6fc5cebb9027f3e7a634c01ea1cc394fb574",
+  "vector_id":
+    "sha256:5010492fb74eda207511b26811992ed4779814185b9f184663b37a37747bd051",
+  "vector_schema": "runnel.actor-stress-vectors/2"
+}
+
+Repetition = {
+  "actions": [Action; 1024],
+  "cleanup_authorities": [CleanupAuthority; accepted_count],
+  "cleanup_receivers": [CleanupReceiver; live_receiver_count],
+  "diagnostics": Diagnostics,
+  "observations": [Observation; observation_count],
+  "post_shutdown": ProbeSnapshot,
+  "pre_cleanup": ProbeSnapshot,
+  "pre_shutdown": ProbeSnapshot,
+  "repetition": UInt in 0..31,
+  "shutdown": Shutdown
+}
+```
+
+High-cardinality records are fixed-length tuples to keep 32 raw histories
+bounded. Their positions, types, and sentinels are part of the schema:
+
+```text
+Action = [
+  ordinal, producer, kind, submit_attempt, client_index,
+  invocation, response, result, error, request_id, output,
+  command, accepted, control, primary_pop, opportunistic_eof_pop,
+  cached_eof, wake
+]
+
+ordinal        = UInt in 0..1023; tuple order equals ordinal
+producer       = UInt in 0..1
+kind           = "submit" | "cancel" | "receiver_drop" | "drain" | "wake"
+submit_attempt = UInt in 0..205 for submit; null otherwise
+client_index   = UInt in 0..63 for targeted actions, wake's consumed selector,
+                 and submit attempts 0..63; null for submit attempts 64..205
+invocation     = UInt in 1..2047
+response       = UInt in 2..2048 and strictly greater than invocation
+result         = "submit_accepted" | "submit_offer_exhausted" |
+                 "cancel_requested" | "cancel_already_requested" |
+                 "cancel_already_terminal" | "receiver_dropped" |
+                 "drain_output" | "drain_empty" | "drain_eof" |
+                 "wake_signaled" | "target_unavailable" | "error"
+error          = Error or null; nonnull if and only if result is "error"
+request_id     = nonzero UInt for an accepted submit or a target lookup that
+                 found a completely published accepted entry; null for wake,
+                 exhausted submit, rejection, or a target not yet published
+output         = Output for "drain_output"; null otherwise
+command        = CommandWitness
+accepted       = AcceptedWitness
+control        = ControlWitness
+primary_pop    = PopWitness whose kind is "primary"
+opportunistic_eof_pop = PopWitness whose kind is "opportunistic_eof"
+cached_eof     = Boolean
+wake           = WakeWitness
+
+Error = [code, category, resource, required, limit]
+  stale authority =
+    ["request_not_found", "invalid_request", null, null, null]
+  saturated engine admission =
+    ["resource_exhausted", "resource_exhausted",
+     "request slot count", 16, 16]
+No other error is a valid captured outcome.
+
+Output = [request_id: nonzero UInt, output_index: UInt, token_id: UInt <= 2^32-1]
+
+CommandWitness = [boundary, slot, ticket, ready_sequence]
+  sentinel = [false, 0, 0, 0]
+  reached  = [true, slot in 0..7, nonzero UInt, nonzero UInt]
+
+AcceptedWitness = [
+  boundary, request_id, control_slot, control_generation,
+  endpoint_slot, endpoint_generation
+]
+  sentinel = [false, 0, 0, 0, 0, 0]
+  reached  = [true, nonzero UInt, slot in 0..15, nonzero UInt,
+              slot in 0..15, nonzero UInt]
+
+ControlWitness = [
+  operation, boundary, slot, expected_generation,
+  loaded_word, resulting_word, disposition
+]
+  sentinel = ["none", false, 0, 0,
+              "0000000000000000", "0000000000000000", null]
+  operation   = "none" | "cancel" | "disconnect"
+  disposition = "requested" | "already_requested" |
+                "already_terminal" | null
+  reached     = operation != "none", boundary = true, slot in 0..15,
+                expected_generation != 0, loaded_word/resulting_word = Hex64
+
+PopWitness = [
+  kind, boundary, slot, generation, drained_before, drained_after, output
+]
+  sentinel(primary) =
+    ["primary", false, 0, 0, 0, 0, null]
+  sentinel(opportunistic) =
+    ["opportunistic_eof", false, 0, 0, 0, 0, null]
+  reached = [kind, true, slot in 0..15, nonzero UInt,
+             UInt, UInt, Output or null]
+
+WakeWitness = [boundary, dirty_was_set, before_park_epoch, after_park_epoch]
+  sentinel = [false, false, 0, 0]
+  reached  = [true, Boolean, UInt, UInt]
+```
+
+Every nonapplicable witness is its exact sentinel. All 64 in-range submits have
+reached command witnesses; their ready sequences are exactly `1..64` and their
+accepted witnesses are reached if and only if result is `submit_accepted`. Per
+command slot, tickets start at one and increase by one without gaps. Exhausted
+submits have the command sentinel. The accepted tuple's request ID equals the
+action request ID. Within each control and endpoint slot, accepted generations
+start at one and each later accepted generation increases by one; the two slot
+namespaces remain independent. A stale control error still has a reached
+witness and null disposition. `cached_eof=true` is valid only for `drain_eof`
+with both pop sentinels; every other action has `cached_eof=false`. The primary
+output tuple equals the action output. Direct EOF has a reached primary pop and
+opportunistic sentinel; last-output EOF acknowledgement has both pops reached;
+empty and ordinary-output reads have a reached primary pop and opportunistic
+sentinel. A primary output advances `drained_after` by exactly one; primary
+empty or EOF leaves it unchanged. A reached opportunistic EOF always has null
+output and unchanged drain counts, uses the same endpoint identity as its
+primary, and has `drained_before` equal to the primary's `drained_after`.
+The authenticated vector kind named `drop` is serialized as race-history kind
+`receiver_drop`; every other kind retains the vector spelling.
+
+Cleanup is serialized after the two producers and uses fresh counter storage
+initialized to zero. Each boundary records `fetch_add(1) + 1`; every authority
+record and then every receiver record receives one invocation/response pair.
+`cleanup_counter_final` is the last issued value, so the exact issued range is
+`1..2*(accepted_count + live_receiver_count)` and the stored final is
+`2*(accepted_count + live_receiver_count)`:
+
+```text
+CleanupAuthority = [
+  invocation, response, client_index, request_id, error, control
+]
+  invocation/response = UInt from the cleanup counter; response = invocation + 1
+  client_index        = UInt in 0..63
+  request_id          = nonzero UInt
+  error               = Error or null
+  control             = ControlWitness
+  control.operation = "cancel" and control.boundary = true
+  error is null with a nonnull disposition, or the stale-authority Error with
+  a null disposition
+
+CleanupReceiver = [
+  invocation, response, client_index, request_id,
+  terminal, outputs, eof_acknowledged, post_drop_quiescent
+]
+  invocation/response = UInt from the cleanup counter; response = invocation + 1
+  client_index        = UInt in 0..63
+  request_id          = nonzero UInt
+  terminal         = Terminal
+  outputs          = [Output; remaining FIFO suffix length]
+  eof_acknowledged = true
+  post_drop_quiescent = ProbeSnapshot satisfying quiescence
+
+Terminal = [
+  request_id: nonzero UInt, outcome,
+  committed_positions: UInt, emitted_tokens: UInt
+]
+  outcome = "completed" | "cancelled"
+```
+
+Authority records include every accepted request in ascending client-index
+order. Receiver records include exactly the receivers still owned after the
+script, also in ascending client-index order. A receiver interval begins before
+terminal consumption and ends only after FIFO/EOF consumption, handle drop,
+and the acknowledged post-drop snapshot. Its request count is exactly one less
+than the preceding authoritative snapshot.
+
+Semantic recorder order is discarded. Observations are serialized as all
+outputs sorted by `(request_id, output_index)`, then terminals by request ID,
+then first-EOF observations by request ID:
+
+```text
+Observation = [
+  kind, request_id, output_index, token_id,
+  outcome, committed_positions, emitted_tokens
+]
+  id        = nonzero UInt
+  index     = UInt
+  token     = UInt <= 2^32-1
+  positions = UInt
+  tokens    = UInt
+  output    = ["output", id, index, token, null, null, null]
+  terminal  = ["terminal", id, null, null,
+               "completed" | "cancelled", positions, tokens]
+  EOF       = ["output_eof", id, null, null, null, null, null]
+```
+
+The three lifecycle snapshots are deliberately distinct: `pre_cleanup` is the
+acknowledged quiescent snapshot after producer join; `pre_shutdown` is the
+acknowledged quiescent snapshot after all cleanup and authority drops; and
+`post_shutdown` is the non-quiescent owner-done snapshot after cooperative
+shutdown. Each object has exactly the following keys:
+
+```text
+ProbeSnapshot = {
+  "command_in_flight": UInt,
+  "command_ready": UInt,
+  "command_reserved": UInt,
+  "command_responded": UInt,
+  "dirty": Boolean,
+  "engine_steps": UInt,
+  "outstanding_requests": UInt,
+  "owner_done": Boolean,
+  "park_epoch": UInt,
+  "parked": Boolean,
+  "pump_entries": UInt,
+  "pump_hold_observed": UInt,
+  "pump_hold_released": UInt,
+  "pump_hold_requested": UInt,
+  "pump_in_flight": Boolean,
+  "request_bytes": UInt,
+  "shared_bytes": UInt
+}
+
+RecorderStatus = {
+  "allocated_capacity": UInt,
+  "observation_count": UInt,
+  "observation_limit": 675,
+  "overflowed": Boolean,
+  "poisoned": Boolean
+}
+
+Diagnostics = {
+  "action_counter_final": 2048,
+  "barrier_released": true,
+  "cleanup_counter_final": UInt,
+  "engine_steps_delta": UInt,
+  "final_engine_steps": UInt,
+  "final_pump_entries": UInt,
+  "initial_engine_steps": UInt,
+  "initial_pump_entries": UInt,
+  "overlap_pair": [left_ordinal, left_boundary,
+                    right_ordinal, right_boundary],
+  "pump_entries_delta": UInt,
+  "recorder_final": RecorderStatus,
+  "recorder_initial": RecorderStatus
+}
+  left/right_boundary = "command" | "control" | "primary_endpoint" |
+                        "opportunistic_endpoint" | "wake"
+
+Shutdown = {
+  "accepted_submissions": UInt,
+  "discarded_output_events": UInt,
+  "engine_steps": UInt,
+  "rejected_submissions": UInt,
+  "released_request_bytes": UInt,
+  "remaining_shared_bytes": UInt,
+  "shutdown_cancellations": UInt,
+  "terminated_requests": UInt
+}
+```
+
+Both recorder snapshots must be healthy, their allocated capacity must be
+equal, and the final observation count must equal the observation array length.
+The overlap ordinals identify opposite producers, their intervals overlap, and
+the named boundary is reached in each corresponding action. Diagnostic deltas
+are exact subtractions of their endpoints; pump delta is at most 4,096. Every
+quiescent snapshot has `parked=true`, `dirty=false`,
+`pump_in_flight=false`, and `owner_done=false`. `post_shutdown` has
+`owner_done=true`, `dirty=true`, `parked=false`, and
+`pump_in_flight=false`. Its pump/engine endpoints equal the diagnostic final
+values, and its engine count also equals `shutdown.engine_steps`.
+`cleanup_counter_final` equals twice the combined cleanup-array lengths.
+Shutdown accepted/rejected counts equal the corresponding in-range action
+results and sum to 64; all five shutdown effect/remaining fields are zero.
+
+After the producers join, only an acknowledged stable-quiescence snapshot is
+authoritative for accounting. It must report zero command occupancy and an
+outstanding-request count equal to the still-owned receiver set, proving all
+script-dropped records have reaped. While the pump is held, cleanup probes every
+accepted authority in ascending offered-index order and retains each exact
+control witness. After release and re-quiescence, remaining receivers are
+consumed in ascending order: terminal first, then the exact FIFO output suffix
+through EOF. The harness re-quiesces after every drop and requires the live
+count to decrease by one. Authorities are then dropped, pre-shutdown
+quiescence must show zero outstanding requests and zero request-owned ledger
+use. Cooperative shutdown must have zero request effects. The post-shutdown
+owner-done snapshot must show zero request and shared-ledger use.
+
+The independent checker regenerates all descriptors and actions and constructs
+a partial-order DAG from producer order and strict response-before-invocation
+edges. It combines that DAG with object-local
+command tickets, ready FIFO sequence, control generation/word chains, endpoint
+drain chains, and the existential actor terminal/rebind events required by
+observed dispositions. It checks topological satisfiability rather than sorting
+counters into a total execution. A cross-producer target may be unavailable
+only when its complete acceptance publication is not forced before that
+action's invocation. The checker requires consecutive accepted IDs in ready
+sequence order, exact typed saturation errors, valid sentinel use, output
+identity and drain algebra, monotone control transitions, complete terminal and
+first-EOF conservation, completed full sequences, cancelled strict prefixes,
+cleanup conservation, and zero final ledgers. Each repetition is verified on
+its own. No expected race digest, accepted set, physical count, or
+cross-repetition byte equality is committed. Authoritative acceptance and CI
+always enable the separate PyTorch gate for all 64 model sequences; a
+`--no-model` checker mode may diagnose structural history only and is never
+publishable evidence because it cannot independently validate token values or
+the completed/cancelled prefix claims.
 
 #### Canonical actor semantic transcript
 

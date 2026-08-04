@@ -205,6 +205,11 @@ impl fmt::Debug for ControlBinding {
 }
 
 impl ControlBinding {
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pub(crate) const fn stress_identity(&self) -> (usize, u64) {
+        (self.index, self.generation.get())
+    }
+
     /// Loads a new control snapshot with acquire ordering.
     ///
     /// A generation mismatch reports the scheduler's generic stale-request
@@ -815,6 +820,29 @@ mod tests {
     }
 
     #[test]
+    fn multi_slot_allocation_and_recycling_are_exact_lifo() {
+        let mut registry = ControlRegistry::try_with_capacity(3).expect("registry");
+        let first = bind_one(&mut registry);
+        let second = bind_one(&mut registry);
+        let third = bind_one(&mut registry);
+        assert_eq!(first.stress_identity(), (0, 1));
+        assert_eq!(second.stress_identity(), (1, 1));
+        assert_eq!(third.stress_identity(), (2, 1));
+
+        first.mark_terminal().expect("first terminal");
+        second.mark_terminal().expect("second terminal");
+        registry.recycle(&first).expect("recycle first");
+        registry.recycle(&second).expect("recycle second");
+
+        let rebound_second = bind_one(&mut registry);
+        let rebound_first = bind_one(&mut registry);
+        assert_eq!(rebound_second.stress_identity(), (1, 2));
+        assert_eq!(rebound_first.stress_identity(), (0, 2));
+        assert_eq!(third.stress_identity(), (2, 1));
+        assert_eq!(registry.available(), 0);
+    }
+
+    #[test]
     fn cancellation_is_idempotent_and_terminal_is_sticky() {
         let mut registry = ControlRegistry::try_with_capacity(1).expect("registry");
         let binding = bind_one(&mut registry);
@@ -967,6 +995,19 @@ mod tests {
         );
 
         stale.mark_terminal().expect("terminal publication");
+        let (after_terminal, terminal_witness) = stale.cancel_with_stress_witness();
+        assert_eq!(
+            after_terminal.expect("cancel after terminal"),
+            CancelDisposition::AlreadyTerminal
+        );
+        assert_eq!(
+            terminal_witness.loaded_word(),
+            requested_witness.resulting_word() | TERMINAL
+        );
+        assert_eq!(
+            terminal_witness.resulting_word(),
+            terminal_witness.loaded_word()
+        );
         registry.recycle(&stale).expect("recycle");
         let current = bind_one(&mut registry);
         let current_word = current.word().expect("word").load(Ordering::Acquire);
@@ -998,8 +1039,9 @@ mod tests {
 
     #[test]
     fn instrumented_disconnect_witnesses_success_already_and_stale_final_loads() {
-        let mut registry = ControlRegistry::try_with_capacity(1).expect("registry");
+        let mut registry = ControlRegistry::try_with_capacity(2).expect("registry");
         let stale = bind_one(&mut registry);
+        let terminal = bind_one(&mut registry);
 
         let (requested, requested_witness) = stale.disconnect_with_stress_witness();
         assert_eq!(
@@ -1024,6 +1066,27 @@ mod tests {
         assert_eq!(
             already_witness.resulting_word(),
             already_witness.loaded_word()
+        );
+
+        terminal.mark_terminal().expect("terminal publication");
+        let (after_terminal, terminal_witness) = terminal.disconnect_with_stress_witness();
+        assert_eq!(
+            after_terminal.expect("disconnect after terminal"),
+            DisconnectDisposition::AlreadyTerminal
+        );
+        assert_eq!(terminal_witness.loaded_word(), (1 << FLAG_BITS) | TERMINAL);
+        assert_eq!(
+            terminal_witness.resulting_word(),
+            terminal_witness.loaded_word() | CANCELLED | DISCONNECTED
+        );
+        let (terminal_again, terminal_again_witness) = terminal.disconnect_with_stress_witness();
+        assert_eq!(
+            terminal_again.expect("repeat terminal disconnect"),
+            DisconnectDisposition::AlreadyTerminal
+        );
+        assert_eq!(
+            terminal_again_witness.resulting_word(),
+            terminal_again_witness.loaded_word()
         );
 
         stale.mark_terminal().expect("terminal publication");

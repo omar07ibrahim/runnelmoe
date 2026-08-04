@@ -64,6 +64,133 @@ pub struct SubmitCommandWitness {
     ready_commit_sequence: u64,
 }
 
+/// Stable structural identity of one accepted request.
+///
+/// Command, control, and endpoint slots are independent namespaces. This
+/// allocation-free witness binds an accepted request ID to the exact control
+/// and endpoint generations owned by its handle.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ActorAcceptedRequestWitness {
+    request_id: crate::RequestId,
+    control_slot_index: usize,
+    control_generation: u64,
+    endpoint_slot_index: usize,
+    endpoint_generation: u64,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorAcceptedRequestWitness {
+    /// Returns the scheduler-assigned request identity.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn request_id(self) -> crate::RequestId {
+        self.request_id
+    }
+
+    /// Returns the control slot index in the control namespace.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn control_slot_index(self) -> usize {
+        self.control_slot_index
+    }
+
+    /// Returns the nonzero control generation.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn control_generation(self) -> u64 {
+        self.control_generation
+    }
+
+    /// Returns the endpoint slot index in the endpoint namespace.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn endpoint_slot_index(self) -> usize {
+        self.endpoint_slot_index
+    }
+
+    /// Returns the nonzero endpoint generation.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn endpoint_generation(self) -> u64 {
+        self.endpoint_generation
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorAcceptedRequestWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorAcceptedRequestWitness")
+            .field("request_id", &self.request_id)
+            .field("control_identity", &"<redacted>")
+            .field("endpoint_identity", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Complete structural evidence for one instrumented nonblocking receive.
+///
+/// The primary witness describes the caller-visible receive. The
+/// opportunistic-EOF witness describes the optional second endpoint probe that
+/// may acknowledge EOF after consuming the final buffered output. A sentinel
+/// in either field means that boundary was not entered; `cached_eof` separates
+/// a repeated EOF result from every other pre-boundary outcome.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ActorReceiveWitness {
+    primary: ActorTryPopWitness,
+    opportunistic_eof: ActorTryPopWitness,
+    cached_eof: bool,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorReceiveWitness {
+    const fn sentinel() -> Self {
+        Self {
+            primary: ActorTryPopWitness::sentinel(ActorTryPopKind::Primary),
+            opportunistic_eof: ActorTryPopWitness::sentinel(ActorTryPopKind::OpportunisticEof),
+            cached_eof: true,
+        }
+    }
+
+    /// Returns the caller-visible endpoint receive witness.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn primary(self) -> ActorTryPopWitness {
+        self.primary
+    }
+
+    /// Returns the optional closed-EOF acknowledgement witness.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn opportunistic_eof(self) -> ActorTryPopWitness {
+        self.opportunistic_eof
+    }
+
+    /// Reports that the handle returned an already-acknowledged EOF without
+    /// entering either endpoint boundary.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn cached_eof(self) -> bool {
+        self.cached_eof
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorReceiveWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorReceiveWitness")
+            .field("primary", &self.primary)
+            .field("opportunistic_eof", &self.opportunistic_eof)
+            .field("cached_eof", &self.cached_eof)
+            .finish()
+    }
+}
+
 #[cfg(any(test, feature = "actor-stress-instrumentation"))]
 impl SubmitCommandWitness {
     /// Returns the claimed command slot, or `None` when no slot was claimed.
@@ -327,6 +454,23 @@ impl RequestHandle {
         self.cancellation.clone()
     }
 
+    /// Returns the accepted request's control and endpoint identities for the
+    /// bounded actor stress checker.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[must_use]
+    #[doc(hidden)]
+    pub fn accepted_request_stress_witness(&self) -> ActorAcceptedRequestWitness {
+        let (control_slot_index, control_generation) = self.cancellation.control.stress_identity();
+        let (endpoint_slot_index, endpoint_generation) = self.receiver.stress_identity();
+        ActorAcceptedRequestWitness {
+            request_id: self.request_id,
+            control_slot_index,
+            control_generation,
+            endpoint_slot_index,
+            endpoint_generation,
+        }
+    }
+
     /// Requests cancellation without consuming this result receiver.
     pub fn cancel(&self) -> SchedulerResult<CancelDisposition> {
         self.cancellation.cancel()
@@ -396,13 +540,21 @@ impl RequestHandle {
     pub fn try_recv_output_with_stress_witness(
         &mut self,
     ) -> (SchedulerResult<TryRecvOutput>, ActorTryPopWitness) {
+        let (result, witness) = self.try_recv_output_with_complete_stress_witness();
+        (result, witness.primary())
+    }
+
+    /// Performs one instrumented nonblocking receive and retains both the
+    /// primary endpoint transition and any opportunistic EOF acknowledgement.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[doc(hidden)]
+    pub fn try_recv_output_with_complete_stress_witness(
+        &mut self,
+    ) -> (SchedulerResult<TryRecvOutput>, ActorReceiveWitness) {
         if self.output_eof {
-            return (
-                Ok(TryRecvOutput::Eof),
-                ActorTryPopWitness::sentinel(ActorTryPopKind::Primary),
-            );
+            return (Ok(TryRecvOutput::Eof), ActorReceiveWitness::sentinel());
         }
-        let (pop, witness) = self
+        let (pop, primary) = self
             .receiver
             .try_pop_with_stress_witness(ActorTryPopKind::Primary);
         let pop = match pop {
@@ -418,13 +570,23 @@ impl RequestHandle {
                 } else {
                     error
                 };
-                return (Err(error), witness);
+                return (
+                    Err(error),
+                    ActorReceiveWitness {
+                        primary,
+                        opportunistic_eof: ActorTryPopWitness::sentinel(
+                            ActorTryPopKind::OpportunisticEof,
+                        ),
+                        cached_eof: false,
+                    },
+                );
             }
         };
         let mut eof_ack = Ok(());
+        let mut opportunistic_eof = ActorTryPopWitness::sentinel(ActorTryPopKind::OpportunisticEof);
         let result = match pop {
             TryPop::Event(event) => {
-                eof_ack = self.acknowledge_closed_eof();
+                (eof_ack, opportunistic_eof) = self.acknowledge_closed_eof_with_stress_witness();
                 TryRecvOutput::Output(event)
             }
             TryPop::Empty => TryRecvOutput::Empty,
@@ -448,7 +610,14 @@ impl RequestHandle {
                 error
             }
         });
-        (result, witness)
+        (
+            result,
+            ActorReceiveWitness {
+                primary,
+                opportunistic_eof,
+                cached_eof: false,
+            },
+        )
     }
 
     /// Waits until one output event or output EOF can be consumed.
@@ -584,6 +753,37 @@ impl RequestHandle {
             }
         }
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    fn acknowledge_closed_eof_with_stress_witness(
+        &mut self,
+    ) -> (SchedulerResult<()>, ActorTryPopWitness) {
+        let sentinel = ActorTryPopWitness::sentinel(ActorTryPopKind::OpportunisticEof);
+        if self.output_eof {
+            return (Ok(()), sentinel);
+        }
+        let snapshot = match self.receiver.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return (Err(error), sentinel),
+        };
+        if snapshot.producer_open || snapshot.buffered_output_events != 0 {
+            return (Ok(()), sentinel);
+        }
+        let (pop, witness) = self
+            .receiver
+            .try_pop_with_stress_witness(ActorTryPopKind::OpportunisticEof);
+        let result = match pop {
+            Ok(TryPop::Eof) => {
+                self.output_eof = true;
+                Ok(())
+            }
+            Ok(TryPop::Empty | TryPop::Event(_)) => Err(SchedulerError::internal(
+                "closed empty request endpoint did not acknowledge EOF",
+            )),
+            Err(error) => Err(error),
+        };
+        (result, witness)
     }
 }
 
@@ -3058,7 +3258,20 @@ mod tests {
                 .expect("cancelled request submission"),
         )
         .await;
-        wait_for_buffered_output(&cancel_handle).await;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = cancel_handle
+                    .receiver
+                    .snapshot()
+                    .expect("cancel endpoint snapshot");
+                if snapshot.producer_open && snapshot.buffered_output_events == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("full cancel endpoint timeout");
         let hold = probe.hold_pump().await.expect("cancel witness hold");
         let (drain, drain_witness) = cancel_handle.try_recv_output_with_stress_witness();
         let event = match drain.expect("primary witnessed drain") {
@@ -3072,6 +3285,31 @@ mod tests {
             drain_witness.drained_before() + 1
         );
         assert_eq!(drain_witness.consumed_output(), Some(event));
+
+        let (second, second_receive) = cancel_handle.try_recv_output_with_complete_stress_witness();
+        let second_event = match second.expect("second witnessed drain") {
+            TryRecvOutput::Output(event) => event,
+            other => panic!("expected a second primary output, got {other:?}"),
+        };
+        assert_eq!(second_event.output_index(), event.output_index() + 1);
+        assert!(!second_receive.cached_eof());
+        assert!(second_receive.primary().boundary_reached());
+        assert_eq!(
+            second_receive.primary().consumed_output(),
+            Some(second_event)
+        );
+        assert!(!second_receive.opportunistic_eof().boundary_reached());
+
+        let (empty, empty_receive) = cancel_handle.try_recv_output_with_complete_stress_witness();
+        assert_eq!(empty.expect("empty witnessed drain"), TryRecvOutput::Empty);
+        assert!(!empty_receive.cached_eof());
+        assert!(empty_receive.primary().boundary_reached());
+        assert_eq!(empty_receive.primary().consumed_output(), None);
+        assert_eq!(
+            empty_receive.primary().drained_after(),
+            empty_receive.primary().drained_before()
+        );
+        assert!(!empty_receive.opportunistic_eof().boundary_reached());
 
         let cancellation = cancel_handle.cancellation();
         let (cancel, cancel_witness) = cancellation.cancel_with_stress_witness();
@@ -3153,6 +3391,188 @@ mod tests {
             .await
             .expect("shutdown timeout")
             .expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_receive_witness_binds_identity_and_opportunistic_eof() {
+        let mut limits = SchedulerLimits::tiny();
+        limits.max_new_tokens = 1;
+        limits.output_capacity_per_request = 2;
+        let (model, config) = model_and_config(limits);
+        let (actor, probe) =
+            SchedulerActor::spawn_instrumented(model, config).expect("instrumented actor");
+        let client = actor.client();
+
+        let mut handle = wait_submission(
+            client
+                .try_submit(request(&[1], 1, None))
+                .expect("one-token request submission"),
+        )
+        .await;
+        let identity = handle.accepted_request_stress_witness();
+        assert_eq!(identity.request_id(), handle.request_id());
+        assert_ne!(identity.control_generation(), 0);
+        assert_ne!(identity.endpoint_generation(), 0);
+        assert!(format!("{identity:?}").contains("<redacted>"));
+
+        assert_eq!(
+            wait_terminal(&mut handle).await.outcome(),
+            TerminalOutcome::Completed
+        );
+        assert!(!handle.output_eof());
+        let (result, receive) = handle.try_recv_output_with_complete_stress_witness();
+        let event = match result.expect("complete witnessed receive") {
+            TryRecvOutput::Output(event) => event,
+            other => panic!("expected final buffered output, got {other:?}"),
+        };
+        assert!(!receive.cached_eof());
+        let primary = receive.primary();
+        assert_eq!(primary.kind(), ActorTryPopKind::Primary);
+        assert!(primary.boundary_reached());
+        assert_eq!(primary.slot_index(), identity.endpoint_slot_index());
+        assert_eq!(primary.slot_generation(), identity.endpoint_generation());
+        assert_eq!(primary.consumed_output(), Some(event));
+        assert_eq!(primary.drained_after(), primary.drained_before() + 1);
+
+        let opportunistic_eof = receive.opportunistic_eof();
+        assert_eq!(opportunistic_eof.kind(), ActorTryPopKind::OpportunisticEof);
+        assert!(opportunistic_eof.boundary_reached());
+        assert_eq!(
+            opportunistic_eof.slot_index(),
+            identity.endpoint_slot_index()
+        );
+        assert_eq!(
+            opportunistic_eof.slot_generation(),
+            identity.endpoint_generation()
+        );
+        assert_eq!(opportunistic_eof.consumed_output(), None);
+        assert_eq!(opportunistic_eof.drained_before(), primary.drained_after());
+        assert_eq!(
+            opportunistic_eof.drained_after(),
+            opportunistic_eof.drained_before()
+        );
+        assert!(handle.output_eof());
+
+        let (cached, cached_receive) = handle.try_recv_output_with_complete_stress_witness();
+        assert_eq!(cached.expect("cached EOF"), TryRecvOutput::Eof);
+        assert!(cached_receive.cached_eof());
+        for witness in [cached_receive.primary(), cached_receive.opportunistic_eof()] {
+            assert!(!witness.boundary_reached());
+            assert_eq!(witness.slot_index(), 0);
+            assert_eq!(witness.slot_generation(), 0);
+            assert_eq!(witness.drained_before(), 0);
+            assert_eq!(witness.drained_after(), 0);
+            assert_eq!(witness.consumed_output(), None);
+        }
+        assert_eq!(cached_receive.primary().kind(), ActorTryPopKind::Primary);
+        assert_eq!(
+            cached_receive.opportunistic_eof().kind(),
+            ActorTryPopKind::OpportunisticEof
+        );
+        let (terminal_cancel, control_witness) = handle.cancel_with_stress_witness();
+        assert_eq!(
+            terminal_cancel.expect("terminal cancellation probe"),
+            CancelDisposition::AlreadyTerminal
+        );
+        assert!(control_witness.boundary_reached());
+        assert_eq!(control_witness.slot_index(), identity.control_slot_index());
+        assert_eq!(
+            control_witness.expected_generation(),
+            identity.control_generation()
+        );
+
+        drop(handle);
+        let reaped = probe.wait_quiescent().await.expect("request reap");
+        assert_eq!(reaped.outstanding_requests, 0);
+        assert_eq!(reaped.request_bytes, 0);
+
+        let mut rebound = wait_submission(
+            client
+                .try_submit(request(&[14], 0, None))
+                .expect("rebound request submission"),
+        )
+        .await;
+        let rebound_identity = rebound.accepted_request_stress_witness();
+        assert_eq!(
+            rebound_identity.request_id().get(),
+            identity.request_id().get() + 1
+        );
+        assert_eq!(
+            rebound_identity.control_slot_index(),
+            identity.control_slot_index()
+        );
+        assert_eq!(
+            rebound_identity.control_generation(),
+            identity.control_generation() + 1
+        );
+        assert_eq!(
+            rebound_identity.endpoint_slot_index(),
+            identity.endpoint_slot_index()
+        );
+        assert_eq!(
+            rebound_identity.endpoint_generation(),
+            identity.endpoint_generation() + 1
+        );
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if rebound
+                    .receiver
+                    .snapshot()
+                    .expect("rebound endpoint snapshot")
+                    .terminal_pending
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rebound terminal publication timeout");
+        let (direct_eof, direct_receive) = rebound.try_recv_output_with_complete_stress_witness();
+        assert_eq!(direct_eof.expect("direct EOF"), TryRecvOutput::Eof);
+        assert!(!direct_receive.cached_eof());
+        let direct_primary = direct_receive.primary();
+        assert!(direct_primary.boundary_reached());
+        assert_eq!(
+            direct_primary.slot_index(),
+            rebound_identity.endpoint_slot_index()
+        );
+        assert_eq!(
+            direct_primary.slot_generation(),
+            rebound_identity.endpoint_generation()
+        );
+        assert_eq!(direct_primary.consumed_output(), None);
+        assert_eq!(
+            direct_primary.drained_after(),
+            direct_primary.drained_before()
+        );
+        assert!(!direct_receive.opportunistic_eof().boundary_reached());
+        assert!(rebound.output_eof());
+        assert_eq!(
+            wait_terminal(&mut rebound).await.outcome(),
+            TerminalOutcome::Completed
+        );
+        drop(rebound);
+        let rebound_reaped = probe.wait_quiescent().await.expect("rebound request reap");
+        assert_eq!(rebound_reaped.outstanding_requests, 0);
+        assert_eq!(rebound_reaped.request_bytes, 0);
+        let report = timeout(Duration::from_secs(5), actor.shutdown())
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown");
+        let stopped = probe.snapshot().expect("post-shutdown snapshot");
+        assert!(stopped.owner_done);
+        assert!(stopped.dirty);
+        assert!(!stopped.parked);
+        assert!(!stopped.pump_in_flight);
+        assert_eq!(stopped.engine_steps, report.engine_steps());
+        assert_eq!(stopped.outstanding_requests, 0);
+        assert_eq!(stopped.request_bytes, 0);
+        assert_eq!(stopped.shared_bytes, 0);
+        assert_eq!(stopped.command_reserved, 0);
+        assert_eq!(stopped.command_ready, 0);
+        assert_eq!(stopped.command_in_flight, 0);
+        assert_eq!(stopped.command_responded, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -44,6 +44,10 @@ async fn feature_on_external_consumer_observes_a_bounded_actor_lifetime() {
         .expect("admission timeout")
         .expect("engine admission");
     let request_id = handle.request_id();
+    let accepted = handle.accepted_request_stress_witness();
+    assert_eq!(accepted.request_id(), request_id);
+    assert_ne!(accepted.control_generation(), 0);
+    assert_ne!(accepted.endpoint_generation(), 0);
     let terminal = timeout(Duration::from_secs(5), handle.terminal())
         .await
         .expect("terminal timeout")
@@ -52,21 +56,31 @@ async fn feature_on_external_consumer_observes_a_bounded_actor_lifetime() {
     assert_eq!(terminal.outcome(), TerminalOutcome::Completed);
 
     let mut output_indices = Vec::new();
-    loop {
-        match timeout(Duration::from_secs(5), handle.recv_output())
-            .await
-            .expect("output timeout")
-            .expect("output receive")
-        {
-            TryRecvOutput::Output(event) => {
-                assert_eq!(event.request_id(), request_id);
-                output_indices.push(event.output_index());
-            }
-            TryRecvOutput::Eof => break,
-            TryRecvOutput::Empty => panic!("awaited receive returned empty"),
-        }
+    for expected_index in 0..2 {
+        let (result, receive) = handle.try_recv_output_with_complete_stress_witness();
+        let event = match result.expect("witnessed output receive") {
+            TryRecvOutput::Output(event) => event,
+            other => panic!("completed request omitted output {expected_index}: {other:?}"),
+        };
+        assert_eq!(event.request_id(), request_id);
+        output_indices.push(event.output_index());
+        let primary = receive.primary();
+        assert!(primary.boundary_reached());
+        assert_eq!(primary.slot_index(), accepted.endpoint_slot_index());
+        assert_eq!(primary.slot_generation(), accepted.endpoint_generation());
+        assert_eq!(primary.consumed_output(), Some(event));
+        assert!(!receive.cached_eof());
+        assert_eq!(
+            receive.opportunistic_eof().boundary_reached(),
+            expected_index == 1
+        );
     }
     assert_eq!(output_indices, [0, 1]);
+    let (cached, receive) = handle.try_recv_output_with_complete_stress_witness();
+    assert_eq!(cached.expect("cached EOF"), TryRecvOutput::Eof);
+    assert!(receive.cached_eof());
+    assert!(!receive.primary().boundary_reached());
+    assert!(!receive.opportunistic_eof().boundary_reached());
     drop(handle);
 
     let reaped = timeout(Duration::from_secs(5), probe.wait_quiescent())
