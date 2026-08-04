@@ -38,6 +38,88 @@ pub(crate) enum DisconnectDisposition {
     AlreadyTerminal,
 }
 
+/// Exact final-iteration observation for one instrumented control mutation.
+///
+/// This API exists only for the bounded actor stress harness. Its raw fields
+/// are deliberately omitted from `Debug`; production code must use the
+/// ordinary cancellation and disconnection methods instead.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ActorControlCasWitness {
+    boundary_reached: bool,
+    slot_index: usize,
+    expected_generation: u64,
+    loaded_word: u64,
+    resulting_word: u64,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorControlCasWitness {
+    #[allow(dead_code, reason = "used for no-call actor stress actions")]
+    pub(crate) const fn sentinel() -> Self {
+        Self {
+            boundary_reached: false,
+            slot_index: 0,
+            expected_generation: 0,
+            loaded_word: 0,
+            resulting_word: 0,
+        }
+    }
+
+    const fn observed(
+        slot_index: usize,
+        expected_generation: u64,
+        loaded_word: u64,
+        resulting_word: u64,
+    ) -> Self {
+        Self {
+            boundary_reached: true,
+            slot_index,
+            expected_generation,
+            loaded_word,
+            resulting_word,
+        }
+    }
+
+    #[must_use]
+    pub const fn boundary_reached(self) -> bool {
+        self.boundary_reached
+    }
+
+    #[must_use]
+    pub const fn slot_index(self) -> usize {
+        self.slot_index
+    }
+
+    #[must_use]
+    pub const fn expected_generation(self) -> u64 {
+        self.expected_generation
+    }
+
+    #[must_use]
+    pub const fn loaded_word(self) -> u64 {
+        self.loaded_word
+    }
+
+    #[must_use]
+    pub const fn resulting_word(self) -> u64 {
+        self.resulting_word
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorControlCasWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorControlCasWitness")
+            .field("boundary_reached", &self.boundary_reached)
+            .field("identity", &"<redacted>")
+            .field("packed_words", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Result of making terminal state visible to request handles.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +262,57 @@ impl ControlBinding {
         }
     }
 
+    /// Performs cancellation and returns the exact final load/CAS iteration.
+    ///
+    /// Unlike a success-only tuple, this preserves the word loaded by a stale
+    /// generation immediately before the typed invalid-request result.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[allow(dead_code, reason = "called by the feature-gated actor stress wrapper")]
+    pub(crate) fn cancel_with_stress_witness(
+        &self,
+    ) -> (SchedulerResult<CancelDisposition>, ActorControlCasWitness) {
+        let expected_generation = self.generation.get();
+        let word = match self.word() {
+            Ok(word) => word,
+            Err(error) => {
+                return (Err(error), ActorControlCasWitness::sentinel());
+            }
+        };
+        loop {
+            let observed = word.load(Ordering::Acquire);
+            let witness = ActorControlCasWitness::observed(
+                self.index,
+                expected_generation,
+                observed,
+                observed,
+            );
+            if let Err(error) = self.validate_generation(observed) {
+                return (Err(error), witness);
+            }
+            if has_flag(observed, TERMINAL) {
+                return (Ok(CancelDisposition::AlreadyTerminal), witness);
+            }
+            if has_flag(observed, CANCELLED) {
+                return (Ok(CancelDisposition::AlreadyRequested), witness);
+            }
+            let resulting = observed | CANCELLED;
+            if word
+                .compare_exchange(observed, resulting, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return (
+                    Ok(CancelDisposition::Requested),
+                    ActorControlCasWitness::observed(
+                        self.index,
+                        expected_generation,
+                        observed,
+                        resulting,
+                    ),
+                );
+            }
+        }
+    }
+
     /// Atomically makes disconnection and its implied cancellation visible.
     ///
     /// Disconnection is recorded even after terminal publication so an owner
@@ -213,6 +346,65 @@ impl ControlBinding {
                 } else {
                     DisconnectDisposition::Requested
                 });
+            }
+        }
+    }
+
+    /// Performs disconnection and returns the exact final load/CAS iteration.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pub(crate) fn disconnect_with_stress_witness(
+        &self,
+    ) -> (
+        SchedulerResult<DisconnectDisposition>,
+        ActorControlCasWitness,
+    ) {
+        let expected_generation = self.generation.get();
+        let word = match self.word() {
+            Ok(word) => word,
+            Err(error) => {
+                return (Err(error), ActorControlCasWitness::sentinel());
+            }
+        };
+        loop {
+            let observed = word.load(Ordering::Acquire);
+            let witness = ActorControlCasWitness::observed(
+                self.index,
+                expected_generation,
+                observed,
+                observed,
+            );
+            if let Err(error) = self.validate_generation(observed) {
+                return (Err(error), witness);
+            }
+            let terminal = has_flag(observed, TERMINAL);
+            if has_flag(observed, DISCONNECTED) {
+                return (
+                    Ok(if terminal {
+                        DisconnectDisposition::AlreadyTerminal
+                    } else {
+                        DisconnectDisposition::AlreadyRequested
+                    }),
+                    witness,
+                );
+            }
+            let resulting = observed | CANCELLED | DISCONNECTED;
+            if word
+                .compare_exchange(observed, resulting, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return (
+                    Ok(if terminal {
+                        DisconnectDisposition::AlreadyTerminal
+                    } else {
+                        DisconnectDisposition::Requested
+                    }),
+                    ActorControlCasWitness::observed(
+                        self.index,
+                        expected_generation,
+                        observed,
+                        resulting,
+                    ),
+                );
             }
         }
     }
@@ -736,6 +928,118 @@ mod tests {
             Ordering::Acquire,
         );
         assert!(result.is_err());
+        assert_eq!(
+            current.fresh_snapshot().expect("current snapshot"),
+            ControlSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn instrumented_cancel_witnesses_success_already_and_stale_final_loads() {
+        let mut registry = ControlRegistry::try_with_capacity(1).expect("registry");
+        let stale = bind_one(&mut registry);
+
+        let (requested, requested_witness) = stale.cancel_with_stress_witness();
+        assert_eq!(
+            requested.expect("cancel request"),
+            CancelDisposition::Requested
+        );
+        assert!(requested_witness.boundary_reached());
+        assert_eq!(requested_witness.expected_generation(), 1);
+        assert_eq!(requested_witness.loaded_word(), 1 << FLAG_BITS);
+        assert_eq!(
+            requested_witness.resulting_word(),
+            (1 << FLAG_BITS) | CANCELLED
+        );
+
+        let (already, already_witness) = stale.cancel_with_stress_witness();
+        assert_eq!(
+            already.expect("repeat cancel"),
+            CancelDisposition::AlreadyRequested
+        );
+        assert_eq!(
+            already_witness.loaded_word(),
+            requested_witness.resulting_word()
+        );
+        assert_eq!(
+            already_witness.resulting_word(),
+            already_witness.loaded_word()
+        );
+
+        stale.mark_terminal().expect("terminal publication");
+        registry.recycle(&stale).expect("recycle");
+        let current = bind_one(&mut registry);
+        let current_word = current.word().expect("word").load(Ordering::Acquire);
+        let (stale_result, stale_witness) = stale.cancel_with_stress_witness();
+        assert_eq!(
+            stale_result.expect_err("stale cancel must fail").category(),
+            ErrorCategory::InvalidRequest
+        );
+        assert!(stale_witness.boundary_reached());
+        assert_eq!(stale_witness.expected_generation(), 1);
+        assert_eq!(stale_witness.loaded_word(), current_word);
+        assert_eq!(stale_witness.resulting_word(), current_word);
+        assert_eq!(stale_witness.slot_index(), requested_witness.slot_index());
+        assert_eq!(
+            current.fresh_snapshot().expect("current snapshot"),
+            ControlSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn unobserved_control_witness_uses_only_zero_sentinels() {
+        let witness = ActorControlCasWitness::sentinel();
+        assert!(!witness.boundary_reached());
+        assert_eq!(witness.slot_index(), 0);
+        assert_eq!(witness.expected_generation(), 0);
+        assert_eq!(witness.loaded_word(), 0);
+        assert_eq!(witness.resulting_word(), 0);
+    }
+
+    #[test]
+    fn instrumented_disconnect_witnesses_success_already_and_stale_final_loads() {
+        let mut registry = ControlRegistry::try_with_capacity(1).expect("registry");
+        let stale = bind_one(&mut registry);
+
+        let (requested, requested_witness) = stale.disconnect_with_stress_witness();
+        assert_eq!(
+            requested.expect("disconnect request"),
+            DisconnectDisposition::Requested
+        );
+        assert_eq!(requested_witness.loaded_word(), 1 << FLAG_BITS);
+        assert_eq!(
+            requested_witness.resulting_word(),
+            (1 << FLAG_BITS) | CANCELLED | DISCONNECTED
+        );
+
+        let (already, already_witness) = stale.disconnect_with_stress_witness();
+        assert_eq!(
+            already.expect("repeat disconnect"),
+            DisconnectDisposition::AlreadyRequested
+        );
+        assert_eq!(
+            already_witness.loaded_word(),
+            requested_witness.resulting_word()
+        );
+        assert_eq!(
+            already_witness.resulting_word(),
+            already_witness.loaded_word()
+        );
+
+        stale.mark_terminal().expect("terminal publication");
+        registry.recycle(&stale).expect("recycle");
+        let current = bind_one(&mut registry);
+        let current_word = current.word().expect("word").load(Ordering::Acquire);
+        let (stale_result, stale_witness) = stale.disconnect_with_stress_witness();
+        assert_eq!(
+            stale_result
+                .expect_err("stale disconnect must fail")
+                .category(),
+            ErrorCategory::InvalidRequest
+        );
+        assert_eq!(stale_witness.loaded_word(), current_word);
+        assert_eq!(stale_witness.resulting_word(), current_word);
+        assert_eq!(stale_witness.expected_generation(), 1);
         assert_eq!(
             current.fresh_snapshot().expect("current snapshot"),
             ControlSnapshot::default()

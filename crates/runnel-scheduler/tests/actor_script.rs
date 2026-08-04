@@ -569,6 +569,17 @@ fn committed_actor_stress_fixture_matches_the_independent_contract() {
 
     let descriptors = descriptors(fixture.parameters.request_count);
     assert_eq!(fixture.descriptor_vectors.count, descriptors.len());
+    let maximum_output_publications = descriptors
+        .iter()
+        .map(|descriptor| descriptor.max_new_tokens)
+        .sum::<u32>();
+    assert_eq!(maximum_output_publications, 547);
+    assert_eq!(
+        maximum_output_publications
+            + 2 * u32::try_from(descriptors.len()).expect("descriptor count fits u32"),
+        675,
+        "bounded observer lifetime covers output, terminal, and first-EOF records"
+    );
     assert_eq!(
         fixture.descriptor_vectors.digest,
         sha256_label(&canonical_json_ascii(&descriptors))

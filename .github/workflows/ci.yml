@@ -50,6 +50,20 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test all targets
         run: cargo test --workspace --all-targets --locked
+      - name: Exercise scheduler feature boundaries
+        run: |
+          cargo clippy -p runnel-scheduler --all-targets --all-features \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets --all-features --locked
+          cargo clippy -p runnel-scheduler --all-targets --no-default-features \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets \
+            --no-default-features --locked
+          cargo clippy -p runnel-scheduler --all-targets \
+            --no-default-features --features actor-stress-instrumentation \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets \
+            --no-default-features --features actor-stress-instrumentation --locked
       - name: Smoke-test the closed M4 evidence protocol
         run: |
           cargo build --locked -p runnel-kernels --bin runnel-kernel-bench \

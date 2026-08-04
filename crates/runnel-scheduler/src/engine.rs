@@ -154,6 +154,61 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         &self.config
     }
 
+    /// Installs a bounded endpoint semantic probe before the first admission.
+    ///
+    /// The explicit observation capacity is independent of request-table
+    /// geometry. Ordinary construction does not allocate or install a probe.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[doc(hidden)]
+    pub fn install_actor_stress_instrumentation(
+        &mut self,
+        observation_capacity: usize,
+    ) -> SchedulerResult<crate::endpoint::ActorStressRecorder> {
+        if self.closed
+            || self.free_slots.len() != self.slots.len()
+            || !self.queued.is_empty()
+            || self.slots.iter().any(|slot| slot.record.is_some())
+            || self.request_ids.peek().map(crate::RequestId::get) != Ok(1)
+        {
+            return Err(SchedulerError::internal(
+                "actor stress instrumentation must be installed before admission",
+            ));
+        }
+        let endpoints = self
+            .endpoints
+            .as_ref()
+            .ok_or_else(|| SchedulerError::internal("request endpoints are unavailable"))?;
+        if endpoints.actor_stress_recorder().is_some() {
+            return Err(SchedulerError::internal(
+                "actor stress instrumentation was already installed",
+            ));
+        }
+        let recorder =
+            crate::endpoint::ActorStressRecorder::try_with_capacity(observation_capacity)?;
+        endpoints.install_actor_stress_recorder(recorder.clone())?;
+        Ok(recorder)
+    }
+
+    /// Returns the installed semantic probe without exposing endpoint tables.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn actor_stress_instrumentation(&self) -> Option<crate::endpoint::ActorStressRecorder> {
+        self.endpoints
+            .as_ref()
+            .and_then(crate::endpoint::EndpointRegistry::actor_stress_recorder)
+    }
+
+    /// Counts every live request record, including a terminal whose result was
+    /// consumed while its output or receiver acknowledgement remains pending.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pub(crate) fn actor_stress_live_request_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.record.is_some())
+            .count()
+    }
+
     fn try_allocate_shared(
         adapter: &A,
         config: &SchedulerConfig,

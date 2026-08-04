@@ -1004,7 +1004,12 @@ cooperative actor shutdown. Consequently shutdown itself cancels and
 terminalizes no request, discards no output, and releases no request-owned
 bytes. Terminal and output publication observers retain semantic records even
 when a receiver was previously dropped, so discarded client delivery cannot
-erase a committed event from the golden transcript.
+erase a committed event from the golden transcript. Before actor construction,
+the observer pre-reserves a logical lifetime capacity of exactly 675 records:
+the frozen descriptors permit at most 547 output publications, plus at most 64
+terminal publications and 64 first-EOF acknowledgements. Its allocation may
+reserve more storage but must never grow after construction; the retained
+logical limit remains 675 and overflow or poison invalidates the run.
 
 Only deterministic request-level outcomes allowed by the frozen actions are
 serialized. A host allocation failure, authenticated-artifact failure, worker

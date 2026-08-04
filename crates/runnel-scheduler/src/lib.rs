@@ -22,6 +22,12 @@ mod request;
 mod ring;
 mod wave;
 
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+pub use actor::{
+    ActorDisconnectDisposition, ActorProbe, ActorProbeSnapshot, ActorPumpHold,
+    ActorRequestDropWitness, ActorRequestDropWitnessSink, ActorWakeWitness, SubmitCommandWitness,
+};
 pub use actor::{
     ActorShutdownReport, RequestCancellation, RequestHandle, SchedulerActor, SchedulerClient,
     Submission, TryRecvOutput,
@@ -29,6 +35,15 @@ pub use actor::{
 pub use config::{
     MAX_BATCH_WIDTH, MAX_WAVES_PER_STEP, SchedulerConfig, SchedulerLimits, SharedStaticCharges,
     StateLayoutSummary,
+};
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+pub use control::ActorControlCasWitness;
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+pub use endpoint::{
+    ActorSemanticObservation, ActorSemanticObservationKind, ActorStressRecorder,
+    ActorStressRecorderStatus, ActorStressRecording, ActorTryPopKind, ActorTryPopWitness,
 };
 pub use engine::SchedulerEngine;
 pub use error::{ErrorCategory, SchedulerError, SchedulerResult};

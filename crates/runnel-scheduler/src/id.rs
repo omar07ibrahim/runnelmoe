@@ -186,7 +186,7 @@ impl RequestIdIssuer {
         self.0.issue(IdentityKind::Request).map(RequestId)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
     pub(crate) const fn peek(&self) -> Result<RequestId, IdentityExhausted> {
         match self.0.peek(IdentityKind::Request) {
             Ok(next) => Ok(RequestId(next)),
@@ -223,7 +223,7 @@ impl SlotKey {
         self.index
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
     pub(crate) const fn generation(self) -> SlotGeneration {
         self.generation
     }

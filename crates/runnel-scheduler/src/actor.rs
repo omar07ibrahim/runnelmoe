@@ -17,6 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+use std::sync::Condvar;
+
 use runnel_runtime::{DecoderAdapter, SamplingPolicy};
 use tokio::{runtime::Handle as RuntimeHandle, sync::Notify, task::JoinHandle};
 
@@ -30,6 +33,12 @@ use crate::{
     },
 };
 
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+use crate::{
+    control::{ActorControlCasWitness, DisconnectDisposition},
+    endpoint::{ActorStressRecorder, ActorTryPopKind, ActorTryPopWitness},
+};
+
 /// Result of a nonblocking output read from a request handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TryRecvOutput {
@@ -39,6 +48,194 @@ pub enum TryRecvOutput {
     Empty,
     /// The producer is closed and every committed output event was consumed.
     Eof,
+}
+
+/// Test-only structural witness for one ordinary submission attempt.
+///
+/// `None`/zero fields are explicit sentinels for boundaries the attempt did
+/// not reach. The type is available only to actor stress instrumentation and
+/// is deliberately not part of the normal scheduler surface.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubmitCommandWitness {
+    command_slot: Option<usize>,
+    ticket: u64,
+    ready_commit_sequence: u64,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl SubmitCommandWitness {
+    /// Returns the claimed command slot, or `None` when no slot was claimed.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn command_slot(self) -> Option<usize> {
+        self.command_slot
+    }
+
+    /// Returns the nonzero generation ticket, or zero before slot claim.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn ticket(self) -> u64 {
+        self.ticket
+    }
+
+    /// Returns the nonzero ready-FIFO commit sequence, or zero when the
+    /// attempt never committed a ready command.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn ready_commit_sequence(self) -> u64 {
+        self.ready_commit_sequence
+    }
+}
+
+/// Public stress-harness spelling of the crate-private disconnect result.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActorDisconnectDisposition {
+    Requested,
+    AlreadyRequested,
+    AlreadyTerminal,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl From<DisconnectDisposition> for ActorDisconnectDisposition {
+    fn from(disposition: DisconnectDisposition) -> Self {
+        match disposition {
+            DisconnectDisposition::Requested => Self::Requested,
+            DisconnectDisposition::AlreadyRequested => Self::AlreadyRequested,
+            DisconnectDisposition::AlreadyTerminal => Self::AlreadyTerminal,
+        }
+    }
+}
+
+/// Structural evidence captured by one prearmed request-handle destructor.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+pub struct ActorRequestDropWitness {
+    result: SchedulerResult<ActorDisconnectDisposition>,
+    control: Option<ActorControlCasWitness>,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorRequestDropWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorRequestDropWitness")
+            .field(
+                "result",
+                &self.result.as_ref().map_err(SchedulerError::category),
+            )
+            .field("control_boundary", &self.control.is_some())
+            .finish()
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorRequestDropWitness {
+    /// Splits the destructor result from its optional control-word witness.
+    #[doc(hidden)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        SchedulerResult<ActorDisconnectDisposition>,
+        Option<ActorControlCasWitness>,
+    ) {
+        (self.result, self.control)
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+enum ActorRequestDropWitnessState {
+    Vacant,
+    Armed,
+    Recorded(ActorRequestDropWitness),
+    Taken,
+}
+
+/// Preallocated one-shot destination for destructor-only disconnect evidence.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ActorRequestDropWitnessSink {
+    state: Arc<Mutex<ActorRequestDropWitnessState>>,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorRequestDropWitnessSink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorRequestDropWitnessSink")
+            .field("contents", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl Default for ActorRequestDropWitnessSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorRequestDropWitnessSink {
+    /// Allocates one sink before arming a handle's destructor path.
+    #[must_use]
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ActorRequestDropWitnessState::Vacant)),
+        }
+    }
+
+    fn arm(&self) -> SchedulerResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SchedulerError::internal("request-drop witness sink is unavailable"))?;
+        if !matches!(*state, ActorRequestDropWitnessState::Vacant) {
+            return Err(SchedulerError::internal(
+                "request-drop witness sink is not vacant",
+            ));
+        }
+        *state = ActorRequestDropWitnessState::Armed;
+        Ok(())
+    }
+
+    fn record(&self, witness: ActorRequestDropWitness) {
+        let mut state = lock_recover(&self.state);
+        if matches!(*state, ActorRequestDropWitnessState::Armed) {
+            *state = ActorRequestDropWitnessState::Recorded(witness);
+        }
+    }
+
+    /// Takes the destructor evidence, or returns `None` while the armed
+    /// handle still owns its receiver. A sink is deliberately single-use.
+    #[doc(hidden)]
+    pub fn take(&self) -> SchedulerResult<Option<ActorRequestDropWitness>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SchedulerError::internal("request-drop witness sink is unavailable"))?;
+        match std::mem::replace(&mut *state, ActorRequestDropWitnessState::Taken) {
+            ActorRequestDropWitnessState::Armed => {
+                *state = ActorRequestDropWitnessState::Armed;
+                Ok(None)
+            }
+            ActorRequestDropWitnessState::Recorded(witness) => Ok(Some(witness)),
+            ActorRequestDropWitnessState::Vacant => {
+                *state = ActorRequestDropWitnessState::Vacant;
+                Err(SchedulerError::internal(
+                    "request-drop witness sink was not armed",
+                ))
+            }
+            ActorRequestDropWitnessState::Taken => Err(SchedulerError::internal(
+                "request-drop witness was already taken",
+            )),
+        }
+    }
 }
 
 /// Cloneable cancellation authority for one accepted request generation.
@@ -64,6 +261,18 @@ impl RequestCancellation {
         self.activity.signal();
         result
     }
+
+    /// Requests cancellation and preserves the exact generation-bound
+    /// control-word decision for the actor stress checker.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[doc(hidden)]
+    pub fn cancel_with_stress_witness(
+        &self,
+    ) -> (SchedulerResult<CancelDisposition>, ActorControlCasWitness) {
+        let (result, witness) = self.control.cancel_with_stress_witness();
+        self.activity.signal();
+        (result, witness)
+    }
 }
 
 /// Sole output and terminal consumer for one accepted request.
@@ -73,6 +282,8 @@ pub struct RequestHandle {
     receiver: EndpointReceiver,
     terminal_cache: Option<TerminalResult>,
     output_eof: bool,
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    drop_witness: Option<ActorRequestDropWitnessSink>,
 }
 
 impl fmt::Debug for RequestHandle {
@@ -99,6 +310,8 @@ impl RequestHandle {
             receiver,
             terminal_cache: None,
             output_eof: false,
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            drop_witness: None,
         }
     }
 
@@ -117,6 +330,15 @@ impl RequestHandle {
     /// Requests cancellation without consuming this result receiver.
     pub fn cancel(&self) -> SchedulerResult<CancelDisposition> {
         self.cancellation.cancel()
+    }
+
+    /// Requests cancellation while retaining the final control CAS/load.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[doc(hidden)]
+    pub fn cancel_with_stress_witness(
+        &self,
+    ) -> (SchedulerResult<CancelDisposition>, ActorControlCasWitness) {
+        self.cancellation.cancel_with_stress_witness()
     }
 
     /// Attempts to consume one output event without waiting.
@@ -164,6 +386,69 @@ impl RequestHandle {
             }
         })?;
         Ok(result)
+    }
+
+    /// Performs one primary nonblocking receive with its exact endpoint
+    /// generation and drain-count transition. Any opportunistic closed-EOF
+    /// acknowledgement remains an ordinary, non-action probe.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[doc(hidden)]
+    pub fn try_recv_output_with_stress_witness(
+        &mut self,
+    ) -> (SchedulerResult<TryRecvOutput>, ActorTryPopWitness) {
+        if self.output_eof {
+            return (
+                Ok(TryRecvOutput::Eof),
+                ActorTryPopWitness::sentinel(ActorTryPopKind::Primary),
+            );
+        }
+        let (pop, witness) = self
+            .receiver
+            .try_pop_with_stress_witness(ActorTryPopKind::Primary);
+        let pop = match pop {
+            Ok(pop) => pop,
+            Err(error) => {
+                let error = if self
+                    .cancellation
+                    .activity
+                    .owner_done
+                    .load(Ordering::Acquire)
+                {
+                    owner_stopped_error(&self.cancellation.activity)
+                } else {
+                    error
+                };
+                return (Err(error), witness);
+            }
+        };
+        let mut eof_ack = Ok(());
+        let result = match pop {
+            TryPop::Event(event) => {
+                eof_ack = self.acknowledge_closed_eof();
+                TryRecvOutput::Output(event)
+            }
+            TryPop::Empty => TryRecvOutput::Empty,
+            TryPop::Eof => {
+                self.output_eof = true;
+                TryRecvOutput::Eof
+            }
+        };
+        if result != TryRecvOutput::Empty {
+            self.cancellation.activity.signal();
+        }
+        let result = eof_ack.map(|()| result).map_err(|error| {
+            if self
+                .cancellation
+                .activity
+                .owner_done
+                .load(Ordering::Acquire)
+            {
+                owner_stopped_error(&self.cancellation.activity)
+            } else {
+                error
+            }
+        });
+        (result, witness)
     }
 
     /// Waits until one output event or output EOF can be consumed.
@@ -262,6 +547,21 @@ impl RequestHandle {
         result
     }
 
+    /// Arms the sole destructor disconnect path to retain its structural
+    /// witness in a preallocated one-shot sink.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[doc(hidden)]
+    pub fn arm_drop_witness(&mut self, sink: ActorRequestDropWitnessSink) -> SchedulerResult<()> {
+        if self.drop_witness.is_some() {
+            return Err(SchedulerError::internal(
+                "request handle already has an armed drop witness",
+            ));
+        }
+        sink.arm()?;
+        self.drop_witness = Some(sink);
+        Ok(())
+    }
+
     /// Reports whether output EOF has already been acknowledged.
     #[must_use]
     pub const fn output_eof(&self) -> bool {
@@ -289,6 +589,16 @@ impl RequestHandle {
 
 impl Drop for RequestHandle {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        if let Some(sink) = self.drop_witness.take() {
+            let (result, control) = self.receiver.disconnect_with_stress_witness();
+            self.cancellation.activity.signal();
+            sink.record(ActorRequestDropWitness {
+                result: result.map(ActorDisconnectDisposition::from),
+                control,
+            });
+            return;
+        }
         let _ = self.receiver.disconnect();
         self.cancellation.activity.signal();
     }
@@ -396,6 +706,54 @@ impl SchedulerClient {
         })
     }
 
+    /// Copies a request while retaining command-table structural evidence.
+    ///
+    /// The witness is returned beside the result so a rejection cannot erase
+    /// a slot/ticket boundary that the attempt already reached.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[doc(hidden)]
+    pub fn try_submit_with_witness(
+        &self,
+        request: RequestSpec<'_>,
+    ) -> (SchedulerResult<Submission>, SubmitCommandWitness) {
+        if let Err(error) = self.shared.validate_submission_shape(request) {
+            return (Err(error), SubmitCommandWitness::default());
+        }
+        let (slot, ticket) = match self.shared.reserve() {
+            Ok(claim) => claim,
+            Err(error) => return (Err(error), SubmitCommandWitness::default()),
+        };
+        let mut witness = SubmitCommandWitness {
+            command_slot: Some(slot),
+            ticket,
+            ready_commit_sequence: 0,
+        };
+        let command = match SubmitCommand::try_from_request(request) {
+            Ok(command) => command,
+            Err(error) => {
+                self.shared.release_reserved(slot, ticket);
+                return (Err(error), witness);
+            }
+        };
+        let ready_commit_sequence = match self.shared.commit_with_witness(slot, ticket, command) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                self.shared.release_reserved(slot, ticket);
+                return (Err(error), witness);
+            }
+        };
+        witness.ready_commit_sequence = ready_commit_sequence;
+        (
+            Ok(Submission {
+                shared: Arc::clone(&self.shared),
+                slot,
+                ticket,
+                pending: true,
+            }),
+            witness,
+        )
+    }
+
     /// Returns nanoseconds elapsed on the actor's monotonic clock.
     #[must_use]
     pub fn monotonic_ns(&self) -> u64 {
@@ -469,6 +827,276 @@ impl ActorShutdownReport {
     }
 }
 
+/// Test-only allocation-free snapshot of actor ownership and wake state.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActorProbeSnapshot {
+    /// A wake or direct-control mutation still requires a final owner scan.
+    pub dirty: bool,
+    /// The async owner has published that it is parked.
+    pub parked: bool,
+    /// A blocking pump invocation is currently outstanding.
+    pub pump_in_flight: bool,
+    /// The owner has completed or failed.
+    pub owner_done: bool,
+    /// Monotone actor-published park generation.
+    pub park_epoch: u64,
+    /// Physical entries into `BlockingOwner::pump`.
+    pub pump_entries: u64,
+    /// Physical synchronous engine steps executed by the actor.
+    pub engine_steps: u64,
+    /// Current ordinary command reservations.
+    pub command_reserved: usize,
+    /// Current commands committed to the ready FIFO.
+    pub command_ready: usize,
+    /// Current commands claimed by the blocking owner.
+    pub command_in_flight: usize,
+    /// Current admission responses awaiting submitter consumption.
+    pub command_responded: usize,
+    /// Exact queued, active, or retained-terminal engine request count.
+    pub outstanding_requests: u64,
+    /// Latest exact request-owned ledger bytes observed by the owner.
+    pub request_bytes: u64,
+    /// Latest exact shared ledger bytes observed by the owner.
+    pub shared_bytes: u64,
+    /// Most recently requested pump-hold epoch.
+    pub pump_hold_requested: u64,
+    /// Most recently acknowledged pump-hold epoch.
+    pub pump_hold_observed: u64,
+    /// Most recently released pump-hold epoch.
+    pub pump_hold_released: u64,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorProbeSnapshot {
+    /// Returns whether this snapshot satisfies the amended ADR's quiescence
+    /// predicate. The wait API additionally proves a stable park epoch.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn quiescent(self) -> bool {
+        self.parked && !self.pump_in_flight && !self.dirty && !self.owner_done
+    }
+
+    /// Returns whether the blocking owner is stopped inside the requested
+    /// pump-entry gate rather than merely parked between pumps.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn pump_held(self) -> bool {
+        self.pump_in_flight
+            && self.pump_hold_requested != 0
+            && self.pump_hold_observed == self.pump_hold_requested
+            && self.pump_hold_released < self.pump_hold_requested
+    }
+}
+
+/// Test-only structural witness for one global actor wake.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActorWakeWitness {
+    /// Whether dirty was already set at the wake linearization.
+    pub dirty_was_set: bool,
+    /// Park generation observed before signaling.
+    pub before_park_epoch: u64,
+    /// Strictly later acknowledged quiescent park generation.
+    pub after_park_epoch: u64,
+}
+
+/// Test-only handle for lost-wake-safe actor state observation.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ActorProbe {
+    shared: Arc<Shared>,
+    recorder: Option<ActorStressRecorder>,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorProbe")
+            .field("state", &"<instrumented>")
+            .finish()
+    }
+}
+
+/// Test-only RAII hold for one acknowledged blocking pump entry.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+pub struct ActorPumpHold {
+    shared: Arc<Shared>,
+    epoch: u64,
+    active: bool,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorPumpHold {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorPumpHold")
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorPumpHold {
+    /// Returns this hold's monotone gate epoch.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Releases the blocking owner and consumes this hold.
+    #[doc(hidden)]
+    pub fn release(mut self) -> SchedulerResult<()> {
+        self.shared.pump_gate.release(self.epoch)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl Drop for ActorPumpHold {
+    fn drop(&mut self) {
+        if self.active {
+            self.shared.pump_gate.release_recovering(self.epoch);
+            self.active = false;
+        }
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorProbe {
+    /// Returns the preinstalled bounded semantic endpoint recorder.
+    #[doc(hidden)]
+    pub fn recorder(&self) -> SchedulerResult<ActorStressRecorder> {
+        self.recorder.clone().ok_or_else(|| {
+            SchedulerError::internal("actor semantic stress recorder is unavailable")
+        })
+    }
+
+    /// Takes one allocation-free concurrent actor snapshot.
+    #[doc(hidden)]
+    pub fn snapshot(&self) -> SchedulerResult<ActorProbeSnapshot> {
+        let occupancy = self.shared.lock_queue()?.occupancy();
+        let gate = self.shared.pump_gate.state()?;
+        Ok(ActorProbeSnapshot {
+            dirty: self.shared.activity.dirty.load(Ordering::Acquire),
+            parked: self.shared.activity.parked.load(Ordering::Acquire),
+            pump_in_flight: self.shared.activity.pump_in_flight.load(Ordering::Acquire),
+            owner_done: self.shared.activity.owner_done.load(Ordering::Acquire),
+            park_epoch: self.shared.activity.park_epoch.load(Ordering::Acquire),
+            pump_entries: self.shared.activity.pump_entries.load(Ordering::Acquire),
+            engine_steps: self.shared.observed_engine_steps.load(Ordering::Acquire),
+            command_reserved: occupancy.reserved,
+            command_ready: occupancy.ready,
+            command_in_flight: occupancy.in_flight,
+            command_responded: occupancy.responded,
+            outstanding_requests: self
+                .shared
+                .observed_outstanding_requests
+                .load(Ordering::Acquire),
+            request_bytes: self.shared.observed_request_bytes.load(Ordering::Acquire),
+            shared_bytes: self.shared.observed_shared_bytes.load(Ordering::Acquire),
+            pump_hold_requested: gate.requested_epoch,
+            pump_hold_observed: gate.observed_epoch,
+            pump_hold_released: gate.released_epoch,
+        })
+    }
+
+    /// Waits for an actor-published, stable quiescent park.
+    #[doc(hidden)]
+    pub async fn wait_quiescent(&self) -> SchedulerResult<ActorProbeSnapshot> {
+        self.wait_quiescent_after(None).await
+    }
+
+    async fn wait_quiescent_after(
+        &self,
+        minimum_exclusive_epoch: Option<u64>,
+    ) -> SchedulerResult<ActorProbeSnapshot> {
+        loop {
+            let notified = self.shared.activity.park_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            let first = self.snapshot()?;
+            if first.quiescent()
+                && minimum_exclusive_epoch.is_none_or(|minimum| first.park_epoch > minimum)
+            {
+                std::sync::atomic::fence(Ordering::Acquire);
+                let second = self.snapshot()?;
+                if second.quiescent()
+                    && second.park_epoch == first.park_epoch
+                    && minimum_exclusive_epoch.is_none_or(|minimum| second.park_epoch > minimum)
+                {
+                    return Ok(second);
+                }
+            }
+            if first.owner_done {
+                return Err(owner_stopped_error(&self.shared.activity));
+            }
+            notified.await;
+        }
+    }
+
+    /// Signals global activity and waits for a strictly later quiescent park.
+    #[doc(hidden)]
+    pub async fn wake_and_wait(&self) -> SchedulerResult<ActorWakeWitness> {
+        let before_park_epoch = self.shared.activity.park_epoch.load(Ordering::Acquire);
+        let dirty_was_set = self.shared.activity.signal_observed();
+        let after = self.wait_quiescent_after(Some(before_park_epoch)).await?;
+        Ok(ActorWakeWitness {
+            dirty_was_set,
+            before_park_epoch,
+            after_park_epoch: after.park_epoch,
+        })
+    }
+
+    /// Waits for quiescence, requests one real pump-entry hold, and returns
+    /// only after the blocking owner has acknowledged that epoch.
+    #[doc(hidden)]
+    pub async fn hold_pump(&self) -> SchedulerResult<ActorPumpHold> {
+        let _ = self.wait_quiescent().await?;
+        let epoch = self.shared.pump_gate.request()?;
+        // Arm recovery before the first suspension following the gate
+        // request. Cancelling this future must release even an epoch that the
+        // blocking owner has not observed yet.
+        let hold = ActorPumpHold {
+            shared: Arc::clone(&self.shared),
+            epoch,
+            active: true,
+        };
+        self.shared.activity.signal();
+        loop {
+            let notified = self.shared.pump_gate.observed.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            let gate = self.shared.pump_gate.state()?;
+            if gate.observed_epoch >= epoch {
+                let snapshot = self.snapshot()?;
+                if !snapshot.pump_held() {
+                    return Err(SchedulerError::internal(
+                        "actor acknowledged a pump hold outside the blocking entry",
+                    ));
+                }
+                return Ok(hold);
+            }
+            if self.shared.activity.owner_done.load(Ordering::Acquire) {
+                return Err(owner_stopped_error(&self.shared.activity));
+            }
+            tokio::select! {
+                () = &mut notified => {}
+                () = self.shared.activity.wait_owner_done() => {
+                    return Err(owner_stopped_error(&self.shared.activity));
+                }
+            }
+        }
+    }
+}
+
 /// Handle for one long-lived scheduler owner with at most one awaited Tokio
 /// blocking pump in flight.
 pub struct SchedulerActor {
@@ -511,6 +1139,52 @@ impl SchedulerActor {
         })
     }
 
+    /// Test convenience using a capacity larger than these unit fixtures.
+    #[cfg(test)]
+    pub fn spawn_instrumented<A>(
+        adapter: A,
+        config: SchedulerConfig,
+    ) -> SchedulerResult<(Self, ActorProbe)>
+    where
+        A: DecoderAdapter + 'static,
+    {
+        Self::spawn_instrumented_with_capacity(adapter, config, 4_096)
+    }
+
+    /// Builds an actor with a pre-admission bounded semantic recorder and its
+    /// non-production structural probe.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    #[doc(hidden)]
+    pub fn spawn_instrumented_with_capacity<A>(
+        adapter: A,
+        config: SchedulerConfig,
+        observation_capacity: usize,
+    ) -> SchedulerResult<(Self, ActorProbe)>
+    where
+        A: DecoderAdapter + 'static,
+    {
+        let runtime = RuntimeHandle::try_current().map_err(|_| {
+            SchedulerError::unsupported("SchedulerActor requires a live Tokio runtime")
+        })?;
+        let mut engine = SchedulerEngine::new(adapter, config)?;
+        let recorder = engine.install_actor_stress_instrumentation(observation_capacity)?;
+        let shared = Arc::new(Shared::try_new(config)?);
+        let client = SchedulerClient {
+            shared: Arc::clone(&shared),
+        };
+        let owner = BlockingOwner::try_new(engine, shared)?;
+        let join = runtime.spawn(async move { owner.run().await });
+        let actor = Self {
+            client,
+            join: Some(join),
+        };
+        let probe = ActorProbe {
+            shared: Arc::clone(&actor.client.shared),
+            recorder: Some(recorder),
+        };
+        Ok((actor, probe))
+    }
+
     /// Returns a cloneable client for submission and out-of-band shutdown.
     #[must_use]
     pub fn client(&self) -> SchedulerClient {
@@ -544,14 +1218,16 @@ struct Activity {
     owner_failed: AtomicBool,
     owner_done: AtomicBool,
     lifecycle: Notify,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
     pump_in_flight: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
     parked: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
     park_epoch: AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
     park_notify: Notify,
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pump_entries: AtomicU64,
 }
 
 impl Activity {
@@ -562,14 +1238,16 @@ impl Activity {
             owner_failed: AtomicBool::new(false),
             owner_done: AtomicBool::new(false),
             lifecycle: Notify::const_new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
             pump_in_flight: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
             parked: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
             park_epoch: AtomicU64::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
             park_notify: Notify::const_new(),
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            pump_entries: AtomicU64::new(0),
         }
     }
 
@@ -578,18 +1256,20 @@ impl Activity {
         self.notify.notify_one();
     }
 
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    fn signal_observed(&self) -> bool {
+        let was_dirty = self.dirty.swap(true, Ordering::AcqRel);
+        self.notify.notify_one();
+        was_dirty
+    }
+
+    #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
     async fn wait_until(&self, deadline: Option<Instant>) {
         let notified = self.notify.notified();
         let mut notified = std::pin::pin!(notified);
         notified.as_mut().enable();
         if self.dirty.swap(false, Ordering::AcqRel) {
             return;
-        }
-        #[cfg(test)]
-        {
-            self.parked.store(true, Ordering::Release);
-            self.park_epoch.fetch_add(1, Ordering::AcqRel);
-            self.park_notify.notify_waiters();
         }
         if let Some(deadline) = deadline {
             tokio::select! {
@@ -599,8 +1279,43 @@ impl Activity {
         } else {
             notified.await;
         }
-        #[cfg(test)]
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    async fn wait_until(&self, deadline: Option<Instant>) -> SchedulerResult<()> {
+        let notified = self.notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        if self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.park_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map_err(|_| {
+                SchedulerError::resource_exhausted("actor quiescence epoch", u64::MAX, u64::MAX)
+            })?;
+        // Publish the park predicate only after its generation is committed;
+        // observers must never acknowledge this park under the prior epoch.
+        self.parked.store(true, Ordering::Release);
+        self.park_notify.notify_waiters();
+        if self.dirty.load(Ordering::Acquire) {
+            self.parked.store(false, Ordering::Release);
+            self.park_notify.notify_waiters();
+            return Ok(());
+        }
+        if let Some(deadline) = deadline {
+            tokio::select! {
+                () = &mut notified => {},
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {},
+            }
+        } else {
+            notified.await;
+        }
         self.parked.store(false, Ordering::Release);
+        self.park_notify.notify_waiters();
+        Ok(())
     }
 
     async fn wait_owner_done(&self) {
@@ -621,7 +1336,162 @@ impl Activity {
         }
         self.owner_done.store(true, Ordering::Release);
         self.lifecycle.notify_waiters();
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        self.park_notify.notify_waiters();
         self.signal();
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    fn record_pump_entry(&self) -> SchedulerResult<u64> {
+        self.pump_entries
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |entries| {
+                entries.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| {
+                SchedulerError::resource_exhausted("actor pump-entry count", u64::MAX, u64::MAX)
+            })
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+struct PumpGate {
+    state: Mutex<PumpGateState>,
+    release: Condvar,
+    observed: Notify,
+    #[cfg(test)]
+    pause_before_observe: AtomicBool,
+    #[cfg(test)]
+    entry_waiting: Notify,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PumpGateState {
+    requested_epoch: u64,
+    observed_epoch: u64,
+    released_epoch: u64,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl PumpGate {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(PumpGateState {
+                requested_epoch: 0,
+                observed_epoch: 0,
+                released_epoch: 0,
+            }),
+            release: Condvar::new(),
+            observed: Notify::const_new(),
+            #[cfg(test)]
+            pause_before_observe: AtomicBool::new(false),
+            #[cfg(test)]
+            entry_waiting: Notify::const_new(),
+        }
+    }
+
+    fn request(&self) -> SchedulerResult<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SchedulerError::internal("actor pump gate is unavailable"))?;
+        if state.requested_epoch != state.released_epoch {
+            return Err(SchedulerError::internal(
+                "actor pump gate already has an outstanding hold",
+            ));
+        }
+        let epoch = state.requested_epoch.checked_add(1).ok_or_else(|| {
+            SchedulerError::resource_exhausted("actor pump-gate epoch", u64::MAX, u64::MAX)
+        })?;
+        state.requested_epoch = epoch;
+        Ok(epoch)
+    }
+
+    fn wait_at_entry(&self) -> SchedulerResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SchedulerError::internal("actor pump gate is unavailable"))?;
+        #[cfg(test)]
+        {
+            self.entry_waiting.notify_waiters();
+            while self.pause_before_observe.load(Ordering::Acquire) {
+                state = self
+                    .release
+                    .wait(state)
+                    .map_err(|_| SchedulerError::internal("actor pump gate is unavailable"))?;
+            }
+        }
+        let epoch = state.requested_epoch;
+        if epoch == state.released_epoch {
+            return Ok(());
+        }
+        if epoch < state.released_epoch || state.observed_epoch > epoch {
+            return Err(SchedulerError::internal(
+                "actor pump gate epochs are inconsistent",
+            ));
+        }
+        state.observed_epoch = epoch;
+        self.observed.notify_waiters();
+        while state.released_epoch < epoch {
+            state = self
+                .release
+                .wait(state)
+                .map_err(|_| SchedulerError::internal("actor pump gate is unavailable"))?;
+        }
+        if state.released_epoch != epoch {
+            return Err(SchedulerError::internal(
+                "actor pump gate released an unexpected epoch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn release(&self, epoch: u64) -> SchedulerResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SchedulerError::internal("actor pump gate is unavailable"))?;
+        if state.requested_epoch != epoch
+            || state.observed_epoch < epoch
+            || state.released_epoch >= epoch
+        {
+            return Err(SchedulerError::internal(
+                "actor pump hold is stale or was already released",
+            ));
+        }
+        state.released_epoch = epoch;
+        drop(state);
+        self.release.notify_all();
+        Ok(())
+    }
+
+    fn release_recovering(&self, epoch: u64) {
+        let mut state = lock_recover(&self.state);
+        if state.requested_epoch == epoch && state.released_epoch < epoch {
+            state.released_epoch = epoch;
+            drop(state);
+            self.release.notify_all();
+        }
+    }
+
+    fn state(&self) -> SchedulerResult<PumpGateState> {
+        self.state
+            .lock()
+            .map(|state| *state)
+            .map_err(|_| SchedulerError::internal("actor pump gate is unavailable"))
+    }
+
+    #[cfg(test)]
+    fn pause_entry_before_observe(&self) {
+        self.pause_before_observe.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn resume_entry_before_observe(&self) {
+        self.pause_before_observe.store(false, Ordering::Release);
+        self.release.notify_all();
     }
 }
 
@@ -630,16 +1500,16 @@ struct Shared {
     slots: Box<[CommandSlot]>,
     activity: Arc<Activity>,
     closed: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
     observed_engine_steps: AtomicU64,
-    #[cfg(test)]
-    hold_pumps: AtomicBool,
-    #[cfg(test)]
-    hold_epoch: AtomicU64,
-    #[cfg(test)]
-    hold_observed: AtomicU64,
-    #[cfg(test)]
-    hold_notify: Notify,
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    observed_outstanding_requests: AtomicU64,
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    observed_request_bytes: AtomicU64,
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    observed_shared_bytes: AtomicU64,
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pump_gate: PumpGate,
     #[cfg(test)]
     panic_next_pump: AtomicBool,
     origin: Instant,
@@ -671,16 +1541,16 @@ impl Shared {
             slots: slots.into_boxed_slice(),
             activity: Arc::new(Activity::new()),
             closed: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
             observed_engine_steps: AtomicU64::new(0),
-            #[cfg(test)]
-            hold_pumps: AtomicBool::new(false),
-            #[cfg(test)]
-            hold_epoch: AtomicU64::new(0),
-            #[cfg(test)]
-            hold_observed: AtomicU64::new(0),
-            #[cfg(test)]
-            hold_notify: Notify::const_new(),
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            observed_outstanding_requests: AtomicU64::new(0),
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            observed_request_bytes: AtomicU64::new(0),
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            observed_shared_bytes: AtomicU64::new(0),
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            pump_gate: PumpGate::new(),
             #[cfg(test)]
             panic_next_pump: AtomicBool::new(false),
             origin: Instant::now(),
@@ -807,6 +1677,7 @@ impl Shared {
         ))
     }
 
+    #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
     fn commit(&self, index: usize, ticket: u64, command: SubmitCommand) -> SchedulerResult<()> {
         let mut queue = self.lock_queue()?;
         if self.closed.load(Ordering::Acquire) {
@@ -825,6 +1696,49 @@ impl Shared {
         drop(queue);
         self.activity.signal();
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    fn commit(&self, index: usize, ticket: u64, command: SubmitCommand) -> SchedulerResult<()> {
+        self.commit_with_witness(index, ticket, command).map(drop)
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    fn commit_with_witness(
+        &self,
+        index: usize,
+        ticket: u64,
+        command: SubmitCommand,
+    ) -> SchedulerResult<u64> {
+        let mut queue = self.lock_queue()?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SchedulerError::scheduler_closed());
+        }
+        if queue.ready.len() >= queue.ready.capacity() {
+            return Err(SchedulerError::internal(
+                "actor ready FIFO exceeded reserved capacity",
+            ));
+        }
+        let _ = checked_state_mut(&mut queue, index, ticket, CommandPhase::Reserved)?;
+        let ready_commit_sequence =
+            queue
+                .next_ready_commit_sequence
+                .checked_add(1)
+                .ok_or_else(|| {
+                    SchedulerError::resource_exhausted(
+                        "actor ready-commit sequence",
+                        u64::MAX,
+                        u64::MAX,
+                    )
+                })?;
+        transition(&mut queue, index, CommandPhase::Ready)?;
+        queue.next_ready_commit_sequence = ready_commit_sequence;
+        queue.states[index].command = Some(command);
+        queue.ready.push_back(index);
+        queue.debug_assert_conserved();
+        drop(queue);
+        self.activity.signal();
+        Ok(ready_commit_sequence)
     }
 
     fn release_reserved(&self, index: usize, ticket: u64) {
@@ -1060,6 +1974,8 @@ struct CommandQueue {
     free: Vec<usize>,
     occupancy: QueueOccupancy,
     retired: usize,
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    next_ready_commit_sequence: u64,
 }
 
 impl CommandQueue {
@@ -1080,6 +1996,8 @@ impl CommandQueue {
             free,
             occupancy: QueueOccupancy::default(),
             retired: 0,
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            next_ready_commit_sequence: 0,
         })
     }
 
@@ -1128,7 +2046,7 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
         let command_batch_limit = engine.config().batch_width();
         let mut accepted = Vec::new();
         try_reserve_vec(&mut accepted, maximum, "actor accepted-control table")?;
-        Ok(Self {
+        let owner = Self {
             engine,
             shared,
             accepted,
@@ -1137,7 +2055,10 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
             shutdown_cancellations: 0,
             engine_steps: 0,
             command_batch_limit,
-        })
+        };
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        owner.publish_probe_state()?;
+        Ok(owner)
     }
 
     async fn run(mut self) -> SchedulerResult<ActorShutdownReport>
@@ -1146,24 +2067,28 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
     {
         loop {
             let shared = Arc::clone(&self.shared);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
             {
                 self.shared.activity.parked.store(false, Ordering::Release);
                 self.shared
                     .activity
                     .pump_in_flight
                     .store(true, Ordering::Release);
+                self.shared.activity.park_notify.notify_waiters();
             }
             let joined = tokio::task::spawn_blocking(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| self.pump()));
                 (self, result)
             })
             .await;
-            #[cfg(test)]
-            shared
-                .activity
-                .pump_in_flight
-                .store(false, Ordering::Release);
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            {
+                shared
+                    .activity
+                    .pump_in_flight
+                    .store(false, Ordering::Release);
+                shared.activity.park_notify.notify_waiters();
+            }
             let (owner, result) = match joined {
                 Ok(result) => result,
                 Err(_) => {
@@ -1185,23 +2110,27 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
             };
             match state {
                 PumpState::Continue => {}
-                PumpState::Wait(deadline) => self.shared.activity.wait_until(deadline).await,
+                PumpState::Wait(deadline) => {
+                    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+                    if let Err(error) = self.shared.activity.wait_until(deadline).await {
+                        return self.fail(error);
+                    }
+                    #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
+                    self.shared.activity.wait_until(deadline).await;
+                }
                 PumpState::Complete(report) => return Ok(report),
             }
         }
     }
 
     fn pump(&mut self) -> SchedulerResult<PumpState> {
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        self.shared.activity.record_pump_entry()?;
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        self.shared.pump_gate.wait_at_entry()?;
         #[cfg(test)]
         if self.shared.panic_next_pump.swap(false, Ordering::AcqRel) {
             panic!("injected actor pump panic");
-        }
-        #[cfg(test)]
-        if self.shared.hold_pumps.load(Ordering::Acquire) {
-            let epoch = self.shared.hold_epoch.load(Ordering::Acquire);
-            self.shared.hold_observed.store(epoch, Ordering::Release);
-            self.shared.hold_notify.notify_waiters();
-            return Ok(PumpState::Wait(None));
         }
         self.prune_accepted()?;
         let initially_closing = self.shared.closed.load(Ordering::Acquire);
@@ -1223,7 +2152,7 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
             self.engine_steps = self.engine_steps.checked_add(1).ok_or_else(|| {
                 SchedulerError::resource_exhausted("actor engine-step count", u64::MAX, u64::MAX)
             })?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
             self.shared
                 .observed_engine_steps
                 .store(self.engine_steps, Ordering::Release);
@@ -1231,6 +2160,8 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
                 .step_with_clock(&|| self.shared.monotonic_ns())?
         };
         self.prune_accepted()?;
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        self.publish_probe_state()?;
 
         if closing {
             self.cancel_accepted()?;
@@ -1241,6 +2172,8 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
                 && self.engine.ledger_snapshot().request_used() == 0
             {
                 let engine = self.engine.shutdown()?;
+                #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+                self.publish_probe_state()?;
                 let report = ActorShutdownReport {
                     engine,
                     accepted_submissions: self.accepted_submissions,
@@ -1258,6 +2191,24 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
         }
         let deadline = if closing { None } else { self.next_deadline()? };
         Ok(PumpState::Wait(deadline))
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    fn publish_probe_state(&self) -> SchedulerResult<()> {
+        let ledger = self.engine.ledger_snapshot();
+        let outstanding_requests = self.engine.actor_stress_live_request_count();
+        let outstanding_requests = u64::try_from(outstanding_requests)
+            .map_err(|_| SchedulerError::internal("actor request count exceeds u64"))?;
+        self.shared
+            .observed_outstanding_requests
+            .store(outstanding_requests, Ordering::Release);
+        self.shared
+            .observed_request_bytes
+            .store(ledger.request_used(), Ordering::Release);
+        self.shared
+            .observed_shared_bytes
+            .store(ledger.shared_used(), Ordering::Release);
+        Ok(())
     }
 
     fn process_commands(&mut self, reject: bool) -> SchedulerResult<()> {
@@ -1382,7 +2333,11 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
         let mut first_error = None;
         self.accepted
             .retain(|entry| match entry.control.fresh_snapshot() {
-                Ok(_) => true,
+                // Terminal controls no longer participate in actor deadline
+                // or shutdown scans. Releasing this owner clone immediately
+                // also keeps the fixed table reusable before its slot is
+                // rebound to a later generation.
+                Ok(snapshot) => !snapshot.terminal(),
                 Err(SchedulerError::RequestNotFound) => false,
                 Err(error) => {
                     if first_error.is_none() {
@@ -1679,54 +2634,31 @@ mod tests {
         }
     }
 
-    async fn wait_until_parked(shared: &Shared) -> u64 {
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let notified = shared.activity.park_notify.notified();
-                let mut notified = std::pin::pin!(notified);
-                notified.as_mut().enable();
-                if shared.activity.parked.load(Ordering::Acquire)
-                    && !shared.activity.pump_in_flight.load(Ordering::Acquire)
-                    && !shared.activity.dirty.load(Ordering::Acquire)
-                {
-                    for _ in 0..16 {
-                        tokio::task::yield_now().await;
-                    }
-                    if shared.activity.parked.load(Ordering::Acquire)
-                        && !shared.activity.pump_in_flight.load(Ordering::Acquire)
-                    {
-                        return shared.observed_engine_steps.load(Ordering::Acquire);
-                    }
-                }
-                notified.await;
-            }
-        })
-        .await
-        .expect("actor parked acknowledgement timeout")
+    async fn wait_until_parked(shared: &Arc<Shared>) -> u64 {
+        let probe = ActorProbe {
+            shared: Arc::clone(shared),
+            recorder: None,
+        };
+        timeout(Duration::from_secs(5), probe.wait_quiescent())
+            .await
+            .expect("actor parked acknowledgement timeout")
+            .expect("actor quiescence")
+            .engine_steps
     }
 
-    async fn hold_owner(shared: &Shared) {
-        let epoch = shared.hold_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        shared.hold_pumps.store(true, Ordering::Release);
-        shared.activity.signal();
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let notified = shared.hold_notify.notified();
-                let mut notified = std::pin::pin!(notified);
-                notified.as_mut().enable();
-                if shared.hold_observed.load(Ordering::Acquire) >= epoch {
-                    return;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .expect("owner hold acknowledgement timeout");
+    async fn hold_owner(shared: &Arc<Shared>) -> ActorPumpHold {
+        let probe = ActorProbe {
+            shared: Arc::clone(shared),
+            recorder: None,
+        };
+        timeout(Duration::from_secs(5), probe.hold_pump())
+            .await
+            .expect("owner hold acknowledgement timeout")
+            .expect("owner pump hold")
     }
 
-    fn release_owner(shared: &Shared) {
-        shared.hold_pumps.store(false, Ordering::Release);
-        shared.activity.signal();
+    fn release_owner(hold: ActorPumpHold) {
+        hold.release().expect("release owner pump hold");
     }
 
     async fn wait_for_buffered_output(handle: &RequestHandle) {
@@ -1877,7 +2809,10 @@ mod tests {
         for turn in 0..256 {
             let waiter_activity = Arc::clone(&activity);
             let waiter = tokio::spawn(async move {
-                waiter_activity.wait_until(None).await;
+                waiter_activity
+                    .wait_until(None)
+                    .await
+                    .expect("activity wait");
             });
             if turn % 2 == 0 {
                 tokio::task::yield_now().await;
@@ -1889,6 +2824,428 @@ mod tests {
                 .expect("activity waiter task");
             activity.dirty.store(false, Ordering::Release);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instrumented_quiescence_is_stable_and_wake_acknowledges_a_later_park() {
+        let (model, config) = model_and_config(SchedulerLimits::tiny());
+        let (actor, probe) =
+            SchedulerActor::spawn_instrumented(model, config).expect("instrumented actor");
+
+        let initial = timeout(Duration::from_secs(5), probe.wait_quiescent())
+            .await
+            .expect("initial quiescence timeout")
+            .expect("initial quiescence");
+        assert!(initial.quiescent());
+        assert!(initial.park_epoch > 0);
+        assert!(
+            initial.pump_entries > 0,
+            "initial no-work pump was not counted"
+        );
+
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let stable = probe.wait_quiescent().await.expect("stable quiescence");
+        assert_eq!(stable.park_epoch, initial.park_epoch);
+        assert_eq!(stable.pump_entries, initial.pump_entries);
+
+        let wake = timeout(Duration::from_secs(5), probe.wake_and_wait())
+            .await
+            .expect("wake acknowledgement timeout")
+            .expect("wake acknowledgement");
+        assert!(!wake.dirty_was_set);
+        assert_eq!(wake.before_park_epoch, initial.park_epoch);
+        assert!(wake.after_park_epoch > wake.before_park_epoch);
+        let after = probe.snapshot().expect("post-wake snapshot");
+        assert!(after.quiescent());
+        assert_eq!(after.park_epoch, wake.after_park_epoch);
+        assert!(
+            after.pump_entries > initial.pump_entries,
+            "global no-work wake did not enter the physical pump"
+        );
+
+        timeout(Duration::from_secs(5), actor.shutdown())
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acknowledged_pump_hold_counts_entry_and_excludes_model_work() {
+        let (model, config) = model_and_config(SchedulerLimits::tiny());
+        let (actor, probe) =
+            SchedulerActor::spawn_instrumented(model, config).expect("instrumented actor");
+        let client = actor.client();
+        let baseline = probe.wait_quiescent().await.expect("initial quiescence");
+
+        let hold = timeout(Duration::from_secs(5), probe.hold_pump())
+            .await
+            .expect("pump hold timeout")
+            .expect("pump hold");
+        let held = probe.snapshot().expect("held snapshot");
+        assert!(held.pump_held());
+        assert_eq!(held.pump_entries, baseline.pump_entries + 1);
+        assert_eq!(held.engine_steps, baseline.engine_steps);
+
+        let (submission, witness) = client.try_submit_with_witness(request(&[1], 0, None));
+        let submission = submission.expect("held ready command");
+        assert!(witness.command_slot().is_some());
+        assert_ne!(witness.ticket(), 0);
+        assert_ne!(witness.ready_commit_sequence(), 0);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let still_held = probe.snapshot().expect("still-held snapshot");
+        assert!(still_held.pump_held());
+        assert_eq!(still_held.engine_steps, baseline.engine_steps);
+        assert_eq!(still_held.request_bytes, 0);
+        assert_eq!(still_held.command_ready, 1);
+
+        hold.release().expect("release pump hold");
+        let mut handle = wait_submission(submission).await;
+        assert_eq!(
+            wait_terminal(&mut handle).await.outcome(),
+            TerminalOutcome::Completed
+        );
+        drop(handle);
+        let reaped = probe.wait_quiescent().await.expect("post-drop quiescence");
+        assert_eq!(reaped.outstanding_requests, 0);
+        assert_eq!(reaped.request_bytes, 0);
+        timeout(Duration::from_secs(5), actor.shutdown())
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_pending_pump_hold_releases_unobserved_epoch() {
+        let (model, config) = model_and_config(SchedulerLimits::tiny());
+        let (actor, probe) =
+            SchedulerActor::spawn_instrumented(model, config).expect("instrumented actor");
+        let baseline = probe.wait_quiescent().await.expect("initial quiescence");
+
+        probe.shared.pump_gate.pause_entry_before_observe();
+        let entry_waiting = probe.shared.pump_gate.entry_waiting.notified();
+        let mut entry_waiting = std::pin::pin!(entry_waiting);
+        entry_waiting.as_mut().enable();
+        let pending_probe = probe.clone();
+        let pending = tokio::spawn(async move { pending_probe.hold_pump().await });
+        timeout(Duration::from_secs(5), entry_waiting)
+            .await
+            .expect("pump did not reach the pre-observation test barrier");
+
+        let requested = probe.snapshot().expect("requested hold snapshot");
+        assert!(requested.pump_in_flight);
+        assert_eq!(requested.pump_entries, baseline.pump_entries + 1);
+        assert!(requested.pump_hold_requested > requested.pump_hold_released);
+        assert!(requested.pump_hold_observed < requested.pump_hold_requested);
+
+        pending.abort();
+        let cancelled = pending.await.expect_err("pending hold was not cancelled");
+        assert!(cancelled.is_cancelled());
+        let recovered = probe.snapshot().expect("recovered hold snapshot");
+        assert_eq!(recovered.pump_hold_released, recovered.pump_hold_requested);
+
+        probe.shared.pump_gate.resume_entry_before_observe();
+        let quiescent = timeout(Duration::from_secs(5), probe.wait_quiescent())
+            .await
+            .expect("post-cancellation quiescence timeout")
+            .expect("post-cancellation quiescence");
+        assert!(quiescent.quiescent());
+        timeout(Duration::from_secs(5), actor.shutdown())
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_unobserved_hold_releases_when_owner_completes() {
+        let (_model, config) = model_and_config(SchedulerLimits::tiny());
+        let shared = Arc::new(Shared::try_new(config).expect("actor shared state"));
+        shared.activity.dirty.store(false, Ordering::Release);
+        shared.activity.parked.store(true, Ordering::Release);
+        shared.activity.park_epoch.store(1, Ordering::Release);
+        let probe = ActorProbe {
+            shared: Arc::clone(&shared),
+            recorder: None,
+        };
+
+        let pending_probe = probe.clone();
+        let pending = tokio::spawn(async move { pending_probe.hold_pump().await });
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let gate = shared.pump_gate.state().expect("pump gate state");
+                if gate.requested_epoch > gate.released_epoch {
+                    assert!(gate.observed_epoch < gate.requested_epoch);
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hold did not reach its unobserved wait");
+
+        shared.mark_owner_done(false);
+        let error = timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("pending hold ignored owner completion")
+            .expect("hold task panicked")
+            .expect_err("a stopped owner cannot acknowledge a pump hold");
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        let gate = shared.pump_gate.state().expect("released pump gate");
+        assert_eq!(gate.released_epoch, gate.requested_epoch);
+        assert!(gate.observed_epoch < gate.requested_epoch);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_counts_terminal_record_until_output_and_receiver_are_reaped() {
+        let mut limits = SchedulerLimits::tiny();
+        limits.max_new_tokens = 2;
+        limits.output_capacity_per_request = 2;
+        let (model, config) = model_and_config(limits);
+        let (actor, probe) =
+            SchedulerActor::spawn_instrumented(model, config).expect("instrumented actor");
+        let client = actor.client();
+        let mut handle = wait_submission(
+            client
+                .try_submit(request(&[1], 2, None))
+                .expect("submission"),
+        )
+        .await;
+
+        assert_eq!(
+            wait_terminal(&mut handle).await.outcome(),
+            TerminalOutcome::Completed
+        );
+        let retained = probe
+            .wait_quiescent()
+            .await
+            .expect("retained terminal quiescence");
+        assert_eq!(retained.outstanding_requests, 1);
+        assert!(retained.request_bytes > 0);
+
+        assert_eq!(drain_to_eof(&mut handle).await.len(), 2);
+        drop(handle);
+        let reaped = probe.wait_quiescent().await.expect("request reap");
+        assert_eq!(reaped.outstanding_requests, 0);
+        assert_eq!(reaped.request_bytes, 0);
+        timeout(Duration::from_secs(5), actor.shutdown())
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stress_wrappers_retain_primary_cancel_drop_and_recorder_evidence() {
+        let mut limits = SchedulerLimits::tiny();
+        limits.max_new_tokens = 8;
+        limits.output_capacity_per_request = 2;
+        let (model, config) = model_and_config(limits);
+        let (actor, probe) = SchedulerActor::spawn_instrumented_with_capacity(model, config, 675)
+            .expect("instrumented actor");
+        let recorder = probe.recorder().expect("semantic recorder");
+        let initial_status = recorder.status();
+        assert_eq!(initial_status.observation_limit(), 675);
+        assert!(initial_status.allocated_capacity() >= 675);
+        assert!(initial_status.healthy());
+        let client = actor.client();
+
+        let mut cancel_handle = wait_submission(
+            client
+                .try_submit(request(&[1], 8, None))
+                .expect("cancelled request submission"),
+        )
+        .await;
+        wait_for_buffered_output(&cancel_handle).await;
+        let hold = probe.hold_pump().await.expect("cancel witness hold");
+        let (drain, drain_witness) = cancel_handle.try_recv_output_with_stress_witness();
+        let event = match drain.expect("primary witnessed drain") {
+            TryRecvOutput::Output(event) => event,
+            other => panic!("expected one primary output, got {other:?}"),
+        };
+        assert_eq!(drain_witness.kind(), ActorTryPopKind::Primary);
+        assert!(drain_witness.boundary_reached());
+        assert_eq!(
+            drain_witness.drained_after(),
+            drain_witness.drained_before() + 1
+        );
+        assert_eq!(drain_witness.consumed_output(), Some(event));
+
+        let cancellation = cancel_handle.cancellation();
+        let (cancel, cancel_witness) = cancellation.cancel_with_stress_witness();
+        assert_eq!(
+            cancel.expect("witnessed cancellation"),
+            CancelDisposition::Requested
+        );
+        assert!(cancel_witness.boundary_reached());
+        assert_ne!(
+            cancel_witness.loaded_word(),
+            cancel_witness.resulting_word()
+        );
+        hold.release().expect("release cancellation hold");
+        assert_eq!(
+            wait_terminal(&mut cancel_handle).await.outcome(),
+            TerminalOutcome::Cancelled
+        );
+        let _ = drain_to_eof(&mut cancel_handle).await;
+        drop(cancel_handle);
+        drop(cancellation);
+        let cancelled_reaped = probe
+            .wait_quiescent()
+            .await
+            .expect("cancelled request reap");
+        assert_eq!(cancelled_reaped.outstanding_requests, 0);
+        assert_eq!(cancelled_reaped.request_bytes, 0);
+
+        let drop_handle = wait_submission(
+            client
+                .try_submit(request(&[14], 8, None))
+                .expect("dropped request submission"),
+        )
+        .await;
+        wait_for_buffered_output(&drop_handle).await;
+        let hold = probe.hold_pump().await.expect("drop witness hold");
+        let sink = ActorRequestDropWitnessSink::new();
+        let mut drop_handle = drop_handle;
+        drop_handle
+            .arm_drop_witness(sink.clone())
+            .expect("arm destructor witness");
+        drop(drop_handle);
+        let drop_witness = sink
+            .take()
+            .expect("read destructor witness")
+            .expect("destructor witness recorded");
+        let (disconnect, control_witness) = drop_witness.into_parts();
+        assert_eq!(
+            disconnect.expect("witnessed destructor disconnect"),
+            ActorDisconnectDisposition::Requested
+        );
+        assert!(
+            control_witness
+                .expect("destructor control boundary")
+                .boundary_reached()
+        );
+        hold.release().expect("release destructor hold");
+        let dropped_reaped = probe.wait_quiescent().await.expect("dropped request reap");
+        assert_eq!(dropped_reaped.outstanding_requests, 0);
+        assert_eq!(dropped_reaped.request_bytes, 0);
+
+        let recording = recorder.recording().expect("semantic recording");
+        assert!(!recording.observations().is_empty());
+        assert!(recording.status().healthy());
+        assert_eq!(recording.status().observation_limit(), 675);
+        for kind in [
+            crate::endpoint::ActorSemanticObservationKind::Output,
+            crate::endpoint::ActorSemanticObservationKind::Terminal,
+            crate::endpoint::ActorSemanticObservationKind::OutputEof,
+        ] {
+            assert!(
+                recording
+                    .observations()
+                    .iter()
+                    .any(|observation| observation.kind() == kind),
+                "missing {kind:?} semantic observation"
+            );
+        }
+        timeout(Duration::from_secs(5), actor.shutdown())
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_commit_witnesses_are_fifo_and_failures_use_sentinels() {
+        let mut limits = SchedulerLimits::tiny();
+        limits.command_capacity = 2;
+        limits.batch_width = 1;
+        let (model, config) = model_and_config(limits);
+        let (actor, probe) =
+            SchedulerActor::spawn_instrumented(model, config).expect("instrumented actor");
+        let client = actor.client();
+        let hold = probe.hold_pump().await.expect("pump hold");
+
+        let (invalid, invalid_witness) = client.try_submit_with_witness(request(&[32], 0, None));
+        assert_eq!(
+            invalid.expect_err("invalid offer").category(),
+            ErrorCategory::InvalidRequest
+        );
+        assert_eq!(invalid_witness.command_slot(), None);
+        assert_eq!(invalid_witness.ticket(), 0);
+        assert_eq!(invalid_witness.ready_commit_sequence(), 0);
+
+        let (first, first_witness) = client.try_submit_with_witness(request(&[1], 0, None));
+        let (second, second_witness) = client.try_submit_with_witness(request(&[14], 0, None));
+        let first = first.expect("first ready command");
+        let second = second.expect("second ready command");
+        assert!(first_witness.command_slot().is_some());
+        assert!(second_witness.command_slot().is_some());
+        assert_ne!(first_witness.ticket(), 0);
+        assert_ne!(second_witness.ticket(), 0);
+        assert_eq!(first_witness.ready_commit_sequence(), 1);
+        assert_eq!(second_witness.ready_commit_sequence(), 2);
+
+        let (full, full_witness) = client.try_submit_with_witness(request(&[16], 0, None));
+        assert_eq!(
+            full.expect_err("full command table").category(),
+            ErrorCategory::ResourceExhausted
+        );
+        assert_eq!(full_witness.command_slot(), None);
+        assert_eq!(full_witness.ticket(), 0);
+        assert_eq!(full_witness.ready_commit_sequence(), 0);
+        assert_eq!(probe.snapshot().expect("ready snapshot").command_ready, 2);
+
+        hold.release().expect("release pump hold");
+        let mut first = wait_submission(first).await;
+        let mut second = wait_submission(second).await;
+        assert!(first.request_id() < second.request_id());
+        assert_eq!(
+            wait_terminal(&mut first).await.outcome(),
+            TerminalOutcome::Completed
+        );
+        assert_eq!(
+            wait_terminal(&mut second).await.outcome(),
+            TerminalOutcome::Completed
+        );
+        drop(first);
+        drop(second);
+        let reaped = probe.wait_quiescent().await.expect("reaped quiescence");
+        assert_eq!(reaped.outstanding_requests, 0);
+        assert_eq!(reaped.request_bytes, 0);
+        timeout(Duration::from_secs(5), actor.shutdown())
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reaped_terminal_controls_do_not_exhaust_the_actor_lifetime_table() {
+        let (model, config) = model_and_config(SchedulerLimits::tiny());
+        let lifetime_requests = config.max_outstanding_requests() * 2 + 1;
+        let (actor, probe) =
+            SchedulerActor::spawn_instrumented(model, config).expect("instrumented actor");
+        let client = actor.client();
+
+        for _ in 0..lifetime_requests {
+            let submission = client
+                .try_submit(request(&[1], 0, None))
+                .expect("lifetime submission");
+            let mut handle = wait_submission(submission).await;
+            assert_eq!(
+                wait_terminal(&mut handle).await.outcome(),
+                TerminalOutcome::Completed
+            );
+            drop(handle);
+            let reaped = probe.wait_quiescent().await.expect("request reap");
+            assert_eq!(reaped.outstanding_requests, 0);
+            assert_eq!(reaped.request_bytes, 0);
+        }
+
+        let report = timeout(Duration::from_secs(5), actor.shutdown())
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown");
+        assert_eq!(report.accepted_submissions(), lifetime_requests);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2079,7 +3436,7 @@ mod tests {
         let (model, config) = model_and_config(limits);
         let actor = SchedulerActor::spawn(model, config).expect("actor");
         let client = actor.client();
-        hold_owner(&client.shared).await;
+        let hold = hold_owner(&client.shared).await;
 
         let deadline = client
             .deadline_after(Duration::from_millis(20))
@@ -2088,7 +3445,7 @@ mod tests {
             .try_submit(request(&[1], 0, Some(deadline)))
             .expect("queued expiring command");
         tokio::time::sleep(Duration::from_millis(30)).await;
-        release_owner(&client.shared);
+        release_owner(hold);
         let error = timeout(Duration::from_secs(5), expired.wait())
             .await
             .expect("expired response timeout")
@@ -2191,7 +3548,7 @@ mod tests {
             wait_submission(client.try_submit(request(&prompt, 4, None)).unwrap()).await;
         wait_for_buffered_output(&handle).await;
 
-        hold_owner(&client.shared).await;
+        let hold = hold_owner(&client.shared).await;
         let pending = client.try_submit(request(&[1], 0, None)).unwrap();
         assert_eq!(client.shared.lock_queue().unwrap().occupancy().ready, 1);
         let handle_wait = tokio::spawn(async move { handle.terminal().await });
@@ -2199,7 +3556,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         client.shared.panic_next_pump.store(true, Ordering::Release);
-        release_owner(&client.shared);
+        release_owner(hold);
 
         let submission_error = timeout(Duration::from_secs(5), pending.wait())
             .await

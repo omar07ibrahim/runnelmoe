@@ -17,6 +17,9 @@ use std::{
     },
 };
 
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+use std::sync::{OnceLock, atomic::AtomicBool};
+
 use tokio::sync::Notify;
 
 use crate::{
@@ -25,6 +28,393 @@ use crate::{
     id::SlotKey,
     request::{OutputEvent, TerminalResult},
 };
+
+/// Kind of one semantic endpoint mutation retained by the actor stress probe.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActorSemanticObservationKind {
+    Output,
+    Terminal,
+    OutputEof,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActorSemanticPayload {
+    Output(OutputEvent),
+    Terminal(TerminalResult),
+    OutputEof(crate::RequestId),
+}
+
+/// Copy-only observation captured at an endpoint mutation's linearization.
+///
+/// Raw request and token identities are available only through this hidden,
+/// nondefault instrumentation API and are intentionally redacted from Debug.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ActorSemanticObservation {
+    payload: ActorSemanticPayload,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorSemanticObservation {
+    const fn output(event: OutputEvent) -> Self {
+        Self {
+            payload: ActorSemanticPayload::Output(event),
+        }
+    }
+
+    const fn terminal(terminal: TerminalResult) -> Self {
+        Self {
+            payload: ActorSemanticPayload::Terminal(terminal),
+        }
+    }
+
+    const fn output_eof(request_id: crate::RequestId) -> Self {
+        Self {
+            payload: ActorSemanticPayload::OutputEof(request_id),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> ActorSemanticObservationKind {
+        match self.payload {
+            ActorSemanticPayload::Output(_) => ActorSemanticObservationKind::Output,
+            ActorSemanticPayload::Terminal(_) => ActorSemanticObservationKind::Terminal,
+            ActorSemanticPayload::OutputEof(_) => ActorSemanticObservationKind::OutputEof,
+        }
+    }
+
+    #[must_use]
+    pub const fn request_id(self) -> crate::RequestId {
+        match self.payload {
+            ActorSemanticPayload::Output(event) => event.request_id(),
+            ActorSemanticPayload::Terminal(terminal) => terminal.request_id(),
+            ActorSemanticPayload::OutputEof(request_id) => request_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn output_event(self) -> Option<OutputEvent> {
+        match self.payload {
+            ActorSemanticPayload::Output(event) => Some(event),
+            ActorSemanticPayload::Terminal(_) | ActorSemanticPayload::OutputEof(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn terminal_result(self) -> Option<TerminalResult> {
+        match self.payload {
+            ActorSemanticPayload::Terminal(terminal) => Some(terminal),
+            ActorSemanticPayload::Output(_) | ActorSemanticPayload::OutputEof(_) => None,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorSemanticObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorSemanticObservation")
+            .field("kind", &self.kind())
+            .field("identity", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+struct ActorStressRecorderState {
+    observations: Vec<ActorSemanticObservation>,
+    limit: usize,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+struct ActorStressRecorderInner {
+    state: Mutex<ActorStressRecorderState>,
+    overflowed: AtomicBool,
+    poisoned: AtomicBool,
+}
+
+/// Sticky health and allocation state for the bounded semantic recorder.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActorStressRecorderStatus {
+    observation_count: usize,
+    observation_limit: usize,
+    allocated_capacity: usize,
+    overflowed: bool,
+    poisoned: bool,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorStressRecorderStatus {
+    #[must_use]
+    pub const fn observation_count(self) -> usize {
+        self.observation_count
+    }
+
+    #[must_use]
+    pub const fn observation_limit(self) -> usize {
+        self.observation_limit
+    }
+
+    #[must_use]
+    pub const fn allocated_capacity(self) -> usize {
+        self.allocated_capacity
+    }
+
+    #[must_use]
+    pub const fn overflowed(self) -> bool {
+        self.overflowed
+    }
+
+    #[must_use]
+    pub const fn poisoned(self) -> bool {
+        self.poisoned
+    }
+
+    #[must_use]
+    pub const fn healthy(self) -> bool {
+        !self.overflowed && !self.poisoned
+    }
+}
+
+/// Owned recorder snapshot copied only after endpoint locks are released.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ActorStressRecording {
+    observations: Vec<ActorSemanticObservation>,
+    status: ActorStressRecorderStatus,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorStressRecording {
+    #[must_use]
+    pub fn observations(&self) -> &[ActorSemanticObservation] {
+        &self.observations
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> ActorStressRecorderStatus {
+        self.status
+    }
+}
+
+/// Cloneable handle to a fixed-capacity endpoint semantic recorder.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ActorStressRecorder {
+    inner: Arc<ActorStressRecorderInner>,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorStressRecorder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorStressRecorder")
+            .field("contents", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorStressRecorder {
+    pub(crate) fn try_with_capacity(capacity: usize) -> SchedulerResult<Self> {
+        if capacity == 0 {
+            return Err(SchedulerError::invalid_request(
+                "actor stress recorder capacity",
+                "must be nonzero",
+            ));
+        }
+        let mut observations = Vec::new();
+        try_reserve_vec(
+            &mut observations,
+            capacity,
+            "actor stress semantic observations",
+        )?;
+        Ok(Self {
+            inner: Arc::new(ActorStressRecorderInner {
+                state: Mutex::new(ActorStressRecorderState {
+                    observations,
+                    limit: capacity,
+                }),
+                overflowed: AtomicBool::new(false),
+                poisoned: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    fn append_batch(&self, observations: &[Option<ActorSemanticObservation>]) {
+        if self.inner.poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.inner.poisoned.store(true, Ordering::Release);
+                return;
+            }
+        };
+        for observation in observations.iter().flatten().copied() {
+            if state.observations.len() >= state.limit {
+                self.inner.overflowed.store(true, Ordering::Release);
+                continue;
+            }
+            debug_assert!(state.observations.capacity() >= state.limit);
+            state.observations.push(observation);
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> ActorStressRecorderStatus {
+        let poisoned =
+            self.inner.poisoned.load(Ordering::Acquire) || self.inner.state.is_poisoned();
+        if poisoned {
+            self.inner.poisoned.store(true, Ordering::Release);
+        }
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(error) => {
+                self.inner.poisoned.store(true, Ordering::Release);
+                error.into_inner()
+            }
+        };
+        ActorStressRecorderStatus {
+            observation_count: state.observations.len(),
+            observation_limit: state.limit,
+            allocated_capacity: state.observations.capacity(),
+            overflowed: self.inner.overflowed.load(Ordering::Acquire),
+            poisoned: self.inner.poisoned.load(Ordering::Acquire),
+        }
+    }
+
+    /// Fallibly copies the retained prefix for an independent checker.
+    pub fn recording(&self) -> SchedulerResult<ActorStressRecording> {
+        let poisoned =
+            self.inner.poisoned.load(Ordering::Acquire) || self.inner.state.is_poisoned();
+        if poisoned {
+            self.inner.poisoned.store(true, Ordering::Release);
+        }
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(error) => {
+                self.inner.poisoned.store(true, Ordering::Release);
+                error.into_inner()
+            }
+        };
+        let mut observations = Vec::new();
+        try_reserve_vec(
+            &mut observations,
+            state.observations.len(),
+            "actor stress recording snapshot",
+        )?;
+        observations.extend_from_slice(&state.observations);
+        let status = ActorStressRecorderStatus {
+            observation_count: state.observations.len(),
+            observation_limit: state.limit,
+            allocated_capacity: state.observations.capacity(),
+            overflowed: self.inner.overflowed.load(Ordering::Acquire),
+            poisoned: self.inner.poisoned.load(Ordering::Acquire),
+        };
+        Ok(ActorStressRecording {
+            observations,
+            status,
+        })
+    }
+}
+
+/// Purpose of one observed endpoint receive attempt.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActorTryPopKind {
+    Primary,
+    OpportunisticEof,
+}
+
+/// Exact endpoint state transition observed by one receive attempt.
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ActorTryPopWitness {
+    kind: ActorTryPopKind,
+    boundary_reached: bool,
+    slot_index: usize,
+    slot_generation: u64,
+    drained_before: usize,
+    drained_after: usize,
+    consumed_output: Option<OutputEvent>,
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl ActorTryPopWitness {
+    pub(crate) const fn sentinel(kind: ActorTryPopKind) -> Self {
+        Self {
+            kind,
+            boundary_reached: false,
+            slot_index: 0,
+            slot_generation: 0,
+            drained_before: 0,
+            drained_after: 0,
+            consumed_output: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> ActorTryPopKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn boundary_reached(self) -> bool {
+        self.boundary_reached
+    }
+
+    #[must_use]
+    pub const fn slot_index(self) -> usize {
+        self.slot_index
+    }
+
+    #[must_use]
+    pub const fn slot_generation(self) -> u64 {
+        self.slot_generation
+    }
+
+    #[must_use]
+    pub const fn drained_before(self) -> usize {
+        self.drained_before
+    }
+
+    #[must_use]
+    pub const fn drained_after(self) -> usize {
+        self.drained_after
+    }
+
+    #[must_use]
+    pub const fn consumed_output(self) -> Option<OutputEvent> {
+        self.consumed_output
+    }
+}
+
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+impl fmt::Debug for ActorTryPopWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorTryPopWitness")
+            .field("kind", &self.kind)
+            .field("boundary_reached", &self.boundary_reached)
+            .field("identity", &"<redacted>")
+            .field("drained_before", &self.drained_before)
+            .field("drained_after", &self.drained_after)
+            .field("consumed_output", &self.consumed_output.is_some())
+            .finish()
+    }
+}
 
 /// A non-sensitive, allocation-free view of one bound endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +502,8 @@ pub(crate) enum TryPop {
 struct EndpointTable {
     slots: Box<[EndpointSlot]>,
     pending_terminals: AtomicUsize,
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    stress_recorder: OnceLock<ActorStressRecorder>,
 }
 
 impl fmt::Debug for EndpointTable {
@@ -511,9 +903,33 @@ impl EndpointRegistry {
             table: Arc::new(EndpointTable {
                 slots: slots.into_boxed_slice(),
                 pending_terminals: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+                stress_recorder: OnceLock::new(),
             }),
             free_slots,
         })
+    }
+
+    /// Installs one fixed-capacity semantic recorder before any endpoint bind.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pub(crate) fn install_actor_stress_recorder(
+        &self,
+        recorder: ActorStressRecorder,
+    ) -> SchedulerResult<()> {
+        if self.free_slots.len() != self.table.slots.len() {
+            return Err(SchedulerError::internal(
+                "actor stress recorder must be installed before endpoint admission",
+            ));
+        }
+        self.table
+            .stress_recorder
+            .set(recorder)
+            .map_err(|_| SchedulerError::internal("actor stress recorder was already installed"))
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pub(crate) fn actor_stress_recorder(&self) -> Option<ActorStressRecorder> {
+        self.table.stress_recorder.get().cloned()
     }
 
     /// Allocates a request's sole queue without mutating registry state.
@@ -597,10 +1013,19 @@ impl EndpointRegistry {
             ));
         }
         let output = state.discarded_output_span()?;
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let eof_before = state.output_eof_acknowledged;
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let request_id = state.expected_request_id()?;
         let report = state.discard_receiver_payload(output, &self.table.pending_terminals)?;
         state.producer_open = false;
         state.shutdown = true;
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let eof = (!eof_before && state.output_eof_acknowledged)
+            .then_some(ActorSemanticObservation::output_eof(request_id));
         drop(state);
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        append_semantic_observations(&self.table, &[eof]);
         slot.notify.notify_waiters();
         Ok(report)
     }
@@ -685,9 +1110,16 @@ impl EndpointProducer {
         let slot = slot_for(&self.table, self.key)?;
         let state = lock_bound(slot, self.key)?;
         validate_publication(&state, true)?;
-        Ok(OutputCommitGuard {
-            held: HeldCommit::new(state, &slot.notify, &self.table.pending_terminals),
-        })
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let held = HeldCommit::new(
+            state,
+            &slot.notify,
+            &self.table.pending_terminals,
+            &self.table,
+        );
+        #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
+        let held = HeldCommit::new(state, &slot.notify, &self.table.pending_terminals);
+        Ok(OutputCommitGuard { held })
     }
 
     /// Locks a terminal-only publication independently of output fullness.
@@ -695,9 +1127,16 @@ impl EndpointProducer {
         let slot = slot_for(&self.table, self.key)?;
         let state = lock_bound(slot, self.key)?;
         validate_publication(&state, false)?;
-        Ok(TerminalCommitGuard {
-            held: HeldCommit::new(state, &slot.notify, &self.table.pending_terminals),
-        })
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let held = HeldCommit::new(
+            state,
+            &slot.notify,
+            &self.table.pending_terminals,
+            &self.table,
+        );
+        #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
+        let held = HeldCommit::new(state, &slot.notify, &self.table.pending_terminals);
+        Ok(TerminalCommitGuard { held })
     }
 
     pub(crate) fn wake_hook(&self) -> EndpointWake {
@@ -734,8 +1173,17 @@ impl EndpointProducer {
             ));
         }
         let output = state.discarded_output_span()?;
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let eof_before = state.output_eof_acknowledged;
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let request_id = state.expected_request_id()?;
         let report = state.discard_receiver_payload(output, &self.table.pending_terminals)?;
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let eof = (!eof_before && state.output_eof_acknowledged)
+            .then_some(ActorSemanticObservation::output_eof(request_id));
         drop(state);
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        append_semantic_observations(&self.table, &[eof]);
         slot.notify.notify_waiters();
         Ok(report)
     }
@@ -802,28 +1250,38 @@ impl fmt::Debug for ValidatedOutputCommitGuard<'_> {
 impl ValidatedOutputCommitGuard<'_> {
     /// Publishes the retained event with no allocation or error path.
     pub(crate) fn publish_output(self) {
-        let event = self.event;
-        self.held.finish(|state, _pending_terminals| {
-            debug_assert!(state.output.len() < state.logical_capacity);
-            debug_assert!(state.output.capacity() >= state.logical_capacity);
-            debug_assert!(validate_next_output_identity(state, event).is_ok());
-            state.output.push_back(event);
-            state.published_output_events += 1;
-            debug_assert!(state.validate_conservation().is_ok());
-        });
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        self.held.publish(Some(self.event), None);
+        #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
+        {
+            let event = self.event;
+            self.held.finish(|state, _pending_terminals| {
+                debug_assert!(state.output.len() < state.logical_capacity);
+                debug_assert!(state.output.capacity() >= state.logical_capacity);
+                debug_assert!(validate_next_output_identity(state, event).is_ok());
+                state.output.push_back(event);
+                state.published_output_events += 1;
+                debug_assert!(state.validate_conservation().is_ok());
+            });
+        }
     }
 
     /// Publishes one event and its terminal result in the same locked commit.
     pub(crate) fn publish_output_and_terminal(self, terminal: TerminalResult) {
-        let event = self.event;
-        self.held.finish(|state, pending_terminals| {
-            debug_assert!(state.output.len() < state.logical_capacity);
-            debug_assert!(state.output.capacity() >= state.logical_capacity);
-            debug_assert!(validate_next_output_identity(state, event).is_ok());
-            state.output.push_back(event);
-            state.published_output_events += 1;
-            publish_terminal(state, terminal, pending_terminals);
-        });
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        self.held.publish(Some(self.event), Some(terminal));
+        #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
+        {
+            let event = self.event;
+            self.held.finish(|state, pending_terminals| {
+                debug_assert!(state.output.len() < state.logical_capacity);
+                debug_assert!(state.output.capacity() >= state.logical_capacity);
+                debug_assert!(validate_next_output_identity(state, event).is_ok());
+                state.output.push_back(event);
+                state.published_output_events += 1;
+                publish_terminal(state, terminal, pending_terminals);
+            });
+        }
     }
 }
 
@@ -844,6 +1302,9 @@ impl fmt::Debug for TerminalCommitGuard<'_> {
 impl TerminalCommitGuard<'_> {
     /// Publishes terminal state with no queue-capacity dependency.
     pub(crate) fn publish_terminal(self, terminal: TerminalResult) {
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        self.held.publish(None, Some(terminal));
+        #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
         self.held.finish(|state, pending_terminals| {
             publish_terminal(state, terminal, pending_terminals);
         });
@@ -854,9 +1315,27 @@ struct HeldCommit<'a> {
     state: Option<MutexGuard<'a, EndpointState>>,
     notify: &'a Notify,
     pending_terminals: &'a AtomicUsize,
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    table: &'a EndpointTable,
 }
 
 impl<'a> HeldCommit<'a> {
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    const fn new(
+        state: MutexGuard<'a, EndpointState>,
+        notify: &'a Notify,
+        pending_terminals: &'a AtomicUsize,
+        table: &'a EndpointTable,
+    ) -> Self {
+        Self {
+            state: Some(state),
+            notify,
+            pending_terminals,
+            table,
+        }
+    }
+
+    #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
     const fn new(
         state: MutexGuard<'a, EndpointState>,
         notify: &'a Notify,
@@ -869,9 +1348,55 @@ impl<'a> HeldCommit<'a> {
         }
     }
 
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    fn publish(mut self, output: Option<OutputEvent>, terminal: Option<TerminalResult>) {
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let mut observations = [None, None, None];
+        let Some(state) = self.state.as_mut() else {
+            debug_assert!(false, "endpoint commit guard lost its held state");
+            return;
+        };
+
+        if let Some(event) = output {
+            debug_assert!(state.output.len() < state.logical_capacity);
+            debug_assert!(state.output.capacity() >= state.logical_capacity);
+            debug_assert!(validate_next_output_identity(state, event).is_ok());
+            state.output.push_back(event);
+            state.published_output_events += 1;
+            debug_assert!(state.validate_conservation().is_ok());
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            {
+                observations[0] = Some(ActorSemanticObservation::output(event));
+            }
+        }
+
+        if let Some(terminal) = terminal {
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            let eof_before = state.output_eof_acknowledged;
+            publish_terminal(state, terminal, self.pending_terminals);
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            {
+                let terminal_index = usize::from(output.is_some());
+                observations[terminal_index] = Some(ActorSemanticObservation::terminal(terminal));
+                if !eof_before && state.output_eof_acknowledged {
+                    observations[terminal_index + 1] =
+                        Some(ActorSemanticObservation::output_eof(terminal.request_id()));
+                }
+            }
+        }
+
+        // The option is private and initialized exactly once. Taking it makes
+        // the endpoint unlock explicit before touching the independent probe.
+        drop(self.state.take());
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        append_semantic_observations(self.table, &observations);
+        self.notify.notify_waiters();
+    }
+
+    #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
     fn finish(mut self, publish: impl FnOnce(&mut EndpointState, &AtomicUsize)) {
-        // The option is private and initialized exactly once. Keeping it as an
-        // option permits an explicit unlock before wake-up without unsafe code.
+        // These three compile-time call sites are fixed, infallible endpoint
+        // mutations. The option permits an explicit unlock before wake-up.
         if let Some(state) = self.state.as_mut() {
             publish(state, self.pending_terminals);
         } else {
@@ -903,6 +1428,16 @@ fn publish_terminal(
     }
 }
 
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+fn append_semantic_observations(
+    table: &EndpointTable,
+    observations: &[Option<ActorSemanticObservation>],
+) {
+    if let Some(recorder) = table.stress_recorder.get() {
+        recorder.append_batch(observations);
+    }
+}
+
 fn increment_pending_terminal(pending_terminals: &AtomicUsize) {
     let previous = pending_terminals.fetch_add(1, Ordering::AcqRel);
     debug_assert!(previous < usize::MAX, "pending terminal count overflowed");
@@ -925,6 +1460,14 @@ pub(crate) struct EndpointReceiver {
     locally_connected: bool,
 }
 
+#[cfg(any(test, feature = "actor-stress-instrumentation"))]
+struct TryPopMutation {
+    result: TryPop,
+    drained_before: usize,
+    drained_after: usize,
+    consumed_output: Option<OutputEvent>,
+}
+
 impl fmt::Debug for EndpointReceiver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -941,6 +1484,7 @@ impl EndpointReceiver {
     }
 
     /// Pops one event, distinguishes temporary emptiness from acknowledged EOF.
+    #[cfg(not(any(test, feature = "actor-stress-instrumentation")))]
     pub(crate) fn try_pop(&mut self) -> SchedulerResult<TryPop> {
         self.ensure_connected()?;
         let slot = slot_for(&self.table, self.key)?;
@@ -984,6 +1528,104 @@ impl EndpointReceiver {
         Ok(TryPop::Empty)
     }
 
+    /// Pops one event while retaining semantic and structural observations.
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pub(crate) fn try_pop(&mut self) -> SchedulerResult<TryPop> {
+        self.try_pop_mutation().map(|mutation| mutation.result)
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pub(crate) fn try_pop_with_stress_witness(
+        &mut self,
+        kind: ActorTryPopKind,
+    ) -> (SchedulerResult<TryPop>, ActorTryPopWitness) {
+        let slot_index = self.key.index();
+        let slot_generation = self.key.generation().get();
+        match self.try_pop_mutation() {
+            Ok(mutation) => (
+                Ok(mutation.result),
+                ActorTryPopWitness {
+                    kind,
+                    boundary_reached: true,
+                    slot_index,
+                    slot_generation,
+                    drained_before: mutation.drained_before,
+                    drained_after: mutation.drained_after,
+                    consumed_output: mutation.consumed_output,
+                },
+            ),
+            Err(error) => (Err(error), ActorTryPopWitness::sentinel(kind)),
+        }
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    fn try_pop_mutation(&mut self) -> SchedulerResult<TryPopMutation> {
+        self.ensure_connected()?;
+        let slot = slot_for(&self.table, self.key)?;
+        let mut state = lock_bound(slot, self.key)?;
+        state.validate_conservation()?;
+        let drained_before = state.drained_output_events;
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        let mut eof_observation = None;
+        let mut notify = false;
+        let mut consumed_output = None;
+        if let Some(event) = state.output.front().copied() {
+            let request_id = state.expected_request_id()?;
+            let expected_index = state
+                .drained_output_events
+                .checked_add(state.discarded_output_events)
+                .ok_or_else(|| {
+                    SchedulerError::internal("drained request output identity overflows")
+                })?;
+            if event.request_id() != request_id || event.output_index() != expected_index {
+                return Err(SchedulerError::internal(
+                    "drained request output has an unexpected identity",
+                ));
+            }
+            let event = state.output.pop_front().ok_or_else(|| {
+                SchedulerError::internal("prevalidated request output disappeared")
+            })?;
+            state.drained_output_events = state
+                .drained_output_events
+                .checked_add(1)
+                .ok_or_else(|| SchedulerError::internal("drained output count overflows"))?;
+            debug_assert!(state.validate_conservation().is_ok());
+            consumed_output = Some(event);
+            notify = true;
+        } else if !state.producer_open {
+            #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+            if !state.output_eof_acknowledged {
+                eof_observation = Some(ActorSemanticObservation::output_eof(
+                    state.expected_request_id()?,
+                ));
+            }
+            state.output_eof_acknowledged = true;
+            if state.terminal_acknowledged {
+                state.receiver_connected = false;
+                self.locally_connected = false;
+            }
+            notify = true;
+        }
+        let drained_after = state.drained_output_events;
+        let result = match consumed_output {
+            Some(event) => TryPop::Event(event),
+            None if !state.producer_open => TryPop::Eof,
+            None => TryPop::Empty,
+        };
+        drop(state);
+        #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+        append_semantic_observations(&self.table, &[eof_observation]);
+        if notify {
+            slot.notify.notify_waiters();
+        }
+        Ok(TryPopMutation {
+            result,
+            drained_before,
+            drained_after,
+            consumed_output,
+        })
+    }
+
     /// Takes and acknowledges the terminal result independently of output.
     pub(crate) fn take_terminal(&mut self) -> SchedulerResult<Option<TerminalResult>> {
         self.ensure_connected()?;
@@ -1023,6 +1665,37 @@ impl EndpointReceiver {
         self.locally_connected = false;
         self.notify_actor();
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "actor-stress-instrumentation"))]
+    pub(crate) fn disconnect_with_stress_witness(
+        &mut self,
+    ) -> (
+        SchedulerResult<crate::control::DisconnectDisposition>,
+        Option<crate::control::ActorControlCasWitness>,
+    ) {
+        if !self.locally_connected {
+            return (Err(SchedulerError::request_not_found()), None);
+        }
+        let (result, witness) = match self.control.as_ref() {
+            Some(control) => control.disconnect_with_stress_witness(),
+            None => {
+                self.locally_connected = false;
+                self.notify_actor();
+                return (
+                    Err(SchedulerError::internal(
+                        "request endpoint control is unavailable",
+                    )),
+                    None,
+                );
+            }
+        };
+        // This hidden method represents the sole destructor attempt. Consume
+        // the local obligation even on a stale/error result so Drop cannot
+        // perform an unobserved second load/CAS attempt.
+        self.locally_connected = false;
+        self.notify_actor();
+        (result, Some(witness))
     }
 
     /// Waits without losing a wake between predicate inspection and parking.
@@ -1357,6 +2030,236 @@ mod tests {
             .bind(controls.prepare().expect("prepare control"))
             .expect("bind control");
         endpoint.commit(control, request_id_for_test(1))
+    }
+
+    fn install_recorder(registry: &EndpointRegistry, capacity: usize) -> ActorStressRecorder {
+        let recorder = ActorStressRecorder::try_with_capacity(capacity).expect("recorder");
+        registry
+            .install_actor_stress_recorder(recorder.clone())
+            .expect("install recorder");
+        recorder
+    }
+
+    #[test]
+    fn primary_and_opportunistic_pop_witnesses_preserve_the_exact_boundary() {
+        let mut registry = EndpointRegistry::try_with_capacity(1).expect("registry");
+        let recorder = install_recorder(&registry, 8);
+        let mut controls = ControlRegistry::try_with_capacity(1).expect("controls");
+        let (producer, mut receiver) = bind(&mut registry, &mut controls, key(0, 1), 1);
+        publish_and_terminal(&producer, output(0), terminal(1));
+
+        let (primary, primary_witness) =
+            receiver.try_pop_with_stress_witness(ActorTryPopKind::Primary);
+        assert!(matches!(primary, Ok(TryPop::Event(event)) if event.output_index() == 0));
+        assert_eq!(primary_witness.kind(), ActorTryPopKind::Primary);
+        assert!(primary_witness.boundary_reached());
+        assert_eq!(primary_witness.slot_index(), 0);
+        assert_eq!(primary_witness.slot_generation(), 1);
+        assert_eq!(primary_witness.drained_before(), 0);
+        assert_eq!(primary_witness.drained_after(), 1);
+        assert_eq!(
+            primary_witness
+                .consumed_output()
+                .map(OutputEvent::output_index),
+            Some(0)
+        );
+
+        let (opportunistic, opportunistic_witness) =
+            receiver.try_pop_with_stress_witness(ActorTryPopKind::OpportunisticEof);
+        assert!(matches!(opportunistic, Ok(TryPop::Eof)));
+        assert_eq!(
+            opportunistic_witness.kind(),
+            ActorTryPopKind::OpportunisticEof
+        );
+        assert_eq!(opportunistic_witness.drained_before(), 1);
+        assert_eq!(opportunistic_witness.drained_after(), 1);
+        assert_eq!(opportunistic_witness.consumed_output(), None);
+
+        let (repeat, repeat_witness) =
+            receiver.try_pop_with_stress_witness(ActorTryPopKind::Primary);
+        assert!(matches!(repeat, Ok(TryPop::Eof)));
+        assert_eq!(repeat_witness.drained_before(), 1);
+        assert_eq!(repeat_witness.drained_after(), 1);
+
+        let recording = recorder.recording().expect("recording");
+        let kinds = recording
+            .observations()
+            .iter()
+            .copied()
+            .map(ActorSemanticObservation::kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                ActorSemanticObservationKind::Output,
+                ActorSemanticObservationKind::Terminal,
+                ActorSemanticObservationKind::OutputEof,
+            ]
+        );
+        assert!(recording.status().healthy());
+    }
+
+    #[test]
+    fn pop_error_before_the_endpoint_boundary_uses_only_zero_sentinels() {
+        let mut registry = EndpointRegistry::try_with_capacity(1).expect("registry");
+        let mut controls = ControlRegistry::try_with_capacity(1).expect("controls");
+        let (_producer, mut receiver) = bind(&mut registry, &mut controls, key(0, 7), 1);
+        receiver.disconnect().expect("disconnect receiver");
+
+        let (result, witness) = receiver.try_pop_with_stress_witness(ActorTryPopKind::Primary);
+        assert_eq!(
+            result
+                .expect_err("locally disconnected pop must fail")
+                .category(),
+            ErrorCategory::InvalidRequest
+        );
+        assert!(!witness.boundary_reached());
+        assert_eq!(witness.slot_index(), 0);
+        assert_eq!(witness.slot_generation(), 0);
+        assert_eq!(witness.drained_before(), 0);
+        assert_eq!(witness.drained_after(), 0);
+        assert_eq!(witness.consumed_output(), None);
+    }
+
+    #[test]
+    fn disconnect_before_terminal_records_terminal_and_discard_eof_once() {
+        let mut registry = EndpointRegistry::try_with_capacity(1).expect("registry");
+        let recorder = install_recorder(&registry, 4);
+        let mut controls = ControlRegistry::try_with_capacity(1).expect("controls");
+        let (producer, mut receiver) = bind(&mut registry, &mut controls, key(0, 1), 1);
+
+        let (disconnect, witness) = receiver.disconnect_with_stress_witness();
+        disconnect.expect("disconnect");
+        let witness = witness.expect("disconnect boundary");
+        assert!(witness.boundary_reached());
+        producer
+            .begin_terminal_commit()
+            .expect("terminal guard")
+            .publish_terminal(terminal(0));
+        let discarded = producer
+            .settle_disconnected()
+            .expect("settle disconnected receiver");
+        assert_eq!(discarded.output_events(), 0);
+        assert_eq!(discarded.terminal_results, 1);
+
+        let recording = recorder.recording().expect("recording");
+        let kinds = recording
+            .observations()
+            .iter()
+            .copied()
+            .map(ActorSemanticObservation::kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                ActorSemanticObservationKind::Terminal,
+                ActorSemanticObservationKind::OutputEof,
+            ]
+        );
+        assert!(recording.status().healthy());
+    }
+
+    #[test]
+    fn witnessed_disconnect_error_consumes_the_drop_obligation_exactly_once() {
+        let mut registry = EndpointRegistry::try_with_capacity(1).expect("registry");
+        let mut controls = ControlRegistry::try_with_capacity(1).expect("controls");
+        let (producer, mut receiver) = bind(&mut registry, &mut controls, key(0, 1), 1);
+        let stale_control = producer.control.clone();
+        stale_control
+            .mark_terminal()
+            .expect("terminal control publication");
+        controls.recycle(&stale_control).expect("recycle control");
+        let current = controls
+            .bind(controls.prepare().expect("prepare current control"))
+            .expect("bind current control");
+
+        let (result, witness) = receiver.disconnect_with_stress_witness();
+        assert_eq!(
+            result
+                .expect_err("stale witnessed disconnect must fail")
+                .category(),
+            ErrorCategory::InvalidRequest
+        );
+        assert!(witness.expect("stale load witness").boundary_reached());
+        assert!(!receiver.locally_connected);
+        let before_drop = current.fresh_snapshot().expect("current before drop");
+        drop(receiver);
+        assert_eq!(
+            current.fresh_snapshot().expect("current after drop"),
+            before_drop
+        );
+        assert_eq!(before_drop, crate::control::ControlSnapshot::default());
+    }
+
+    #[test]
+    fn shutdown_discard_records_the_first_eof_transition() {
+        let mut registry = EndpointRegistry::try_with_capacity(1).expect("registry");
+        let recorder = install_recorder(&registry, 4);
+        let mut controls = ControlRegistry::try_with_capacity(1).expect("controls");
+        let slot_key = key(0, 1);
+        let (producer, _receiver) = bind(&mut registry, &mut controls, slot_key, 1);
+        publish_and_terminal(&producer, output(0), terminal(1));
+
+        let discarded = registry
+            .shutdown_discard(slot_key)
+            .expect("shutdown discard");
+        assert_eq!(discarded.output_events(), 1);
+        assert_eq!(discarded.terminal_results, 1);
+        let recording = recorder.recording().expect("recording");
+        let kinds = recording
+            .observations()
+            .iter()
+            .copied()
+            .map(ActorSemanticObservation::kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                ActorSemanticObservationKind::Output,
+                ActorSemanticObservationKind::Terminal,
+                ActorSemanticObservationKind::OutputEof,
+            ]
+        );
+    }
+
+    #[test]
+    fn recorder_overflow_is_sticky_and_never_grows_its_allocation() {
+        let mut registry = EndpointRegistry::try_with_capacity(1).expect("registry");
+        let recorder = install_recorder(&registry, 2);
+        let initial = recorder.status();
+        let mut controls = ControlRegistry::try_with_capacity(1).expect("controls");
+        let (producer, mut receiver) = bind(&mut registry, &mut controls, key(0, 1), 1);
+        publish_and_terminal(&producer, output(0), terminal(1));
+        assert!(matches!(receiver.try_pop(), Ok(TryPop::Event(_))));
+        assert!(matches!(receiver.try_pop(), Ok(TryPop::Eof)));
+        assert!(matches!(receiver.try_pop(), Ok(TryPop::Eof)));
+
+        let status = recorder.status();
+        assert_eq!(status.observation_count(), 2);
+        assert_eq!(status.observation_limit(), 2);
+        assert_eq!(status.allocated_capacity(), initial.allocated_capacity());
+        assert!(status.overflowed());
+        assert!(!status.poisoned());
+        assert!(!status.healthy());
+        let recording = recorder.recording().expect("overflow prefix");
+        assert_eq!(recording.observations().len(), 2);
+        assert!(recording.status().overflowed());
+    }
+
+    #[test]
+    fn recorder_poison_is_sticky_and_visible_without_exposing_contents() {
+        let recorder = ActorStressRecorder::try_with_capacity(1).expect("recorder");
+        let poison = recorder.clone();
+        let join = thread::spawn(move || {
+            let _held = poison.inner.state.lock().expect("recorder lock");
+            panic!("intentional recorder poison");
+        });
+        assert!(join.join().is_err());
+        let status = recorder.status();
+        assert!(status.poisoned());
+        assert!(!status.healthy());
+        assert!(recorder.status().poisoned());
+        assert!(!format!("{recorder:?}").contains("RequestId"));
     }
 
     #[test]
