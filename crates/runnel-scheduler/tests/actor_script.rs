@@ -674,5 +674,9 @@ fn canonical_object_writer_sorts_keys_recursively() {
 }
 
 #[cfg(feature = "actor-stress-instrumentation")]
+#[path = "actor_script/common.rs"]
+mod common;
+
+#[cfg(feature = "actor-stress-instrumentation")]
 #[path = "actor_script/golden.rs"]
 mod golden;

@@ -97,6 +97,7 @@ REQUIRED = {
     "crates/runnel-scheduler/tests/actor_instrumented_public.rs",
     "crates/runnel-scheduler/tests/actor_public.rs",
     "crates/runnel-scheduler/tests/actor_script.rs",
+    "crates/runnel-scheduler/tests/actor_script/common.rs",
     "crates/runnel-scheduler/tests/actor_script/golden.rs",
     "crates/runnel-scheduler/tests/engine.rs",
     "crates/runnel-sim/Cargo.toml",
