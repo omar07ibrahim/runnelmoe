@@ -14,6 +14,14 @@ request scheduling, and honest measurement.
 > batches on one recorded host; neither milestone is an end-to-end inference
 > speedup claim.
 
+M5 is in progress. Its published synchronous slice now includes paged
+transactional decoder state, deterministic sampling, bounded FIFO admission,
+equal-weight token-quantum DRR, expert-sorted continuous batches, exact logical
+ownership accounting, output backpressure, deadlines, cancellation, and
+failure-atomic cleanup. The concurrent actor, full stress/differential matrix,
+and preregistered evidence are not complete, so this is not an M5 closure or
+performance claim.
+
 The runtime's central contract is simple: a configured
 resident-memory ceiling
 must remain enforceable while expert tensors move between an immutable
@@ -121,8 +129,9 @@ performance procedure is frozen in
 
 ## Architecture contract
 
-- Rust owns parsing, verified storage/cache, the scalar reference runtime, and
-  dispatch; later milestones add multi-request scheduling and serving.
+- Rust owns parsing, verified storage/cache, the scalar reference runtime,
+  dispatch, and the bounded synchronous multi-request scheduler; later slices
+  add the concurrent owner and serving.
 - A narrow C ABI contains the measured AVX2 GEMV; scalar Rust remains the
   independently callable correctness baseline.
 - Python/PyTorch is used only as an independently structured oracle, golden

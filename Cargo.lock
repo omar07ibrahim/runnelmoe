@@ -410,6 +410,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "runnel-scheduler"
+version = "0.1.0"
+dependencies = [
+ "runnel-fixture",
+ "runnel-format",
+ "runnel-runtime",
+ "thiserror",
+]
+
+[[package]]
 name = "runnel-sim"
 version = "0.1.0"
 dependencies = [

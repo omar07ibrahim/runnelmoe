@@ -246,15 +246,21 @@ the scheduler still validates the complete envelope at every boundary. A
 higher-ranked synchronous callback prevents a validated commit capability from
 escaping into an outer future; all fallible work precedes its allocation-free,
 return-free apply. The fixed 192-byte tiny-adapter scratch is reused through
-the full 1,024-position context without growth. Continuous batching, the
-scheduler's composite RNG/output commit, and the bounded actor remain
-incomplete until the rest of M5 lands. Weights remain eagerly resident in M5,
-so live cache-leased expert execution remains an explicit system gap.
+the full 1,024-position context without growth. The synchronous scheduler now
+composes adapter state, DRR credit, RNG, output, phase, and trace publication at
+one non-yielding boundary. It uses bounded FIFO admission, retained-round DRR,
+expert-sorted waves, per-request output backpressure, exact category ownership,
+and prevalidated release permits for terminal/reap/shutdown cleanup. The
+concurrent control owner, adversarial interleaving matrix, independent
+trace/fairness replay, and accepted evidence remain incomplete until the rest
+of M5 lands. Weights remain eagerly resident in M5, so live cache-leased expert
+execution remains an explicit system gap.
 
 ## Error model
 
-Public operations return stable categories while retaining an internal source
-chain:
+Public operations return stable categories. Internal source chains are retained
+only when they are bounded and content-safe; the scheduler deliberately
+discards raw adapter and sampler sources at its public boundary:
 
 | Category | Examples | Retry |
 | --- | --- | --- |

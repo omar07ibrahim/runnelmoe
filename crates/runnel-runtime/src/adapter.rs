@@ -33,8 +33,9 @@ pub struct AdapterTransactionId(pub(crate) NonZeroU64);
 impl AdapterTransactionId {
     /// Constructs an adapter-owned transaction identity.
     ///
-    /// External adapters are responsible for issuing each value at most once
-    /// and for permanently exhausting their counter instead of wrapping.
+    /// External adapters are responsible for issuing values from one strictly
+    /// increasing lifetime counter and for permanently exhausting it instead
+    /// of wrapping or reusing an earlier value.
     pub fn try_new(value: u64) -> Result<Self> {
         NonZeroU64::new(value)
             .map(Self)
@@ -69,9 +70,9 @@ impl AdapterWorkIdentity {
     /// transaction.
     ///
     /// Adapter implementations must keep model-instance and state identities
-    /// unique within their own lifetime and must never reuse a transaction
-    /// identity. Constructing a tag does not authorize work or provide access
-    /// to an adapter-owned task or contribution payload.
+    /// unique within their own lifetime and issue transaction identities in
+    /// strictly increasing order. Constructing a tag does not authorize work
+    /// or provide access to an adapter-owned task or contribution payload.
     pub fn try_new(
         transaction_id: u64,
         model_instance_id: u64,

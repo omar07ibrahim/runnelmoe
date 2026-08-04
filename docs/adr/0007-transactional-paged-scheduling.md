@@ -120,7 +120,9 @@ Runtime adapter types never depend on scheduler request slots. Both layers
 validate their complete identity before scatter. Request IDs, request slots,
 slot generations, engine/adapter transaction IDs, model/state IDs, revisions,
 and positions use checked increments; exhaustion fails before work selection
-and never wraps or reuses an identity.
+and never wraps or reuses an identity. Adapter transaction identities are
+observed against one engine-lifetime high-water mark and must increase
+strictly across requests as well as within one request.
 
 `finish_token` rejects a missing, duplicate, foreign, stale, wrong-rank,
 wrong-expert, nonfinite, or dimension-mismatched contribution before it
@@ -430,7 +432,8 @@ and eligible completion permutation.
 The scheduler exposes stable categories compatible with the cross-system
 error model: `invalid_request`, `unsupported`, `resource_exhausted`,
 `cancelled`, `deadline_exceeded`, and `internal`. Adapter errors retain their
-typed source but never expose prompt/token content. Invalid lengths, tokens,
+stable classification while potentially sensitive raw source values are
+discarded at the public scheduler boundary. Invalid lengths, tokens,
 sampling floats, limits, count products, byte products, deadlines, and
 configuration are rejected before request payload allocation or schedule
 mutation.
@@ -468,7 +471,8 @@ Shared identity:
 
 ```text
 shared_used = ordinary_command_capacity + control_wake_capacity
-            + worker_scratch + coalesced_batch_capacity
+            + worker_scratch + sampling_scratch
+            + coalesced_batch_capacity
             + model_resident_partition + page_pool_partition
             + trace_capacity + admission_reserve
 total_used  = sum(request_used) + shared_used
@@ -492,6 +496,7 @@ The owner/lifetime transitions are closed:
 | active state and pending transaction capacity | request, reserved before promotion and retained until numerical state is destroyed; the pending buffers change only an in-use count per token |
 | output queue capacity and terminal slot | request, reserved before admission; committed events occupy bounded slots until drain/discard, and capacity releases at result reap/drop |
 | worker scratch | shared static partition through scheduler shutdown; worker ownership changes do not remove its charge |
+| sampling scratch | shared static partition through scheduler shutdown; logits and sampling workspace occupancy change without changing its reserved capacity |
 | coalesced batch capacity | shared static partition through shutdown; includes 64 bytes per task identity plus adapter contribution buffers and is charged once, never per participating request |
 | trace capacity | shared static partition through shutdown at 128 bytes per bounded slot; draining changes occupancy, not capacity charge |
 | model resident partition | validated static partition present when the scheduler is constructed |

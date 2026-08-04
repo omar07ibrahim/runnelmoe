@@ -5,6 +5,7 @@ members = [
     "crates/runnel-format",
     "crates/runnel-kernels",
     "crates/runnel-runtime",
+    "crates/runnel-scheduler",
     "crates/runnel-sim",
     "crates/runnel-store",
 ]
