@@ -2576,13 +2576,19 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
         if occupancy.ready != 0 {
             return Ok(true);
         }
+        // Terminal publication can make a disconnected endpoint reap-ready,
+        // but recycling is deliberately a later resolve-visible-controls
+        // pass. The signal that caused this pump may already have been
+        // coalesced before entry, so always schedule that reconciliation pass
+        // rather than relying on another external wake.
+        if report.terminal_decisions != 0 {
+            return Ok(true);
+        }
         let snapshot = self.engine.snapshot();
         if snapshot.active_requests > snapshot.output_blocked_requests {
             return Ok(true);
         }
-        let made_progress = report.promoted_requests != 0
-            || report.committed_positions != 0
-            || report.terminal_decisions != 0;
+        let made_progress = report.promoted_requests != 0 || report.committed_positions != 0;
         Ok(snapshot.queued_requests != 0 && snapshot.active_requests == 0 && made_progress)
     }
 
@@ -3387,6 +3393,73 @@ mod tests {
                 "missing {kind:?} semantic observation"
             );
         }
+        timeout(Duration::from_secs(5), actor.shutdown())
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_decision_reconciles_a_coalesced_receiver_drop_without_another_signal() {
+        let mut limits = SchedulerLimits::tiny();
+        limits.max_new_tokens = 8;
+        limits.output_capacity_per_request = 2;
+        let (model, config) = model_and_config(limits);
+        let (actor, probe) =
+            SchedulerActor::spawn_instrumented(model, config).expect("instrumented actor");
+        let client = actor.client();
+        let handle = wait_submission(
+            client
+                .try_submit(request(&[14], 8, None))
+                .expect("request submission"),
+        )
+        .await;
+        wait_for_buffered_output(&handle).await;
+
+        let hold = probe.hold_pump().await.expect("reconciliation hold");
+        let cancellation = handle.cancellation();
+        assert_eq!(
+            cancellation.cancel().expect("cancellation"),
+            CancelDisposition::Requested
+        );
+        let sink = ActorRequestDropWitnessSink::new();
+        let mut handle = handle;
+        handle
+            .arm_drop_witness(sink.clone())
+            .expect("arm destructor witness");
+        drop(handle);
+        let (disconnect, control) = sink
+            .take()
+            .expect("take destructor witness")
+            .expect("recorded destructor witness")
+            .into_parts();
+        assert_eq!(
+            disconnect.expect("disconnect"),
+            ActorDisconnectDisposition::Requested
+        );
+        assert!(control.expect("control boundary").boundary_reached());
+
+        // Model the boundary that exposed the bug: both action signals have
+        // already been coalesced into the current pump. Consume the single
+        // stored Notify permit and clear dirty so neither can accidentally
+        // supply a second reconciliation pass.
+        timeout(
+            Duration::from_secs(5),
+            probe.shared.activity.notify.notified(),
+        )
+        .await
+        .expect("consume coalesced signal timeout");
+        probe.shared.activity.dirty.store(false, Ordering::Release);
+        hold.release().expect("release reconciliation hold");
+        drop(cancellation);
+
+        let reaped = timeout(Duration::from_secs(5), probe.wait_quiescent())
+            .await
+            .expect("reconciliation timeout")
+            .expect("reconciliation quiescence");
+        assert_eq!(reaped.outstanding_requests, 0);
+        assert_eq!(reaped.request_bytes, 0);
+        drop(client);
         timeout(Duration::from_secs(5), actor.shutdown())
             .await
             .expect("shutdown timeout")
