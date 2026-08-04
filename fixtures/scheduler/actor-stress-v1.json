@@ -1,0 +1,223 @@
+{
+  "action_counts": {
+    "by_kind": {
+      "cancel": 220,
+      "drain": 237,
+      "drop": 222,
+      "submit": 206,
+      "wake": 139
+    },
+    "exhausted_submits": 142,
+    "total": 1024
+  },
+  "action_vectors": {
+    "count": 1024,
+    "digest": "sha256:430810784f31659367ecc4fecb5cf8693b4758176debe4a4769dc7cc62611b73",
+    "first": [
+      {
+        "kind": "drain",
+        "ordinal": 0,
+        "producer": 0,
+        "request_index": 42
+      },
+      {
+        "exhausted": false,
+        "kind": "submit",
+        "ordinal": 1,
+        "producer": 0,
+        "request_index": 0,
+        "submit_attempt": 0
+      },
+      {
+        "exhausted": false,
+        "kind": "submit",
+        "ordinal": 2,
+        "producer": 1,
+        "request_index": 1,
+        "submit_attempt": 1
+      },
+      {
+        "exhausted": false,
+        "kind": "submit",
+        "ordinal": 3,
+        "producer": 0,
+        "request_index": 2,
+        "submit_attempt": 2
+      }
+    ],
+    "last": [
+      {
+        "kind": "cancel",
+        "ordinal": 1020,
+        "producer": 0,
+        "request_index": 1
+      },
+      {
+        "kind": "drain",
+        "ordinal": 1021,
+        "producer": 1,
+        "request_index": 7
+      },
+      {
+        "kind": "drain",
+        "ordinal": 1022,
+        "producer": 0,
+        "request_index": 28
+      },
+      {
+        "kind": "wake",
+        "ordinal": 1023,
+        "producer": 1,
+        "selector_index": 49
+      }
+    ]
+  },
+  "actor_config": {
+    "adapter": "tiny-v3",
+    "admission_reserve_bytes": 1048576,
+    "backend": "scalar",
+    "batch_width": 8,
+    "command_capacity": 8,
+    "logical_memory_limit_bytes": 8388608,
+    "max_active_requests": 8,
+    "max_context_tokens": 19,
+    "max_new_tokens": 16,
+    "max_outstanding_requests": 16,
+    "max_prompt_tokens": 4,
+    "max_queued_requests": 16,
+    "max_retained_terminal_results": 16,
+    "output_capacity_per_request": 2,
+    "page_pool_partition_bytes": 0,
+    "state_page_tokens": 4,
+    "trace_capacity": 1024,
+    "waves_per_step": 4,
+    "worker_count": 1
+  },
+  "algorithms": {
+    "action_generation": "unbiased-kind-then-selector-submit-cursor-v1",
+    "descriptor_generation": "sha256-domain-u32le-index-byte-formulas-v1",
+    "producer_assignment": "submit-attempt-home-drop-drain-home-cancel-opposite-wake-ordinal-v1",
+    "sequence_digest": "sha256-canonical-json-ascii-v1",
+    "unbiased_mapping": "reject-ge-floor-2^64-over-bound-times-bound-v1",
+    "word_stream": "sha256-domain-u64le-counter-four-u64le-byte-order-v1"
+  },
+  "descriptor_vectors": {
+    "count": 64,
+    "digest": "sha256:d902ecf3377310de99471f41287f62730671263b8e339ac03b87ee5d6edef42b",
+    "first": [
+      {
+        "deadline_ns": null,
+        "index": 0,
+        "max_new_tokens": 15,
+        "prompt": [
+          1,
+          22
+        ],
+        "sampling": "greedy"
+      },
+      {
+        "deadline_ns": null,
+        "index": 1,
+        "max_new_tokens": 13,
+        "prompt": [
+          10,
+          21,
+          25
+        ],
+        "sampling": "greedy"
+      },
+      {
+        "deadline_ns": null,
+        "index": 2,
+        "max_new_tokens": 13,
+        "prompt": [
+          8,
+          9,
+          30
+        ],
+        "sampling": "greedy"
+      },
+      {
+        "deadline_ns": null,
+        "index": 3,
+        "max_new_tokens": 1,
+        "prompt": [
+          28,
+          31,
+          6,
+          2
+        ],
+        "sampling": "greedy"
+      }
+    ],
+    "last": [
+      {
+        "deadline_ns": null,
+        "index": 60,
+        "max_new_tokens": 15,
+        "prompt": [
+          5,
+          7
+        ],
+        "sampling": "greedy"
+      },
+      {
+        "deadline_ns": null,
+        "index": 61,
+        "max_new_tokens": 11,
+        "prompt": [
+          26,
+          11
+        ],
+        "sampling": "greedy"
+      },
+      {
+        "deadline_ns": null,
+        "index": 62,
+        "max_new_tokens": 10,
+        "prompt": [
+          23,
+          8,
+          14,
+          29
+        ],
+        "sampling": "greedy"
+      },
+      {
+        "deadline_ns": null,
+        "index": 63,
+        "max_new_tokens": 13,
+        "prompt": [
+          29
+        ],
+        "sampling": "greedy"
+      }
+    ]
+  },
+  "domains": {
+    "action_words": "runnel-m5-actor-stress-v1\u0000",
+    "request_descriptors": "runnel-m5-actor-request-v1\u0000"
+  },
+  "fixture_id": "sha256:297827cef0bde04a5a1e6af549c565b5548d223a79dd9b80aacb58142c364436",
+  "kind_codes": {
+    "0": "submit",
+    "1": "cancel",
+    "2": "drop",
+    "3": "drain",
+    "4": "wake"
+  },
+  "parameters": {
+    "action_count": 1024,
+    "kind_bound": 5,
+    "pin_count": 4,
+    "request_count": 64,
+    "selector_bound": 64,
+    "words_per_digest": 4
+  },
+  "producer_counts": {
+    "producer_0": 518,
+    "producer_1": 506
+  },
+  "schema": "runnel.actor-stress-vectors/1",
+  "specification": "runnel-m5-actor-stress-v1"
+}

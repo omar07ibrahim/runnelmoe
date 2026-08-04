@@ -2,6 +2,7 @@
 
 - Status: accepted; implementation in progress; measurement pending
 - Date: 2026-08-03
+- Last amended: 2026-08-04 (pre-measurement stress-protocol clarification)
 - Milestone: M5
 
 ## Context
@@ -444,7 +445,7 @@ mutation.
 
 ### Logical memory ledger
 
-Pre-measurement amendment (2026-08-03): actor integration review found that
+Pre-measurement amendment (2026-08-04): actor integration review found that
 the original formulas charged only command metadata and one global control
 wake while omitting the bounded offered-prompt copies and accepted-control /
 deadline table. Before any M5 capture, the formulas were corrected to charge
@@ -595,9 +596,40 @@ proof. Runnable gap includes commits before a request's first service, between
 successive services, and after its last service through the horizon; only
 commits by other requests count. Lag, gap, Jain, and the baseline difference
 are exact replayed properties, not bootstrap estimates. All 30 timing
-repetitions must have identical eligible service-sequence digests. A 1,000-turn
-continuous-arrival deterministic stress test separately proves an older
-runnable request continues to progress and terminates.
+repetitions must have identical eligible service-sequence digests.
+
+The `continuous-arrival-1000` check is a deterministic candidate-core
+correctness test, not a timing cell. It uses the evidence configuration with
+these exact overrides: one worker, batch width one, one wave per step, maximum
+active requests 16, outstanding/queued/retained-terminal caps 64/64/64, output
+capacity two, and trace capacity 1,024. Before turn zero it admits anchor
+offered index zero as `P(16)` with eight output tokens, followed by churner
+indices 1 through 15 as `P(1)` with one output token each. All requests are
+greedy and have no deadline.
+
+For each zero-based turn `t` from zero through 999, the harness first offers
+churner index `16 + t`, again as `P(1)` with one output token, and requires
+acceptance. It then calls exactly one bounded scheduler step and requires that
+the step commit exactly one model position and append exactly one service
+event. Before the next turn, it visits retained requests in ascending request
+ID, nonblocking-drains every available output event, and acknowledges every
+terminal churner; if the anchor is terminal, it records its result, drains it,
+and acknowledges EOF in the same pass. The following turn's bounded step reaps
+those ready records during its control prefix before committing its sole
+service event. After the final turn, cleanup performs the corresponding reap
+before shutdown. No sink operation may execute model work, and lifecycle reaps
+are not service turns.
+
+The valid trace has exactly 1,000 service events. Anchor positions zero through
+22 each appear exactly once, its first service occurs no later than turn 15,
+at most 15 other commits separate successive anchor services while it remains
+runnable, and it reaches `Completed` no later than turn 367. No accepted
+runnable request may report output or memory blocking in this test. After turn
+999, the harness requests cancellation of every outstanding request in
+ascending request ID, takes at most 64 further bounded cleanup steps, drains
+and reaps in ascending request ID, and shuts down. Cleanup service is excluded
+from the 1,000-event trace and must not commit another position; final request
+and shared ledger use are zero.
 
 ### Preregistered evidence workloads
 
@@ -838,37 +870,219 @@ M5 does not close until all of these pass:
 - committed raw evidence whose verifier recomputes schema, hashes, arithmetic,
   percentiles, fairness, accounting, parity, and capture provenance.
 
-Actor validation has a deterministic interleaving test and a separate genuine
-race stress. Both offer 64 direct-token requests of at most 16 model positions
-through two Tokio producer tasks to one scheduler actor with ordinary-command
-capacity 8, total-outstanding cap 16, output capacity 2, and one compute worker.
-A 1,024-action script is derived from consecutive little-endian words of
-`SHA-256("runnel-m5-actor-stress-v1\0" || u64_le(counter))`. A word below
-`floor(2^64 / 5) * 5` maps by remainder to `0=submit next offered index`,
-`1=cancel`, `2=receiver drop`, `3=drain one event`, or `4=actor wake`; rejected
-words are skipped. The last four actions consume a second stream word with the
-same unbiased rule and bound 64 to choose a client request index. Offered
-indices advance even when submission is rejected and are assigned alternately
-to the two producers.
+Pre-measurement protocol amendment (2026-08-04): the actor workload, producer
+assignment, cleanup, witnesses, and semantic transcript below were made
+explicit before generating a golden digest or running any M5 measurement or
+capture. Neither this actor-stress protocol nor the `continuous-arrival-1000`
+protocol had been run, no semantic golden digest had been generated, and no M5
+measurement, capture, or timing result existed when this amendment was
+accepted. Earlier unit and integration correctness results are not relabeled as
+this protocol's evidence. The amendment changes no model or scheduler policy
+and uses no implementation, fixture, prose, or result from the credited
+prior-art repository.
 
-For the golden test, a coordinator releases exactly one action to its assigned
-producer and waits for that operation's documented linearization acknowledgement
-before releasing the next. It stops after at most 4,096 pump turns, drains and
-shuts down, and must match one independently generated event/terminal digest.
-For the race test, the two producers receive their even/odd script subsequences
-behind one start barrier and then run without ordering gates for 32 repetitions;
-it has no fixed event digest or accepted set. Each API operation records
-invocation, response, and its operation-specific actor-commit or atomic-CAS
-witness. An independent state machine constructs and verifies a valid
-linearization that is consistent with operation intervals, witnesses, and
-observed outcomes, then matches all accepts, resource-exhausted rejections,
-cancellations, drains, and terminal outcomes. The race harness does not infer
-a total order from an adjacent global counter.
-Every race repetition must resolve each accepted request exactly once, preserve
-committed-token semantics, finish within 4,096 pump turns after producers join,
-resolve every receiver, and end with zero request and shared ledger use. The
-`actor-concurrency-stress` correctness row aggregates both subtests; only the
-gated subtest has a committed expected digest.
+#### Actor request and action streams
+
+Actor validation has a deterministic interleaving test and a separate genuine
+race stress. Both run the tiny-v3 model on the scalar backend through two Tokio
+producer tasks and one scheduler actor. The exact limits are one compute worker,
+ordinary-command capacity eight, outstanding/active/queued/retained-terminal
+caps 16/8/16/16, prompt/generation/context ceilings 4/16/19, four-token state
+pages, two output events per request, batch width eight, four waves per step,
+1,024 trace events, an 8,388,608-byte logical-memory limit, no page-pool
+partition, and a 1,048,576-byte admission reserve. The global context envelope
+is 19 because configuration validates `4 + 16 - 1`; every derived request below
+still has at most 16 model positions.
+
+The 64 offered descriptions are derived independently of the action stream.
+For zero-based request index `i`, let `d` be the 32 bytes of:
+
+```text
+SHA-256("runnel-m5-actor-request-v1\0" || u32_le(i))
+```
+
+Bytes are numbered from zero in digest byte order. The descriptor is:
+
+```text
+prompt_len      = 1 + d[0] mod 4
+prompt[j]       = 1 + d[1 + j] mod 31, for 0 <= j < prompt_len
+max_new_tokens  = 1 + d[5] mod (17 - prompt_len)
+sampling        = Greedy
+deadline        = None
+```
+
+Thus `prompt_len + max_new_tokens - 1` is at most 16. No tokenizer or model
+output is fed back into descriptor generation.
+
+The action word stream concatenates, in increasing counter order, the four
+little-endian `u64` values represented by digest byte ranges 0..8, 8..16,
+16..24, and 24..32 of:
+
+```text
+SHA-256("runnel-m5-actor-stress-v1\0" || u64_le(counter))
+```
+
+Counters start at zero. To draw uniformly below bound `b`, words are consumed
+until one is below `floor(2^64 / b) * b`, and its remainder modulo `b` is used.
+Exactly 1,024 accepted bound-five draws define action kinds
+`0=submit`, `1=cancel`, `2=receiver drop`, `3=drain one event`, and
+`4=actor wake`. Kinds one through four consume a subsequent unbiased bound-64
+draw. A wake consumes and records that request selector to preserve stream
+custody, but the selector is ignored by the global wake operation.
+
+Every submit-kind action has its own zero-based submit-attempt ordinal. Attempts
+zero through 63 map one-to-one to the same request index; the cursor advances
+even if actor submission or engine admission rejects that offer. Attempts 64
+and later are `offer_exhausted` no-ops with no request index and do not call the
+actor. All submit-kind actions are assigned to producer
+`submit_attempt_ordinal mod 2`. Request index `i` has home producer `i mod 2`:
+drain and receiver-drop actions run on that producer, cancellation runs on the
+opposite producer, and wake action ordinal `a` runs on producer `a mod 2`.
+
+An accepted request stores its cancellation authority separately from its sole
+receiver. Dropping the receiver does not drop that authority; it remains usable
+until its generation becomes terminal and is recycled. A targeted operation
+whose needed authority or receiver is absent, not yet accepted, rejected, or
+already consumed is an `unavailable` no-op and makes no actor API call. A
+stored authority that has since become stale is still called and records its
+typed API error. A drain action performs exactly one nonblocking receive
+attempt: it consumes at most one FIFO output event, observes empty, or
+acknowledges EOF. Receiver drop explicitly publishes disconnect before
+consuming the handle. Wake is global and never inspects the selected request.
+
+#### Golden execution, cleanup, and race witnesses
+
+The golden actor first reaches acknowledged quiescence. For action ordinals in
+increasing order, a coordinator releases exactly one action to its assigned
+producer, waits for the operation response, and then waits for explicit actor
+quiescence before releasing the next action. An in-range submit waits for its
+admission response, including a typed rejection. Quiescence means the actor is
+parked, no pump is in flight, and its dirty flag is false, observed through a
+lost-wake-safe acknowledgement. A pump turn is one entry into the blocking
+owner's `pump` function, including command-only and no-work entries; engine
+step count is not a substitute. The cap is a delta of 4,096 pump entries from
+the initial acknowledged quiescence through completed shutdown.
+
+Cleanup begins from quiescence. While the pump is held, the coordinator visits
+request indices in ascending order and requests cancellation through every
+still-generation-valid stored authority. It then releases the pump and waits
+for quiescence. In ascending request-index order, each remaining receiver first
+consumes its terminal result, then drains committed output in FIFO order through
+EOF, and is dropped; a receiver already dropped by the script is skipped. The
+harness drops the stored cancellation authorities, waits for quiescence, and
+performs cooperative actor shutdown. Terminal and output publication observers
+retain semantic records even when a receiver was previously dropped, so
+discarded client delivery cannot erase a committed event from the golden
+transcript.
+
+The genuine race uses the identical actions and producer assignment for 32
+repetitions. After initial actor quiescence, both producers wait behind one
+start barrier and then execute their own action subsequence in original action
+ordinal order without cross-producer gates. After both producer tasks join, the
+coordinator waits for quiescence and performs the identical ordered cleanup
+used by the golden execution. The 4,096 pump-entry cap is the delta from barrier
+release through completed shutdown. Each operation records invocation and
+response interval counters plus a structural witness:
+
+- a submit records command-slot index and ticket and, if it reached ready
+  commit, its ready-commit sequence; an accepted response also records the
+  assigned request ID;
+- cancel and disconnect record control-slot identity and the generation-bound
+  packed control word before and after their load/CAS decision;
+- drain records endpoint slot/generation, drained-event count before and after,
+  and any consumed output identity; and
+- wake records whether dirty was already set and the park epoch observed before
+  the wake and after its acknowledgement.
+
+Zero/sentinel witness fields are required for an operation that never reaches
+the corresponding boundary. Shared interval counters establish only invocation,
+response, per-producer, and response-before-later-invocation constraints. The
+independent checker must choose a linearization consistent with those edges and
+the structural witnesses; it must not use an adjacent counter value as the
+linearization point or infer a total order from it. It then matches every
+acceptance, typed rejection, cancellation, drop, drain, output, terminal, and
+cleanup effect. Every repetition resolves each accepted request exactly once,
+preserves committed-token semantics, resolves or deliberately drops every
+receiver, and ends with zero request and shared ledger use.
+
+#### Canonical actor semantic transcript
+
+The golden digest is SHA-256 over one canonical binary transcript; it is
+reported as `sha256:` followed by 64 lowercase hexadecimal digits. Every
+integer is unsigned little-endian, reserved fields must be zero, and no native
+`usize`, enum representation, JSON spelling, timestamp, interval counter, or
+structural witness enters this semantic digest. The byte stream is:
+
+```text
+"runnel-m5-actor-semantic-transcript-v1\0"
+u32(1024 action records)
+u32(output publication count)
+u32(terminal publication count)
+u32(EOF acknowledgement count)
+1024 action records in action-ordinal order
+output records sorted by (client_index, output_index)
+terminal records sorted by client_index
+EOF records sorted by client_index
+one shutdown record
+```
+
+An action record has tag `0x01`, followed by `ordinal:u32`, `kind:u8`,
+`producer:u8`, `result:u8`, `error:u8`, `submit_attempt:u32`,
+`client_index:u32`, `request_id:u64`, `value0:u32`, and `value1:u32`.
+`submit_attempt` is `0xffffffff` for non-submit actions. `client_index` is
+`0xffffffff` for an exhausted submit, the offered index for an in-range submit,
+and the consumed selector for every targeted action including wake. For an
+accepted submit, `request_id` is its assigned ID; an exhausted or rejected
+submit uses zero. For another targeted action, it is the ID already assigned to
+that client index when the action begins, even if the operation is now
+unavailable; it is zero if that index has not yet been accepted. A wake always
+uses zero because it is global. For `drain_output`, `value0` and `value1` are
+output index and token ID; otherwise both are zero.
+
+Action result codes are `0=submit_accepted`, `1=submit_offer_exhausted`,
+`2=cancel_requested`, `3=cancel_already_requested`,
+`4=cancel_already_terminal`, `5=receiver_dropped`, `6=drain_output`,
+`7=drain_empty`, `8=drain_eof`, `9=wake_signaled`,
+`10=target_unavailable`, and `11=error`. Error codes are
+`0=none`, `1=invalid_request`, `2=unsupported`, `3=resource_exhausted`,
+`4=cancelled`, `5=deadline_exceeded`, and `6=internal`, matching the public
+scheduler category; `error` is nonzero exactly for result 11.
+
+An output-publication record has tag `0x02`, followed by `client_index:u32`,
+`request_id:u64`, `output_index:u32`, and `token_id:u32`. It records every
+committed output exactly once whether later drained or discarded. A terminal
+record has tag `0x03`, followed by `client_index:u32`, `request_id:u64`,
+`outcome:u8`, `error:u8`, `reserved:u16`, `committed_positions:u32`, and
+`emitted_tokens:u32`. Outcome codes are `0=completed`, `1=cancelled`,
+`2=deadline_exceeded`, and `3=failed`; `error` uses the action-record error
+table and is nonzero exactly for failed.
+An EOF record has tag `0x04`, followed by `client_index:u32` and
+`request_id:u64`, and appears exactly when endpoint output-EOF acknowledgement
+first changes from false to true, whether by client EOF consumption or the
+equivalent disconnect/discard settlement. Repeated `drain_eof` action results
+add no further EOF record.
+
+The final record has tag `0x05`, followed by
+`accepted_submissions:u32`, `rejected_submissions:u32`,
+`shutdown_cancellations:u32`, `terminated_requests:u32`,
+`discarded_output_events:u32`, `reserved:u32`, `engine_steps:u64`,
+`pump_entries:u64`, `released_request_bytes:u64`,
+`remaining_shared_bytes:u64`, `final_request_bytes:u64`, and
+`final_shared_bytes:u64`. Actor and engine report fields are copied exactly
+after checked conversion to the declared widths; `pump_entries` is the
+previously defined cap delta, and the final byte fields are the post-shutdown
+ledger snapshot. `rejected_submissions` therefore excludes exhausted offers
+and unavailable operations, because neither calls the actor. Both final byte
+fields and `remaining_shared_bytes` must be zero. Cleanup operations are fixed
+by the preceding contract and are not additional action records; their effects
+appear in output, terminal, EOF, and shutdown records. Independently structured
+Rust and Python generators must agree on every transcript byte before the
+expected golden digest is committed.
+
+The `actor-concurrency-stress` correctness row aggregates the golden and race
+subtests. Only the gated golden execution has a committed semantic digest; race
+histories retain their interval and structural-witness corpus for independent
+verification but have no expected event digest or accepted set.
 
 Timing eligibility additionally requires exact accepted/rejected ID sets, no
 lost or duplicate events, balanced ledgers, final request-owned bytes zero,

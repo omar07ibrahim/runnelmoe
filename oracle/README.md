@@ -18,6 +18,7 @@ python -m oracle.generate --check
 python -m oracle.generate --check --spec fixtures/tiny-v2/spec.json
 python -m oracle.generate --check --spec fixtures/tiny-v3/spec.json
 python -m oracle.sampling --check
+python -m oracle.scheduler --check
 python -m unittest discover -s oracle/tests -v
 ```
 
@@ -29,6 +30,7 @@ python -m oracle.generate --write
 python -m oracle.generate --write --spec fixtures/tiny-v2/spec.json
 python -m oracle.generate --write --spec fixtures/tiny-v3/spec.json
 python -m oracle.sampling --write
+python -m oracle.scheduler --write
 ```
 
 The default command remains the frozen all-float32 adapter-v1 fixture. The
@@ -58,6 +60,17 @@ The vector checker validates a closed canonical JSON schema, recomputes every
 valid and invalid case, verifies the semantic vector identity, and then
 requires byte equality with independent regeneration. Production code does not
 import this oracle, and the oracle does not consume production outputs.
+
+## Independent scheduler stress inputs
+
+`scheduler.py` is a standard-library-only implementation of the domain-separated
+SHA-256 word stream, rejection sampling, synthetic request descriptors, action
+selection, and two-producer assignment frozen by ADR 0007. Its committed
+`actor-stress-v1.json` fixture contains inputs and configuration only: it does
+not import the Rust scheduler, model an actor result, or claim a golden terminal
+digest. The checker performs bounded no-follow reads, rejects noncanonical or
+open-schema JSON, recomputes every identity, and requires byte equality with a
+fresh independent generation.
 
 ## Independent cache-policy oracle
 

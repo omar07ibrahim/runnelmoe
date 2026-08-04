@@ -416,6 +416,9 @@ dependencies = [
  "runnel-fixture",
  "runnel-format",
  "runnel-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
 ]

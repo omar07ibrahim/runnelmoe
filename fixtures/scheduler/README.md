@@ -52,3 +52,42 @@ reconstruct every binary32 input from its raw bits. Binary64 diagnostics are
 for diagnosis and use a maximum four-ULP comparison, fixed before M5 timing:
 `math.exp` is intentionally not presented as bitwise portable across all libm
 implementations.
+
+## Actor stress input corpus
+
+`actor-stress-v1.json` freezes the input side of the preregistered M5 actor
+stress before any M5 capture or golden runtime digest. The separately
+structured standard-library implementation in `oracle/scheduler.py` derives 64
+bounded direct-token descriptors and 1,024 actor actions from the SHA-256
+domains in ADR 0007. It also binds the exact tiny-v3 scalar actor limits,
+producer assignment, exhausted-submit behavior, and ignored-but-consumed wake
+selectors. It contains no Rust result, output token transcript, timing, or
+terminal claim.
+
+Frozen identity:
+
+- descriptor sequence:
+  `sha256:d902ecf3377310de99471f41287f62730671263b8e339ac03b87ee5d6edef42b`;
+- action sequence:
+  `sha256:430810784f31659367ecc4fecb5cf8693b4758176debe4a4769dc7cc62611b73`;
+- semantic fixture ID:
+  `sha256:297827cef0bde04a5a1e6af549c565b5548d223a79dd9b80aacb58142c364436`;
+- complete file SHA-256:
+  `eb4a170a70c734471f6be0d33767f6d0d7102662307bd8860f9bc527d317e9b1`.
+
+The action counts are 206 submit, 220 cancel, 222 receiver-drop, 237 drain,
+and 139 wake actions. Of the submit actions, 142 occur after the 64-description
+corpus is exhausted and are explicit no-ops. Producer action counts are 518
+and 506.
+
+Verify without rewriting:
+
+```console
+python -m oracle.scheduler --check
+python -m unittest oracle.tests.test_scheduler -v
+```
+
+Deliberate regeneration uses `python -m oracle.scheduler --write` and requires
+reviewing every identity above plus the literal independent test vectors. The
+checker performs a bounded no-follow regular-file read, enforces canonical
+closed-schema JSON, and requires exact byte equality with fresh regeneration.

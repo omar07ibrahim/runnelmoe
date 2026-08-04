@@ -23,6 +23,12 @@ seeded top-k/top-p categorical sampling. These inputs contain only small,
 hand-auditable numeric cases encoded with exact float-bit custody; they are not
 model weights or production-runtime traces.
 
+The same scheduler fixture directory contains the independently generated
+`actor-stress-v1.json` input corpus. It freezes only synthetic request
+descriptors, actor actions, producer assignment, and bounded configuration;
+runtime outcomes and the preregistered golden transcript remain deliberately
+absent until the Rust actor and a separate reference agree.
+
 M3 also commits three tiny canonical
 [cache-policy traces](cache/README.md). They are hand-inspectable correctness
 inputs; the larger stochastic experiment traces are regenerated from the
