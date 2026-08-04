@@ -190,6 +190,8 @@ REQUIRED = {
     "fixtures/tiny-v3/golden_tokens.json",
     "fixtures/tiny-v3/spec.json",
     "fixtures/scheduler/README.md",
+    "fixtures/scheduler/actor-golden-v1.json",
+    "fixtures/scheduler/actor-golden-v1.sha256",
     "fixtures/scheduler/actor-stress-v1.json",
     "fixtures/scheduler/sampling-v1.json",
     "oracle/README.md",
@@ -428,6 +430,12 @@ def main() -> int:
         if path.is_symlink():
             failures.append(f"symbolic links are not allowed in source: {relative}")
             continue
+        if (
+            relative.parent == Path("fixtures/scheduler")
+            and relative.name.startswith("actor-golden-")
+            and relative.suffix == ".bin"
+        ):
+            failures.append(f"{relative}: actor transcript binaries must not be committed")
         if (
             len(relative.parts) >= 2
             and relative.parts[0] == "fixtures"

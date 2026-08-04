@@ -30,6 +30,7 @@ SCHEMA = "runnel.actor-semantic-capture/1"
 TRANSCRIPT_DOMAIN = b"runnel-m5-actor-semantic-transcript-v2\0"
 MAX_CAPTURE_BYTES = 1024 * 1024
 MAX_TINY_SPEC_BYTES = 256 * 1024
+EXPECTED_DIGEST_BYTES = 72
 MAX_U8 = (1 << 8) - 1
 MAX_U32 = (1 << 32) - 1
 MAX_U64 = (1 << 64) - 1
@@ -1020,6 +1021,63 @@ def _read_capture(path: Path) -> bytes:
         os.close(descriptor)
 
 
+def read_expected_digest_path(path: Path) -> str:
+    """Read one canonical labeled SHA-256 line without following the leaf."""
+
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(Path(path), flags)
+    except OSError as error:
+        _fail(f"cannot open expected actor transcript digest without following links: {error}")
+    try:
+        try:
+            before = os.fstat(descriptor)
+        except OSError as error:
+            _fail(f"cannot inspect expected actor transcript digest: {error}")
+        if not stat.S_ISREG(before.st_mode):
+            _fail("expected actor transcript digest path must name a regular file")
+        if before.st_size != EXPECTED_DIGEST_BYTES:
+            _fail("expected actor transcript digest has a noncanonical length")
+        chunks: list[bytes] = []
+        bytes_read = 0
+        try:
+            while bytes_read <= EXPECTED_DIGEST_BYTES:
+                remaining = EXPECTED_DIGEST_BYTES + 1 - bytes_read
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                bytes_read += len(chunk)
+        except OSError as error:
+            _fail(f"cannot read expected actor transcript digest: {error}")
+        raw = b"".join(chunks)
+        try:
+            after = os.fstat(descriptor)
+        except OSError as error:
+            _fail(f"cannot re-inspect expected actor transcript digest: {error}")
+        if (
+            len(raw) != EXPECTED_DIGEST_BYTES
+            or len(raw) != after.st_size
+            or before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            _fail("expected actor transcript digest changed while it was being read")
+        if raw[:7] != b"sha256:" or raw[-1:] != b"\n":
+            _fail("expected actor transcript digest is not a canonical labeled line")
+        hexadecimal = raw[7:-1]
+        if len(hexadecimal) != 64 or any(
+            byte not in b"0123456789abcdef" for byte in hexadecimal
+        ):
+            _fail("expected actor transcript digest is not lowercase SHA-256")
+        return raw[:-1].decode("ascii")
+    finally:
+        os.close(descriptor)
+
+
 def _read_authenticated_tiny_spec() -> bytes:
     flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -1301,16 +1359,23 @@ def _write_new(path: Path, payload: bytes) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="verify a logical actor capture and emit its independent ADR v2 transcript"
+        description=(
+            "verify a logical actor capture and optionally emit its independent "
+            "ADR v2 transcript"
+        )
     )
     parser.add_argument("capture", type=Path, help="canonical logical capture JSON")
     parser.add_argument(
         "--transcript",
         "--output",
         dest="transcript",
-        required=True,
         type=Path,
         help="new binary transcript path (must not already exist)",
+    )
+    parser.add_argument(
+        "--expected-digest",
+        type=Path,
+        help="canonical labeled semantic digest file to require",
     )
     parser.add_argument(
         "--validate-model",
@@ -1318,19 +1383,26 @@ def main(argv: list[str] | None = None) -> int:
         help="also require exact output prefixes from the tiny-v3 PyTorch oracle",
     )
     arguments = parser.parse_args(argv)
+    if arguments.transcript is None and arguments.expected_digest is None:
+        parser.error("at least one of --transcript or --expected-digest is required")
     try:
         capture = parse_capture_path(arguments.capture)
         if arguments.validate_model:
             validate_model_output_prefixes(capture)
         transcript = serialize_transcript(capture)
-        _write_new(arguments.transcript, transcript)
+        digest = f"sha256:{hashlib.sha256(transcript).hexdigest()}"
+        if arguments.expected_digest is not None:
+            expected = read_expected_digest_path(arguments.expected_digest)
+            _require(digest == expected, "actor semantic transcript digest is not accepted")
+        if arguments.transcript is not None:
+            _write_new(arguments.transcript, transcript)
     except ActorTranscriptError as error:
         print(f"actor transcript oracle: {error}", file=sys.stderr)
         return 1
-    print(
-        f"{transcript_digest(capture)} bytes={len(transcript)} "
-        f"transcript={arguments.transcript}"
+    destination = (
+        f" transcript={arguments.transcript}" if arguments.transcript is not None else ""
     )
+    print(f"{digest} bytes={len(transcript)}{destination}")
     return 0
 
 

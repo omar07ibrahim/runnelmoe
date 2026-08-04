@@ -42,6 +42,8 @@ const CAPTURE_SCHEMA: &str = "runnel.actor-semantic-capture/1";
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 const MAX_TRANSCRIPT_BYTES: usize = 47_823;
 const EOS_TOKEN_ID: u32 = 0;
+const EXPECTED_TRANSCRIPT_DIGEST: &str =
+    "sha256:2711f6b6b28849dd9cb9692f75d97f09d24520645d7b0ccaf7c4c2fd023ddd7a";
 const EXPECTED_SPEC_DIGEST: &str =
     "sha256:ed57d7961e65c76223c169cabebaff9c02d8293da026abb0c0c0a22d38079845";
 const EXPECTED_ARTIFACT_ID: &str =
@@ -2260,6 +2262,10 @@ async fn deterministic_actor_semantic_golden_is_bounded_and_structurally_sound()
         .await
         .expect("deterministic actor golden exceeded 30 seconds")
         .unwrap_or_else(|error| panic!("deterministic actor golden failed: {error}"));
+    assert_eq!(
+        run.digest, EXPECTED_TRANSCRIPT_DIGEST,
+        "actor semantic transcript changed from the accepted v2 golden"
+    );
     exchange_independent_capture(&run)
         .unwrap_or_else(|error| panic!("actor golden capture exchange failed: {error}"));
     assert!(!run.transcript.is_empty());

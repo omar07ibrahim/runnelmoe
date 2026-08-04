@@ -881,6 +881,20 @@ this protocol's evidence. The amendment changes no model or scheduler policy
 and uses no implementation, fixture, prose, or result from the credited
 prior-art repository.
 
+Golden custody acceptance (2026-08-04): after three byte-identical local
+captures, independent Rust/Python byte agreement, PyTorch prefix validation,
+two independent reviews, and green hosted CI run
+[`30951994706`](https://github.com/omar07ibrahim/runnelmoe/actions/runs/30951994706)
+for pre-freeze commit `9dfee37`, the v2 semantic transcript was accepted at
+36,561 bytes with digest
+`sha256:2711f6b6b28849dd9cb9692f75d97f09d24520645d7b0ccaf7c4c2fd023ddd7a`.
+The canonical historical capture is `actor-golden-v1.json`; its JSON file
+SHA-256 is `d070c5158ae6ba3ae36553604fb98b231482db5333df545d75572716c2f67705`.
+The semantic digest excludes physical diagnostics and recorder append order.
+Future live captures must satisfy every diagnostic bound and semantic check,
+but their JSON bytes and physical counts need not equal the historical capture.
+No binary transcript is committed.
+
 #### Actor request and action streams
 
 Actor validation has a deterministic interleaving test and a separate genuine
@@ -1173,7 +1187,7 @@ golden would reject a valid implementation-preserving scheduling change. The
 4,096-entry pump cap remains a required guardrail, measured as the previously
 defined delta, and the capture retains both diagnostic counts. Independently
 structured Rust and Python generators must agree on every semantic transcript
-byte before the expected golden digest is committed.
+byte and on the accepted digest in every gated live run.
 
 Removing those two physical counters changes the binary record layout, so this
 corrected pre-result format uses the `v2` domain above. The never-populated `v1`

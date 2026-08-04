@@ -171,13 +171,20 @@ jobs:
         run: |
           exchange_dir="$(mktemp -d /dev/shm/runnel-actor-golden.XXXXXX)"
           test "$(stat -c %a "$exchange_dir")" = 700
+          python -m oracle.actor_transcript \
+            fixtures/scheduler/actor-golden-v1.json \
+            --expected-digest fixtures/scheduler/actor-golden-v1.sha256 \
+            --transcript "$exchange_dir/committed-transcript.bin"
           RUNNEL_ACTOR_GOLDEN_CAPTURE="$exchange_dir/capture.json" \
             cargo test -p runnel-scheduler --test actor_script \
               --no-default-features --features actor-stress-instrumentation \
               deterministic_actor_semantic_golden_is_bounded_and_structurally_sound \
               --locked
           python -m oracle.actor_transcript "$exchange_dir/capture.json" \
+            --expected-digest fixtures/scheduler/actor-golden-v1.sha256 \
             --transcript "$exchange_dir/python-transcript.bin" --validate-model
+          cmp "$exchange_dir/committed-transcript.bin" \
+            "$exchange_dir/python-transcript.bin"
           RUNNEL_ACTOR_PYTHON_TRANSCRIPT="$exchange_dir/python-transcript.bin" \
             cargo test -p runnel-scheduler --test actor_script \
               --no-default-features --features actor-stress-instrumentation \

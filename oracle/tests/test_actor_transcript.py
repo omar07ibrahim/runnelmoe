@@ -15,6 +15,17 @@ from unittest import mock
 from oracle import actor_transcript, scheduler
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+COMMITTED_CAPTURE_PATH = REPOSITORY_ROOT / "fixtures/scheduler/actor-golden-v1.json"
+COMMITTED_DIGEST_PATH = REPOSITORY_ROOT / "fixtures/scheduler/actor-golden-v1.sha256"
+EXPECTED_SEMANTIC_DIGEST = (
+    "sha256:2711f6b6b28849dd9cb9692f75d97f09d24520645d7b0ccaf7c4c2fd023ddd7a"
+)
+EXPECTED_CAPTURE_FILE_SHA256 = (
+    "d070c5158ae6ba3ae36553604fb98b231482db5333df545d75572716c2f67705"
+)
+
+
 def _workload() -> dict[str, str]:
     fixture = scheduler.build_fixture()
     fixture_bytes = scheduler.canonical_bytes(fixture)
@@ -214,6 +225,28 @@ def _add_output(
 
 
 class ActorTranscriptTests(unittest.TestCase):
+    def test_committed_capture_has_independent_artifact_and_semantic_custody(self) -> None:
+        self.assertFalse(COMMITTED_CAPTURE_PATH.is_symlink())
+        capture_bytes = COMMITTED_CAPTURE_PATH.read_bytes()
+        self.assertEqual(len(capture_bytes), 265_240)
+        self.assertEqual(
+            hashlib.sha256(capture_bytes).hexdigest(), EXPECTED_CAPTURE_FILE_SHA256
+        )
+        self.assertEqual(
+            COMMITTED_DIGEST_PATH.read_bytes(),
+            EXPECTED_SEMANTIC_DIGEST.encode("ascii") + b"\n",
+        )
+        self.assertEqual(
+            actor_transcript.read_expected_digest_path(COMMITTED_DIGEST_PATH),
+            EXPECTED_SEMANTIC_DIGEST,
+        )
+        validated = actor_transcript.parse_capture_path(COMMITTED_CAPTURE_PATH)
+        transcript = actor_transcript.serialize_transcript(validated)
+        self.assertEqual(len(transcript), 36_561)
+        self.assertEqual(
+            actor_transcript.transcript_digest(validated), EXPECTED_SEMANTIC_DIGEST
+        )
+
     def test_validated_capture_cannot_bypass_validation(self) -> None:
         shutdown = actor_transcript.ShutdownRecord(0, 0, 0, 0, 0, 0, 0, 0, 0)
         with self.assertRaisesRegex(
@@ -773,11 +806,21 @@ class ActorTranscriptTests(unittest.TestCase):
             capture_path = root / "capture.json"
             capture_path.write_bytes(actor_transcript.canonical_bytes(_capture()))
             transcript_path = root / "transcript.bin"
+            digest_path = root / "expected.sha256"
+            digest_path.write_bytes(
+                actor_transcript.transcript_digest(_capture()).encode("ascii") + b"\n"
+            )
             stdout = io.StringIO()
             stderr = io.StringIO()
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 result = actor_transcript.main(
-                    [str(capture_path), "--transcript", str(transcript_path)]
+                    [
+                        str(capture_path),
+                        "--expected-digest",
+                        str(digest_path),
+                        "--transcript",
+                        str(transcript_path),
+                    ]
                 )
             self.assertEqual(result, 0)
             self.assertEqual(stderr.getvalue(), "")
@@ -797,6 +840,38 @@ class ActorTranscriptTests(unittest.TestCase):
                 )
             self.assertEqual(transcript_path.read_bytes(), before)
 
+            digest_only_stdout = io.StringIO()
+            with redirect_stdout(digest_only_stdout), redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    actor_transcript.main(
+                        [
+                            str(capture_path),
+                            "--expected-digest",
+                            str(digest_path),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertIn("bytes=", digest_only_stdout.getvalue())
+
+            wrong_digest = root / "wrong.sha256"
+            wrong_digest.write_bytes(b"sha256:" + b"0" * 64 + b"\n")
+            rejected_output = root / "rejected.bin"
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    actor_transcript.main(
+                        [
+                            str(capture_path),
+                            "--expected-digest",
+                            str(wrong_digest),
+                            "--transcript",
+                            str(rejected_output),
+                        ]
+                    ),
+                    1,
+                )
+            self.assertFalse(rejected_output.exists())
+
             link = root / "capture-link.json"
             link.symlink_to(capture_path)
             with self.assertRaises(actor_transcript.ActorTranscriptError):
@@ -806,6 +881,29 @@ class ActorTranscriptTests(unittest.TestCase):
             os.mkfifo(fifo)
             with self.assertRaises(actor_transcript.ActorTranscriptError):
                 actor_transcript.parse_capture_path(fifo)
+
+            for label, payload in (
+                ("uppercase", b"sha256:" + b"A" * 64 + b"\n"),
+                ("missing-lf", b"sha256:" + b"0" * 64),
+                ("leading-space", b" sha256:" + b"0" * 63 + b"\n"),
+                ("trailing-data", b"sha256:" + b"0" * 64 + b"\nX"),
+            ):
+                malformed = root / f"{label}.sha256"
+                malformed.write_bytes(payload)
+                with self.subTest(digest=label), self.assertRaises(
+                    actor_transcript.ActorTranscriptError
+                ):
+                    actor_transcript.read_expected_digest_path(malformed)
+
+            digest_link = root / "digest-link.sha256"
+            digest_link.symlink_to(digest_path)
+            with self.assertRaises(actor_transcript.ActorTranscriptError):
+                actor_transcript.read_expected_digest_path(digest_link)
+
+            digest_fifo = root / "digest.fifo"
+            os.mkfifo(digest_fifo)
+            with self.assertRaises(actor_transcript.ActorTranscriptError):
+                actor_transcript.read_expected_digest_path(digest_fifo)
 
             oversized = root / "oversized.json"
             oversized.write_bytes(b"x" * (actor_transcript.MAX_CAPTURE_BYTES + 1))

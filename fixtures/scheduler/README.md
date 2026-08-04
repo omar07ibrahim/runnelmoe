@@ -123,8 +123,12 @@ prefix. The Rust harness can create a new logical capture and, in a separate
 invocation, byte-compare the independently created Python transcript. Detailed
 commands and file-safety constraints are in `oracle/README.md`.
 
-The first custody commit intentionally contains no accepted capture or expected
-digest. A later commit may freeze them only after repeated deterministic runs,
-exact cross-language byte agreement, independent review, and green hosted CI.
-The binary transcript remains ephemeral even after the canonical JSON capture
-and its semantic SHA-256 are accepted.
+`actor-golden-v1.json` is the accepted 265,240-byte canonical capture from the
+reviewed post-custody run. Its historical JSON file SHA-256 is
+`d070c5158ae6ba3ae36553604fb98b231482db5333df545d75572716c2f67705`.
+`actor-golden-v1.sha256` names the independently serialized 36,561-byte
+semantic transcript, not the JSON file: its accepted digest is
+`sha256:2711f6b6b28849dd9cb9692f75d97f09d24520645d7b0ccaf7c4c2fd023ddd7a`.
+The capture retains physical diagnostics as historical guardrail evidence, but
+future live executions need only satisfy their bounds; they are deliberately
+excluded from the semantic digest. No binary transcript is committed.

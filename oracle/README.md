@@ -83,19 +83,35 @@ request from the authenticated tiny-v3 specification; Rust output must be an
 exact generated prefix, and completed requests must match the complete oracle
 sequence.
 
-Before a digest is frozen, the cross-language custody handshake uses only new
-files in a private tmpfs directory. Python never receives the Rust transcript,
-and the final Rust invocation compares the independently produced bytes:
+The accepted capture and semantic digest can be checked without writing a
+binary transcript:
+
+```console
+python -m oracle.actor_transcript \
+  fixtures/scheduler/actor-golden-v1.json \
+  --expected-digest fixtures/scheduler/actor-golden-v1.sha256
+```
+
+The steady-state cross-language handshake uses only new exchange files in a
+private tmpfs directory. Python never receives the Rust transcript, and the
+final Rust invocation compares the independently produced bytes:
 
 ```console
 exchange_dir="$(mktemp -d /dev/shm/runnel-actor-golden.XXXXXX)"
+python -m oracle.actor_transcript \
+  fixtures/scheduler/actor-golden-v1.json \
+  --expected-digest fixtures/scheduler/actor-golden-v1.sha256 \
+  --transcript "$exchange_dir/committed-transcript.bin"
 RUNNEL_ACTOR_GOLDEN_CAPTURE="$exchange_dir/capture.json" \
   cargo test -p runnel-scheduler --test actor_script --no-default-features \
     --features actor-stress-instrumentation \
     deterministic_actor_semantic_golden_is_bounded_and_structurally_sound \
     --locked --offline
 python -m oracle.actor_transcript "$exchange_dir/capture.json" \
+  --expected-digest fixtures/scheduler/actor-golden-v1.sha256 \
   --transcript "$exchange_dir/python-transcript.bin" --validate-model
+cmp "$exchange_dir/committed-transcript.bin" \
+  "$exchange_dir/python-transcript.bin"
 RUNNEL_ACTOR_PYTHON_TRANSCRIPT="$exchange_dir/python-transcript.bin" \
   cargo test -p runnel-scheduler --test actor_script --no-default-features \
     --features actor-stress-instrumentation \
@@ -103,9 +119,12 @@ RUNNEL_ACTOR_PYTHON_TRANSCRIPT="$exchange_dir/python-transcript.bin" \
     --locked --offline
 ```
 
-The capture and transcript readers are bounded regular-file/no-follow paths;
-the transcript destination is create-new. The binary transcript is an exchange
-artifact, not a repository artifact.
+The capture, expected-digest, and transcript readers are bounded
+regular-file/no-follow paths; the transcript destination is create-new. The
+`.sha256` file is the semantic transcript digest, while the committed capture's
+physical diagnostics remain historical observations subject to bounds rather
+than exact live equality. The binary transcript is an exchange artifact, not a
+repository artifact.
 
 ## Independent cache-policy oracle
 
