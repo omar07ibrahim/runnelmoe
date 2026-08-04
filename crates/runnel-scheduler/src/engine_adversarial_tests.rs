@@ -13,6 +13,7 @@ use runnel_runtime::{
 };
 
 use crate::control::ControlBinding;
+use crate::endpoint::TryPop;
 use crate::{
     CancelDisposition, ErrorCategory, LedgerCategory, LedgerOwnership, RequestPhase, RequestSpec,
     SchedulerConfig, SchedulerEngine, SchedulerLimits, StepReport, TerminalOutcome,
@@ -521,6 +522,47 @@ fn assert_all_request_ownership_reaped(
             );
         }
     }
+}
+
+#[test]
+fn externally_owned_endpoint_reaps_after_normal_two_sided_acknowledgement() {
+    let gate = Arc::new(CommitGate::passthrough());
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let mut engine = new_engine(gate, apply_count, 1);
+    let pristine = engine.ledger_snapshot();
+    let admission = engine
+        .try_submit_for_actor(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted external endpoint request");
+    let (request_id, control, mut receiver) = admission.into_parts();
+
+    let report = engine.step().expect("terminal actor-owned request");
+    assert_eq!(report.committed_positions, 1);
+    assert_eq!(report.terminal_decisions, 1);
+    assert!(matches!(
+        receiver.try_pop().expect("external output"),
+        TryPop::Event(_)
+    ));
+    assert_eq!(receiver.try_pop().expect("external EOF"), TryPop::Eof);
+    assert!(
+        receiver
+            .take_terminal()
+            .expect("external terminal")
+            .is_some()
+    );
+
+    engine.step().expect("reap acknowledged external endpoint");
+    assert_eq!(
+        engine
+            .request_phase(request_id)
+            .expect_err("acknowledged request must be reaped")
+            .category(),
+        ErrorCategory::InvalidRequest
+    );
+    assert_eq!(
+        control.cancel().expect("terminal control remains stable"),
+        CancelDisposition::AlreadyTerminal
+    );
+    assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
 }
 
 #[test]

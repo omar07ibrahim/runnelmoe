@@ -21,9 +21,12 @@ ownership accounting, output backpressure, deadlines, cancellation, and
 failure-atomic cleanup. Generation-bound atomic controls and a live
 cancel/deadline check inside the adapter's validated commit callback prevent a
 late signal from partially publishing model state, RNG, output, or service
-credit. The concurrent actor, full stress/differential matrix, and
-preregistered evidence are not complete, so this is not an M5 closure or
-performance claim.
+credit. Each admitted request now has one generation-tagged, pre-reserved
+endpoint whose mutex remains held from output-capacity validation through the
+final state decision; its output queue and independently reserved terminal
+slot are the sole result authority. The concurrent actor, full
+stress/differential matrix, and preregistered evidence are not complete, so
+this is not an M5 closure or performance claim.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling

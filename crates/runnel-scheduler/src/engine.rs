@@ -8,6 +8,11 @@ use crate::{
     },
     config::{MAX_BATCH_WIDTH, SchedulerConfig},
     control::{ControlBinding, ControlRegistry, ControlSnapshot},
+    endpoint::{
+        EndpointDiscardReport, EndpointProducer, EndpointReapReport, EndpointReceiver,
+        EndpointRegistry, EndpointSnapshot, TerminalCommitGuard, TryPop,
+        ValidatedOutputCommitGuard,
+    },
     error::{ErrorCategory, SchedulerError, SchedulerResult},
     id::{
         EngineTransactionIdIssuer, IdentityExhausted, RequestIdIssuer, SlotGenerationIssuer,
@@ -33,6 +38,7 @@ pub struct SchedulerEngine<A: DecoderAdapter> {
     slots: Vec<RequestSlot<A>>,
     free_slots: Vec<usize>,
     controls: Option<ControlRegistry>,
+    endpoints: Option<EndpointRegistry>,
     queued: VecDeque<SlotKey>,
     ring: Option<DrrRing>,
     request_ids: RequestIdIssuer,
@@ -94,16 +100,26 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .map_err(map_ledger_error)?;
 
         let allocation = Self::try_allocate_shared(&adapter, &config);
-        let (slots, free_slots, controls, queued, ring, workspace, sampling, wave, service_trace) =
-            match allocation {
-                Ok(parts) => parts,
-                Err(error) => {
-                    ledger
-                        .rollback_provisional(provisional)
-                        .map_err(map_ledger_error)?;
-                    return Err(error);
-                }
-            };
+        let (
+            slots,
+            free_slots,
+            controls,
+            endpoints,
+            queued,
+            ring,
+            workspace,
+            sampling,
+            wave,
+            service_trace,
+        ) = match allocation {
+            Ok(parts) => parts,
+            Err(error) => {
+                ledger
+                    .rollback_provisional(provisional)
+                    .map_err(map_ledger_error)?;
+                return Err(error);
+            }
+        };
         let shared_reservation = ledger
             .commit_provisional(provisional)
             .map_err(map_ledger_error)?;
@@ -116,6 +132,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             slots,
             free_slots,
             controls: Some(controls),
+            endpoints: Some(endpoints),
             queued,
             ring: Some(ring),
             request_ids: RequestIdIssuer::new(),
@@ -156,6 +173,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         }
 
         let controls = ControlRegistry::try_with_capacity(config.max_outstanding_requests())?;
+        let endpoints = EndpointRegistry::try_with_capacity(config.max_outstanding_requests())?;
 
         let mut queued = VecDeque::new();
         try_reserve_deque(
@@ -183,6 +201,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             slots,
             free_slots,
             controls,
+            endpoints,
             queued,
             ring,
             workspace,
@@ -194,6 +213,39 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
 
     /// Validates and copies one request atomically before assigning its ID.
     pub fn try_submit(&mut self, request: RequestSpec<'_>) -> SchedulerResult<crate::RequestId> {
+        self.try_submit_with(request, |request_id, _, receiver| {
+            (Some(receiver), request_id)
+        })
+    }
+
+    /// Admits a request and transfers its sole result receiver to the actor in
+    /// the same infallible publication that installs the engine record.
+    #[allow(dead_code, reason = "used by the staged Tokio actor integration")]
+    pub(crate) fn try_submit_for_actor(
+        &mut self,
+        request: RequestSpec<'_>,
+    ) -> SchedulerResult<ActorAdmission> {
+        self.try_submit_with(request, |request_id, control, receiver| {
+            (
+                None,
+                ActorAdmission {
+                    request_id,
+                    control: control.clone(),
+                    receiver,
+                },
+            )
+        })
+    }
+
+    fn try_submit_with<R>(
+        &mut self,
+        request: RequestSpec<'_>,
+        finish: impl FnOnce(
+            crate::RequestId,
+            &ControlBinding,
+            EndpointReceiver,
+        ) -> (Option<EndpointReceiver>, R),
+    ) -> SchedulerResult<R> {
         self.ensure_open()?;
         let adapter = self
             .adapter
@@ -301,9 +353,16 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .ledger
             .acquire_provisional(admission_plan.as_slice())
             .map_err(map_ledger_error)?;
-        let allocation =
-            Self::try_allocate_request_payload(prompt, self.config.output_capacity_per_request());
-        let (prompt, output) = match allocation {
+        let allocation = (|| {
+            let prompt = Self::try_allocate_request_payload(prompt)?;
+            let endpoint = self
+                .endpoints
+                .as_ref()
+                .ok_or_else(|| SchedulerError::internal("request endpoints are unavailable"))?
+                .prepare(self.config.output_capacity_per_request())?;
+            Ok((prompt, endpoint))
+        })();
+        let (prompt, prepared_endpoint) = match allocation {
             Ok(payload) => payload,
             Err(error) => {
                 self.ledger
@@ -341,13 +400,23 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 return Err(map_identity_error(error));
             }
         };
-        let control = match self
-            .controls
-            .as_mut()
-            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
-            .bind(prepared_control)
-        {
-            Ok(control) => control,
+        let key = SlotKey::new(slot_index, generation);
+        let binding = (|| {
+            let endpoints = self
+                .endpoints
+                .as_mut()
+                .ok_or_else(|| SchedulerError::internal("request endpoints are unavailable"))?;
+            let controls = self
+                .controls
+                .as_mut()
+                .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
+            let endpoint = endpoints.begin_bind(prepared_endpoint, key)?;
+            let control = controls.bind(prepared_control)?;
+            let (producer, receiver) = endpoint.commit(control.clone(), request_id);
+            Ok((control, producer, receiver))
+        })();
+        let (control, endpoint, receiver) = match binding {
+            Ok(binding) => binding,
             Err(error) => {
                 let release = self
                     .ledger
@@ -357,7 +426,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 return Err(error);
             }
         };
-        let key = SlotKey::new(slot_index, generation);
+        let (direct_receiver, result) = finish(request_id, &control, receiver);
         let record = RequestRecord {
             request_id,
             key,
@@ -379,26 +448,21 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             next_decode_token: None,
             rng_state: None,
             adapter_binding: None,
-            output,
-            terminal: None,
+            endpoint,
+            direct_receiver,
         };
         self.free_slots.swap_remove(free_position);
         self.slots[slot_index].key = Some(key);
         self.slots[slot_index].record = Some(record);
         self.queued.push_back(key);
-        Ok(request_id)
+        Ok(result)
     }
 
-    fn try_allocate_request_payload(
-        prompt: &[u32],
-        output_capacity: usize,
-    ) -> SchedulerResult<(Vec<u32>, VecDeque<OutputEvent>)> {
+    fn try_allocate_request_payload(prompt: &[u32]) -> SchedulerResult<Vec<u32>> {
         let mut owned_prompt = Vec::new();
         try_reserve_vec(&mut owned_prompt, prompt.len(), "request prompt storage")?;
         owned_prompt.extend_from_slice(prompt);
-        let mut output = VecDeque::new();
-        try_reserve_deque(&mut output, output_capacity, "request output queue")?;
-        Ok((owned_prompt, output))
+        Ok(owned_prompt)
     }
 
     pub fn cancel(&self, id: crate::RequestId) -> SchedulerResult<CancelDisposition> {
@@ -433,7 +497,10 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let ledger = self.ledger.snapshot();
         let mut active = 0_usize;
         let mut output_blocked = 0_usize;
-        let mut terminals = 0_usize;
+        let terminals = self
+            .endpoints
+            .as_ref()
+            .map_or(0, EndpointRegistry::pending_terminal_count);
         for slot in &self.slots {
             if let Some(record) = &slot.record {
                 match record.phase {
@@ -445,7 +512,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                         active += 1;
                         output_blocked += 1;
                     }
-                    RequestPhase::Terminal => terminals += usize::from(record.terminal.is_some()),
+                    RequestPhase::Terminal => {}
                     RequestPhase::Queued => {}
                 }
             }
@@ -590,18 +657,37 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     ) -> SchedulerResult<()> {
         for index in 0..self.slots.len() {
             let now = self.observe_clock(clock);
-            let decision = if let Some(record) = self.slots[index]
-                .record
-                .as_ref()
-                .filter(|record| record.phase != RequestPhase::Terminal)
-            {
-                visible_control_outcome(record, now)?.map(|outcome| (record.key, outcome))
+            let action = if let Some(record) = self.slots[index].record.as_ref() {
+                let snapshot = record.control.fresh_snapshot()?;
+                if record.phase == RequestPhase::Terminal {
+                    Some((record.key, None, snapshot.disconnected()))
+                } else {
+                    visible_snapshot_outcome(snapshot, record.deadline_ns, now)
+                        .map(|outcome| (record.key, Some(outcome), snapshot.disconnected()))
+                }
             } else {
                 None
             };
-            if let Some((key, outcome)) = decision {
-                self.terminalize_key(ring, key, outcome)?;
-                report.terminal_decisions += 1;
+            if let Some((key, outcome, disconnected)) = action {
+                if let Some(outcome) = outcome {
+                    self.terminalize_key(ring, key, outcome)?;
+                    report.terminal_decisions += 1;
+                } else {
+                    let endpoint = self.record_for_key(key)?.endpoint.clone();
+                    if disconnected && endpoint.snapshot()?.receiver_connected {
+                        let report = endpoint.settle_disconnected()?;
+                        let record = self.record_for_key(key)?;
+                        validate_endpoint_discard(
+                            record.request_id,
+                            record.emitted_tokens,
+                            endpoint.snapshot()?,
+                            report,
+                        )?;
+                    }
+                    if endpoint.snapshot()?.reap_ready {
+                        self.reap_key(key)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -708,17 +794,29 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
 
             let now = self.observe_clock(clock);
             let control = visible_control_outcome(self.record_for_key(key)?, now)?;
-            if control.is_none()
-                && self.record_for_key(key)?.phase == RequestPhase::Ready
-                && self.record_for_key(key)?.output.len()
-                    >= self.config.output_capacity_per_request()
-            {
-                self.record_mut_for_key(key)?.phase = RequestPhase::OutputBlocked;
+            let endpoint = self.record_for_key(key)?.endpoint.snapshot()?;
+            if endpoint.output_capacity != self.config.output_capacity_per_request() {
+                return Err(SchedulerError::internal(
+                    "request endpoint capacity changed while active",
+                ));
+            }
+            let output_available = endpoint.producer_open
+                && endpoint.receiver_connected
+                && endpoint.buffered_output_events < endpoint.output_capacity;
+            if control.is_none() {
+                match (self.record_for_key(key)?.phase, output_available) {
+                    (RequestPhase::Ready, false) => {
+                        self.record_mut_for_key(key)?.phase = RequestPhase::OutputBlocked;
+                    }
+                    (RequestPhase::OutputBlocked, true) => {
+                        self.record_mut_for_key(key)?.phase = RequestPhase::Ready;
+                    }
+                    _ => {}
+                }
             }
             let runnable = control.is_none()
                 && self.record_for_key(key)?.phase == RequestPhase::Ready
-                && self.record_for_key(key)?.output.len()
-                    < self.config.output_capacity_per_request();
+                && output_available;
             if !runnable {
                 let progress = ring.mark_blocked(visit).map_err(map_ring_error)?;
                 if let Some(outcome) = control {
@@ -1012,19 +1110,38 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 report.terminal_decisions += 1;
                 continue;
             }
-            let publication =
-                match self.plan_publication(adapter, key, pending_identity, logits, sampling) {
-                    Ok(publication) => publication,
-                    Err(error) => {
-                        self.release_wave_selection(ring, wave, selection_index)?;
-                        let category = error.category();
-                        self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
-                        report.terminal_decisions += 1;
-                        continue;
-                    }
-                };
+            let endpoint = self.record_for_key(key)?.endpoint.clone();
+            let publication = match self.plan_publication(
+                adapter,
+                key,
+                pending_identity,
+                logits,
+                sampling,
+                &endpoint,
+            ) {
+                Ok(PublicationPlan::Ready(publication)) => publication,
+                Ok(PublicationPlan::OutputBlocked) => {
+                    self.release_wave_selection(ring, wave, selection_index)?;
+                    self.record_mut_for_key(key)?.phase = RequestPhase::OutputBlocked;
+                    continue;
+                }
+                Ok(PublicationPlan::Cancelled) => {
+                    self.release_wave_selection(ring, wave, selection_index)?;
+                    self.terminalize_key(ring, key, TerminalOutcome::Cancelled)?;
+                    report.terminal_decisions += 1;
+                    continue;
+                }
+                Err(error) => {
+                    self.release_wave_selection(ring, wave, selection_index)?;
+                    let category = error.category();
+                    self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
+                    report.terminal_decisions += 1;
+                    continue;
+                }
+            };
             let now = self.observe_clock(clock);
             if let Some(outcome) = visible_control_outcome(self.record_for_key(key)?, now)? {
+                drop(publication);
                 self.release_wave_selection(ring, wave, selection_index)?;
                 self.terminalize_key(ring, key, outcome)?;
                 report.terminal_decisions += 1;
@@ -1046,10 +1163,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             );
             match committed {
                 Ok(CommitDisposition::Applied {
-                    post_commit_failure,
+                    post_commit_failure: _,
+                    terminalized,
                 }) => {
                     report.committed_positions += 1;
-                    if post_commit_failure.is_some() || publication.completed {
+                    if terminalized {
                         report.terminal_decisions += 1;
                     }
                 }
@@ -1068,14 +1186,15 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         Ok(selected_count)
     }
 
-    fn plan_publication(
+    fn plan_publication<'endpoint>(
         &self,
         adapter: &A,
         key: SlotKey,
         identity: AdapterWorkIdentity,
         logits: &[f32],
         sampling: &mut SamplingWorkspace,
-    ) -> SchedulerResult<TokenPublication> {
+        endpoint: &'endpoint EndpointProducer,
+    ) -> SchedulerResult<PublicationPlan<'endpoint>> {
         let record = self.record_for_key(key)?;
         let next_position = record
             .committed_positions
@@ -1092,12 +1211,23 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .ok_or_else(|| SchedulerError::internal("active request prompt is missing"))?
             .len();
         let emits = record.max_new_tokens != 0 && next_position >= prompt_len;
+        let (output_guard, terminal_guard, output_full_after_publish) = if emits {
+            let guard = match endpoint.begin_output_commit() {
+                Ok(guard) => guard,
+                Err(error) if error.category() == ErrorCategory::ResourceExhausted => {
+                    return Ok(PublicationPlan::OutputBlocked);
+                }
+                Err(error) if error.category() == ErrorCategory::Cancelled => {
+                    return Ok(PublicationPlan::Cancelled);
+                }
+                Err(error) => return Err(error),
+            };
+            let output_full_after_publish = guard.will_be_full_after_publish();
+            (Some(guard), None, output_full_after_publish)
+        } else {
+            (None, Some(endpoint.begin_terminal_commit()?), false)
+        };
         let (event, next_rng_state, next_decode_token, stop) = if emits {
-            if record.output.len() >= self.config.output_capacity_per_request() {
-                return Err(SchedulerError::internal(
-                    "output slot was not reserved before sampling",
-                ));
-            }
             let preview = sampling
                 .preview(logits, record.sampling, record.rng_state)
                 .map_err(|source| SchedulerError::sampling("previewing token", source))?;
@@ -1117,16 +1247,26 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         } else {
             (None, record.rng_state, record.next_decode_token, false)
         };
+        let emitted = event.is_some();
         let next_emitted_tokens = record
             .emitted_tokens
-            .checked_add(usize::from(event.is_some()))
+            .checked_add(usize::from(emitted))
             .ok_or_else(|| SchedulerError::internal("emitted token count overflows"))?;
+        let endpoint_guard = if let Some(guard) = output_guard {
+            let event = event.ok_or_else(|| {
+                SchedulerError::internal("output endpoint guard has no planned event")
+            })?;
+            PublicationGuard::Output(guard.validate_planned_event(event)?)
+        } else {
+            let guard = terminal_guard.ok_or_else(|| {
+                SchedulerError::internal("terminal endpoint guard is unavailable")
+            })?;
+            PublicationGuard::Terminal(guard)
+        };
         let completed = next_position == record.total_positions || stop;
         let next_phase = if completed {
             RequestPhase::Terminal
-        } else if record.output.len() + usize::from(event.is_some())
-            >= self.config.output_capacity_per_request()
-        {
+        } else if output_full_after_publish {
             RequestPhase::OutputBlocked
         } else {
             RequestPhase::Ready
@@ -1143,17 +1283,17 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 "adapter state revision changed before commit",
             ));
         }
-        Ok(TokenPublication {
+        Ok(PublicationPlan::Ready(TokenPublication {
             position: record.committed_positions,
             next_position,
             next_emitted_tokens,
             next_rng_state,
             next_decode_token,
-            event,
             next_phase,
             next_adapter_revision,
             completed,
-        })
+            endpoint_guard,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1165,9 +1305,20 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         key: SlotKey,
         reservation: crate::ring::ServiceReservation,
         pending: &A::PendingStateCommit,
-        publication: TokenPublication,
+        publication: TokenPublication<'_>,
         clock: &impl Fn() -> u64,
     ) -> SchedulerResult<CommitDisposition> {
+        let TokenPublication {
+            position,
+            next_position,
+            next_emitted_tokens,
+            next_rng_state,
+            next_decode_token,
+            next_phase,
+            next_adapter_revision,
+            completed,
+            endpoint_guard,
+        } = publication;
         if self.queued.contains(&key) {
             return Err(SchedulerError::internal(
                 "committing request is still present in the admission FIFO",
@@ -1191,9 +1342,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .record
             .as_mut()
             .ok_or_else(|| SchedulerError::internal("commit request record is missing"))?;
-        if record.phase != RequestPhase::ReadyToCommit
-            || record.committed_positions != publication.position
-        {
+        if record.phase != RequestPhase::ReadyToCommit || record.committed_positions != position {
             return Err(SchedulerError::internal(
                 "commit request phase or position changed",
             ));
@@ -1209,13 +1358,6 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 "service trace capacity changed before commit",
             ));
         }
-        if publication.event.is_some()
-            && record.output.capacity() < self.config.output_capacity_per_request()
-        {
-            return Err(SchedulerError::internal(
-                "output queue capacity changed before commit",
-            ));
-        }
         let release = ledger
             .prepare_release(
                 record
@@ -1224,19 +1366,20 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                     .chain(record.prompt_reservation.iter()),
             )
             .map_err(map_ledger_error)?;
-        let state = record
+        let mut state = record
             .state
-            .as_mut()
+            .take()
             .ok_or_else(|| SchedulerError::internal("commit adapter state is missing"))?;
         let request_id = record.request_id;
         let deadline_ns = record.deadline_ns;
         let control = &record.control;
-        let mut terminal_outcome = None;
-        let (callback, adapter_result) = ring
+        let mut release = Some(release);
+        let mut endpoint_guard = Some(endpoint_guard);
+        let (callback, adapter_result, terminal_outcome) = ring
             .with_validated_credit_commit(reservation, |mut service_permit| {
                 let mut callback = None;
                 let adapter_result =
-                    adapter.with_validated_state_commit(state, pending, |adapter_permit| {
+                    adapter.with_validated_state_commit(&mut state, pending, |adapter_permit| {
                         let now = observe_clock_value(monotonic_ns, clock);
                         let snapshot = control.fresh_snapshot_prevalidated();
                         if let Some(outcome) = visible_snapshot_outcome(snapshot, deadline_ns, now)
@@ -1247,21 +1390,18 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                         }
                         A::apply_state_commit(adapter_permit);
                         service_permit.apply();
-                        record.committed_positions = publication.next_position;
-                        record.emitted_tokens = publication.next_emitted_tokens;
-                        record.rng_state = publication.next_rng_state;
-                        record.next_decode_token = publication.next_decode_token;
-                        if let Some(event) = publication.event {
-                            record.output.push_back(event);
-                        }
-                        record.phase = publication.next_phase;
+                        record.committed_positions = next_position;
+                        record.emitted_tokens = next_emitted_tokens;
+                        record.rng_state = next_rng_state;
+                        record.next_decode_token = next_decode_token;
+                        record.phase = next_phase;
                         if let Some(binding) = record.adapter_binding.as_mut() {
-                            binding.expected_revision = publication.next_adapter_revision;
+                            binding.expected_revision = next_adapter_revision;
                         }
                         if trace.len() < trace_capacity {
                             trace.push(ServiceTraceEvent {
                                 request_id,
-                                position: publication.position,
+                                position,
                             });
                         } else {
                             *trace_overflowed = true;
@@ -1269,46 +1409,57 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                         callback = Some(CommitCallback::Applied);
                     });
 
-                terminal_outcome =
+                let terminal_outcome =
                     if callback == Some(CommitCallback::Applied) && adapter_result.is_err() {
                         Some(TerminalOutcome::Failed {
                             category: ErrorCategory::Internal,
                         })
-                    } else if callback == Some(CommitCallback::Applied) && publication.completed {
+                    } else if callback == Some(CommitCallback::Applied) && completed {
                         Some(TerminalOutcome::Completed)
                     } else {
                         None
                     };
-                if let Some(outcome) = terminal_outcome {
-                    service_permit.remove_member();
-                    record.phase = RequestPhase::Terminal;
-                    record.terminal = Some(TerminalResult::new(
+                let terminal = terminal_outcome.map(|outcome| {
+                    TerminalResult::new(
                         record.request_id,
                         outcome,
                         record.committed_positions,
                         record.emitted_tokens,
-                    ));
+                    )
+                });
+                if terminal_outcome.is_some() {
+                    service_permit.remove_member();
+                    record.phase = RequestPhase::Terminal;
                     control.mark_terminal_prevalidated();
+                    let _ = record.prompt.take();
+                    let _ = record.active_reservation.take();
+                    let _ = record.prompt_reservation.take();
+                    if let Some(release) = release.take() {
+                        release.apply();
+                    }
+                    drop(state);
+                } else {
+                    record.state = Some(state);
                 }
-                (callback, adapter_result)
+                if callback == Some(CommitCallback::Applied)
+                    && let Some(guard) = endpoint_guard.take()
+                {
+                    guard.publish(terminal);
+                }
+                (callback, adapter_result, terminal_outcome)
             })
             .map_err(map_ring_error)?;
-        if terminal_outcome.is_some() {
-            let _ = record.state.take();
-            let _ = record.prompt.take();
-            let _ = record.active_reservation.take();
-            let _ = record.prompt_reservation.take();
-            release.apply();
-        }
         match (callback, adapter_result) {
             (Some(CommitCallback::Suppressed(outcome)), _) => {
                 Ok(CommitDisposition::Suppressed(outcome))
             }
             (Some(CommitCallback::Applied), Ok(())) => Ok(CommitDisposition::Applied {
                 post_commit_failure: None,
+                terminalized: terminal_outcome.is_some(),
             }),
             (Some(CommitCallback::Applied), Err(_)) => Ok(CommitDisposition::Applied {
                 post_commit_failure: Some(ErrorCategory::Internal),
+                terminalized: true,
             }),
             (None, Ok(())) => Err(SchedulerError::internal(
                 "adapter returned success without invoking the commit callback",
@@ -1357,6 +1508,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         key: SlotKey,
         outcome: TerminalOutcome,
     ) -> SchedulerResult<()> {
+        if self.record_for_key(key)?.phase == RequestPhase::Terminal {
+            return Ok(());
+        }
+        let endpoint = self.record_for_key(key)?.endpoint.clone();
+        let endpoint_guard = endpoint.begin_terminal_commit()?;
         let index = key.index();
         let slot = self
             .slots
@@ -1372,14 +1528,16 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .as_mut()
             .ok_or_else(|| SchedulerError::internal("terminal request record is missing"))?;
         if record.phase == RequestPhase::Terminal {
-            return Ok(());
+            return Err(SchedulerError::internal(
+                "request became terminal while its endpoint was locked",
+            ));
         }
         if ring.contains(key) && !ring.member_matches(key, record.request_id) {
             return Err(SchedulerError::internal(
                 "terminal DRR member has a foreign request identity",
             ));
         }
-        let _ = record.control.fresh_snapshot()?;
+        let control_snapshot = record.control.fresh_snapshot()?;
         let release = self
             .ledger
             .prepare_release(
@@ -1399,13 +1557,23 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let _ = record.active_reservation.take();
         let _ = record.prompt_reservation.take();
         record.phase = RequestPhase::Terminal;
-        record.terminal = Some(TerminalResult::new(
+        let terminal = TerminalResult::new(
             record.request_id,
             outcome,
             record.committed_positions,
             record.emitted_tokens,
-        ));
+        );
         release.apply();
+        endpoint_guard.publish_terminal(terminal);
+        if control_snapshot.disconnected() {
+            let report = endpoint.settle_disconnected()?;
+            validate_endpoint_discard(
+                record.request_id,
+                record.emitted_tokens,
+                endpoint.snapshot()?,
+                report,
+            )?;
+        }
         Ok(())
     }
 
@@ -1416,69 +1584,56 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         limit: usize,
     ) -> SchedulerResult<Vec<OutputEvent>> {
         let key = self.record_by_id(id)?.key;
-        let count = self.record_for_key(key)?.output.len().min(limit);
-        let output_capacity = self.config.output_capacity_per_request();
+        let count = self
+            .record_for_key(key)?
+            .endpoint
+            .snapshot()?
+            .buffered_output_events
+            .min(limit);
         let mut drained = Vec::new();
         try_reserve_vec(&mut drained, count, "drained output result")?;
 
-        let final_reap = {
-            let record = self.record_for_key(key)?;
-            record.phase == RequestPhase::Terminal
-                && record.terminal.is_none()
-                && count == record.output.len()
-        };
-        if final_reap {
-            let index = key.index();
-            let slot = self
-                .slots
-                .get_mut(index)
-                .ok_or_else(|| SchedulerError::internal("drain slot index is out of range"))?;
-            if slot.key != Some(key) || self.free_slots.len() >= self.free_slots.capacity() {
-                return Err(SchedulerError::internal(
-                    "final drain slot ownership is invalid",
-                ));
-            }
-            let record = slot
-                .record
-                .as_ref()
-                .ok_or_else(|| SchedulerError::internal("final drain request record is missing"))?;
-            validate_terminal_resources_released(record)?;
-            let retained = record.retained_reservation.as_ref().ok_or_else(|| {
-                SchedulerError::internal("retained request reservation is missing")
+        if count != 0 {
+            let record = self.record_mut_for_key(key)?;
+            let receiver = record.direct_receiver.as_mut().ok_or_else(|| {
+                SchedulerError::internal("request endpoint receiver is externally owned")
             })?;
-            let release = self
-                .ledger
-                .prepare_release([retained])
-                .map_err(map_ledger_error)?;
-            self.controls
-                .as_mut()
-                .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
-                .recycle(&record.control)?;
-            let mut record = slot.record.take().ok_or_else(|| {
-                SchedulerError::internal("prevalidated final drain record disappeared")
-            })?;
-            while let Some(event) = record.output.pop_front() {
-                drained.push(event);
+            for _ in 0..count {
+                match receiver.try_pop()? {
+                    TryPop::Event(event) => drained.push(event),
+                    TryPop::Empty | TryPop::Eof => {
+                        return Err(SchedulerError::internal(
+                            "prevalidated output event is missing",
+                        ));
+                    }
+                }
             }
-            slot.key = None;
-            self.free_slots.push(index);
-            drop(record);
-            release.apply();
-            return Ok(drained);
+            let endpoint = receiver.snapshot()?;
+            if !endpoint.producer_open
+                && endpoint.buffered_output_events == 0
+                && !endpoint.output_eof_acknowledged
+            {
+                match receiver.try_pop()? {
+                    TryPop::Eof => {}
+                    TryPop::Empty | TryPop::Event(_) => {
+                        return Err(SchedulerError::internal(
+                            "closed empty endpoint did not acknowledge EOF",
+                        ));
+                    }
+                }
+            }
         }
 
+        let endpoint = self.record_for_key(key)?.endpoint.snapshot()?;
+        if self.record_for_key(key)?.phase == RequestPhase::OutputBlocked
+            && endpoint.producer_open
+            && endpoint.receiver_connected
+            && endpoint.buffered_output_events < endpoint.output_capacity
         {
-            let record = self.record_mut_for_key(key)?;
-            for _ in 0..count {
-                let event = record.output.pop_front().ok_or_else(|| {
-                    SchedulerError::internal("prevalidated output event is missing")
-                })?;
-                drained.push(event);
-            }
-            if record.phase == RequestPhase::OutputBlocked && record.output.len() < output_capacity
-            {
-                record.phase = RequestPhase::Ready;
-            }
+            self.record_mut_for_key(key)?.phase = RequestPhase::Ready;
+        }
+        if endpoint.reap_ready {
+            self.reap_key(key)?;
         }
         Ok(drained)
     }
@@ -1489,26 +1644,37 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         id: crate::RequestId,
     ) -> SchedulerResult<Option<TerminalResult>> {
         let key = self.record_by_id(id)?.key;
-        let (result, reap_with_result) = {
-            let record = self.record_for_key(key)?;
-            (
-                (record.phase == RequestPhase::Terminal)
-                    .then_some(record.terminal)
-                    .flatten(),
-                record.phase == RequestPhase::Terminal
-                    && record.terminal.is_some()
-                    && record.output.is_empty(),
-            )
+        let result = {
+            let record = self.record_mut_for_key(key)?;
+            let receiver = record.direct_receiver.as_mut().ok_or_else(|| {
+                SchedulerError::internal("request endpoint receiver is externally owned")
+            })?;
+            let result = receiver.take_terminal()?;
+            if result.is_some() {
+                let endpoint = receiver.snapshot()?;
+                if !endpoint.producer_open
+                    && endpoint.buffered_output_events == 0
+                    && !endpoint.output_eof_acknowledged
+                {
+                    match receiver.try_pop()? {
+                        TryPop::Eof => {}
+                        TryPop::Empty | TryPop::Event(_) => {
+                            return Err(SchedulerError::internal(
+                                "closed empty endpoint did not acknowledge EOF",
+                            ));
+                        }
+                    }
+                }
+            }
+            result
         };
-        if reap_with_result {
-            self.reap_key(key, true)?;
-        } else if result.is_some() {
-            let _ = self.record_mut_for_key(key)?.terminal.take();
+        if self.record_for_key(key)?.endpoint.snapshot()?.reap_ready {
+            self.reap_key(key)?;
         }
         Ok(result)
     }
 
-    fn reap_key(&mut self, key: SlotKey, allow_terminal_result: bool) -> SchedulerResult<()> {
+    fn reap_key(&mut self, key: SlotKey) -> SchedulerResult<()> {
         let index = key.index();
         let slot = self
             .slots
@@ -1526,7 +1692,9 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .record
             .as_ref()
             .ok_or_else(|| SchedulerError::internal("reap request record is missing"))?;
-        validate_reap_record(record, allow_terminal_result)?;
+        validate_terminal_resources_released(record)?;
+        let emitted_tokens = record.emitted_tokens;
+        let endpoint_snapshot = record.endpoint.snapshot()?;
         let reservation = record
             .retained_reservation
             .as_ref()
@@ -1535,14 +1703,28 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .ledger
             .prepare_release([reservation])
             .map_err(map_ledger_error)?;
-        self.controls
+        let endpoint = self
+            .endpoints
             .as_mut()
-            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
-            .recycle(&record.control)?;
+            .ok_or_else(|| SchedulerError::internal("request endpoints are unavailable"))?
+            .begin_recycle(key)?;
+        let endpoint_report = endpoint.report();
+        validate_endpoint_reap(emitted_tokens, endpoint_snapshot, endpoint_report)?;
+        let controls = self
+            .controls
+            .as_mut()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
         let record = slot
             .record
             .take()
             .ok_or_else(|| SchedulerError::internal("prevalidated reap record disappeared"))?;
+        let recycle = controls.recycle(&record.control);
+        if let Err(error) = recycle {
+            slot.record = Some(record);
+            return Err(error);
+        }
+        let committed_endpoint_report = endpoint.commit();
+        debug_assert_eq!(committed_endpoint_report, endpoint_report);
         slot.key = None;
         self.free_slots.push(index);
         drop(record);
@@ -1551,42 +1733,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     }
 
     fn discard_and_reap_key(&mut self, key: SlotKey) -> SchedulerResult<()> {
-        let index = key.index();
-        let slot = self
-            .slots
-            .get_mut(index)
-            .ok_or_else(|| SchedulerError::internal("discard slot index is out of range"))?;
-        if slot.key != Some(key) || self.free_slots.len() >= self.free_slots.capacity() {
-            return Err(SchedulerError::internal(
-                "discarded request slot ownership is invalid",
-            ));
-        }
-        let record = slot
-            .record
-            .as_ref()
-            .ok_or_else(|| SchedulerError::internal("discard request record is missing"))?;
-        validate_terminal_resources_released(record)?;
-        let retained = record
-            .retained_reservation
-            .as_ref()
-            .ok_or_else(|| SchedulerError::internal("discarded retained reservation is missing"))?;
-        let release = self
-            .ledger
-            .prepare_release([retained])
-            .map_err(map_ledger_error)?;
-        self.controls
-            .as_mut()
-            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
-            .recycle(&record.control)?;
-        let record = slot
-            .record
-            .take()
-            .ok_or_else(|| SchedulerError::internal("prevalidated discard record disappeared"))?;
-        slot.key = None;
-        self.free_slots.push(index);
-        drop(record);
-        release.apply();
-        Ok(())
+        self.reap_key(key)
     }
 
     /// Closes the engine, resolves all requests, and releases all declared
@@ -1601,6 +1748,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 && self.wave.is_none()
                 && self.service_trace.is_none()
                 && self.controls.is_none()
+                && self.endpoints.is_none()
             {
                 return Ok(ShutdownReport::default());
             }
@@ -1629,14 +1777,37 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 }
             }
             self.queued.clear();
-            for slot in &self.slots {
-                if let Some(record) = slot.record.as_ref() {
-                    discarded_output_events = discarded_output_events
-                        .checked_add(record.output.len())
-                        .ok_or_else(|| {
-                            SchedulerError::internal("discarded output count overflows")
-                        })?;
+            for index in 0..self.slots.len() {
+                let Some(key) = self.slots[index].key else {
+                    continue;
+                };
+                if let Some(receiver) = self.slots[index]
+                    .record
+                    .as_mut()
+                    .and_then(|record| record.direct_receiver.as_mut())
+                {
+                    receiver.disconnect()?;
                 }
+                let record = self.slots[index].record.as_ref().ok_or_else(|| {
+                    SchedulerError::internal("shutdown request record is missing")
+                })?;
+                let request_id = record.request_id;
+                let emitted_tokens = record.emitted_tokens;
+                let discarded = self
+                    .endpoints
+                    .as_ref()
+                    .ok_or_else(|| SchedulerError::internal("request endpoints are unavailable"))?
+                    .shutdown_discard(key)?;
+                let endpoint = self.slots[index]
+                    .record
+                    .as_ref()
+                    .ok_or_else(|| SchedulerError::internal("shutdown request record disappeared"))?
+                    .endpoint
+                    .snapshot()?;
+                validate_endpoint_discard(request_id, emitted_tokens, endpoint, discarded)?;
+                discarded_output_events = discarded_output_events
+                    .checked_add(discarded.output_events())
+                    .ok_or_else(|| SchedulerError::internal("discarded output count overflows"))?;
             }
             for index in 0..self.slots.len() {
                 if let Some(key) = self.slots[index].key {
@@ -1673,6 +1844,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let _ = self.service_trace.take();
         let _ = self.adapter.take();
         let _ = self.controls.take();
+        let _ = self.endpoints.take();
         self.slots = Vec::new();
         self.free_slots = Vec::new();
         self.queued = VecDeque::new();
@@ -1734,6 +1906,7 @@ type SharedAllocation<A> = (
     Vec<RequestSlot<A>>,
     Vec<usize>,
     ControlRegistry,
+    EndpointRegistry,
     VecDeque<SlotKey>,
     DrrRing,
     <A as DecoderAdapter>::Workspace,
@@ -1745,6 +1918,31 @@ type SharedAllocation<A> = (
     >,
     Vec<ServiceTraceEvent>,
 );
+
+#[allow(dead_code, reason = "used by the staged Tokio actor integration")]
+pub(crate) struct ActorAdmission {
+    request_id: crate::RequestId,
+    control: ControlBinding,
+    receiver: EndpointReceiver,
+}
+
+impl fmt::Debug for ActorAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorAdmission")
+            .field("request_id", &self.request_id)
+            .field("control", &"<redacted>")
+            .field("receiver", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ActorAdmission {
+    #[allow(dead_code, reason = "used by the staged Tokio actor integration")]
+    pub(crate) fn into_parts(self) -> (crate::RequestId, ControlBinding, EndpointReceiver) {
+        (self.request_id, self.control, self.receiver)
+    }
+}
 
 struct RequestSlot<A: DecoderAdapter> {
     generations: SlotGenerationIssuer,
@@ -1783,21 +1981,61 @@ struct RequestRecord<A: DecoderAdapter> {
     next_decode_token: Option<u32>,
     rng_state: Option<u64>,
     adapter_binding: Option<AdapterBinding>,
-    output: VecDeque<OutputEvent>,
-    terminal: Option<TerminalResult>,
+    endpoint: EndpointProducer,
+    direct_receiver: Option<EndpointReceiver>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TokenPublication {
+struct TokenPublication<'endpoint> {
     position: usize,
     next_position: usize,
     next_emitted_tokens: usize,
     next_rng_state: Option<u64>,
     next_decode_token: Option<u32>,
-    event: Option<OutputEvent>,
     next_phase: RequestPhase,
     next_adapter_revision: u64,
     completed: bool,
+    endpoint_guard: PublicationGuard<'endpoint>,
+}
+
+impl fmt::Debug for TokenPublication<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenPublication")
+            .field("position", &self.position)
+            .field("next_position", &self.next_position)
+            .field("emits", &self.endpoint_guard.expects_output())
+            .field("completed", &self.completed)
+            .field("endpoint", &"<held>")
+            .finish_non_exhaustive()
+    }
+}
+
+enum PublicationPlan<'endpoint> {
+    Ready(TokenPublication<'endpoint>),
+    OutputBlocked,
+    Cancelled,
+}
+
+enum PublicationGuard<'endpoint> {
+    Output(ValidatedOutputCommitGuard<'endpoint>),
+    Terminal(TerminalCommitGuard<'endpoint>),
+}
+
+impl PublicationGuard<'_> {
+    const fn expects_output(&self) -> bool {
+        matches!(self, Self::Output(_))
+    }
+
+    fn publish(self, terminal: Option<TerminalResult>) {
+        match (self, terminal) {
+            (Self::Output(guard), Some(terminal)) => {
+                guard.publish_output_and_terminal(terminal);
+            }
+            (Self::Output(guard), None) => guard.publish_output(),
+            (Self::Terminal(guard), Some(terminal)) => guard.publish_terminal(terminal),
+            (Self::Terminal(guard), None) => drop(guard),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1810,6 +2048,7 @@ enum CommitCallback {
 enum CommitDisposition {
     Applied {
         post_commit_failure: Option<ErrorCategory>,
+        terminalized: bool,
     },
     Suppressed(TerminalOutcome),
 }
@@ -1824,7 +2063,7 @@ impl<A: DecoderAdapter> fmt::Debug for RequestRecord<A> {
             .field("sampling", &"<redacted>")
             .field("committed_positions", &self.committed_positions)
             .field("emitted_tokens", &self.emitted_tokens)
-            .field("output_count", &self.output.len())
+            .field("endpoint", &"<endpoint-owned>")
             .finish()
     }
 }
@@ -1868,6 +2107,65 @@ fn visible_snapshot_outcome(
     }
 }
 
+fn validate_endpoint_discard(
+    request_id: crate::RequestId,
+    emitted_tokens: usize,
+    snapshot: EndpointSnapshot,
+    report: EndpointDiscardReport,
+) -> SchedulerResult<()> {
+    if snapshot.published_output_events != emitted_tokens
+        || snapshot.buffered_output_events != 0
+        || report.terminal_results > 1
+        || (report.terminal_results != 0 && !snapshot.terminal_acknowledged)
+    {
+        return Err(SchedulerError::internal(
+            "request endpoint discard accounting diverged from engine state",
+        ));
+    }
+    if let Some(span) = report.output {
+        let prior_discarded = snapshot
+            .discarded_output_events
+            .checked_sub(span.count())
+            .ok_or_else(|| SchedulerError::internal("endpoint discard count underflows"))?;
+        let expected_first = snapshot
+            .drained_output_events
+            .checked_add(prior_discarded)
+            .ok_or_else(|| SchedulerError::internal("endpoint discard index overflows"))?;
+        let observed_end = span
+            .first_output_index()
+            .checked_add(span.count())
+            .ok_or_else(|| SchedulerError::internal("endpoint discard span overflows"))?;
+        if span.request_id() != request_id
+            || span.first_output_index() != expected_first
+            || observed_end != emitted_tokens
+        {
+            return Err(SchedulerError::internal(
+                "request endpoint discarded a foreign or noncontiguous output span",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_endpoint_reap(
+    emitted_tokens: usize,
+    snapshot: EndpointSnapshot,
+    report: EndpointReapReport,
+) -> SchedulerResult<()> {
+    if !snapshot.reap_ready
+        || snapshot.published_output_events != emitted_tokens
+        || snapshot.buffered_output_events != 0
+        || snapshot.discarded_output_events != report.discarded_output_events
+        || snapshot.discarded_terminal_results != report.discarded_terminal_results
+        || snapshot.shutdown != report.shutdown
+    {
+        return Err(SchedulerError::internal(
+            "request endpoint reap accounting diverged from engine state",
+        ));
+    }
+    Ok(())
+}
+
 fn observe_clock_value(last_seen_ns: &mut u64, clock: &impl Fn() -> u64) -> u64 {
     *last_seen_ns = (*last_seen_ns).max(clock());
     *last_seen_ns
@@ -1909,24 +2207,6 @@ fn validate_terminal_resources_released<A: DecoderAdapter>(
     {
         return Err(SchedulerError::internal(
             "terminal request still owns active resources",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_reap_record<A: DecoderAdapter>(
-    record: &RequestRecord<A>,
-    allow_terminal_result: bool,
-) -> SchedulerResult<()> {
-    validate_terminal_resources_released(record)?;
-    if !record.output.is_empty() {
-        return Err(SchedulerError::internal(
-            "request output must be consumed before reap",
-        ));
-    }
-    if record.terminal.is_some() && !allow_terminal_result {
-        return Err(SchedulerError::internal(
-            "terminal result must be consumed before reap",
         ));
     }
     Ok(())

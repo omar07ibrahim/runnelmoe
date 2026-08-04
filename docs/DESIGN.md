@@ -254,12 +254,18 @@ generation-bound atomic request controls, and prevalidated release permits for
 terminal/reap/shutdown cleanup. A live monotonic-clock and control snapshot is
 taken inside the adapter's validated commit callback; suppression drops both
 unapplied permits before terminal cleanup, so that position publishes no state,
-RNG, output, trace, or service-credit debit. Deterministic gated tests exercise
-late cancellation, inclusive expiry, precedence, credit recovery, and stale
-slot reuse. The concurrent actor, full adversarial interleaving matrix,
-independent trace/fairness replay, and accepted evidence remain incomplete
-until the rest of M5 lands. Weights remain eagerly resident in M5, so live
-cache-leased expert execution remains an explicit system gap.
+RNG, output, trace, or service-credit debit. A generation-tagged endpoint lock
+is acquired before sampling and remains held across that callback. After the
+adapter returns, the scheduler classifies any post-callback failure and then
+infallibly publishes the optional output and independent terminal result from
+the same guard. Endpoint and control lifecycle guards make admission and reap
+cross-registry transitions rollback-safe. Deterministic gated tests exercise
+late cancellation, inclusive expiry, precedence, credit recovery, stale slot
+reuse, endpoint saturation, disconnect, and lifecycle rollback. The concurrent
+actor, full adversarial interleaving matrix, independent trace/fairness replay,
+and accepted evidence remain incomplete until the rest of M5 lands. Weights
+remain eagerly resident in M5, so live cache-leased expert execution remains an
+explicit system gap.
 
 ## Error model
 

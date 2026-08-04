@@ -144,13 +144,17 @@ no position or status that a caller could discover was inconsistent only after
 the state linearization point.
 
 The scheduler separately validates control state, sampler preview, output
-reservation, and request phase before entering the scoped callback. Inside the
-callback it wraps the adapter permit and those scheduler-owned values in one
-stack-local `TransactionCommitPermit`. Applying the composite permit calls the
-infallible adapter apply and publishes RNG, output, and phase without further
-fallible work, panic, or yield. Runtime types never validate scheduler-owned
-capacity. This two-layer fallible-permit/infallible-apply split is what lets
-stale/ABA rejection coexist with atomic K/V, RNG, and output publication.
+reservation, and request phase before entering the scoped callback. A held
+generation-tagged endpoint guard excludes both receiver mutation and endpoint
+recycle from reservation through publication. Inside the callback the final
+live clock/control snapshot gates the infallible adapter apply, DRR debit, RNG,
+phase, and trace update without further fallible work, panic, or yield. The
+endpoint guard remains held after the callback so an adapter error returned
+after applying can be classified as terminal before the optional output and
+terminal payload become visible together. Runtime types never validate
+scheduler-owned capacity. This two-layer fallible-permit/infallible-apply split
+is what lets stale/ABA rejection coexist with atomic K/V, RNG, and result
+publication.
 
 ### Paged K/V state
 

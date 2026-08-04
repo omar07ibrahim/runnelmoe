@@ -417,6 +417,7 @@ dependencies = [
  "runnel-format",
  "runnel-runtime",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

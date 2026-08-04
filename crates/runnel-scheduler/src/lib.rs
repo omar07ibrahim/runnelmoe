@@ -1,14 +1,16 @@
 //! Bounded deterministic scheduling for model-agnostic decoder adapters.
 //!
 //! The synchronous core owns request policy, exact semantic accounting, DRR
-//! fairness, coalesced expert work, and transactional token publication. It is
-//! intentionally independent of Tokio; the later actor layer is a thin owner.
+//! fairness, coalesced expert work, and transactional token publication. Model
+//! execution remains synchronous; endpoints use Tokio only for allocation-free
+//! wake notifications consumed by the thin actor layer.
 
 #![forbid(unsafe_code)]
 
 mod accounting;
 mod config;
 mod control;
+mod endpoint;
 mod engine;
 #[cfg(test)]
 mod engine_adversarial_tests;
