@@ -1,6 +1,6 @@
 # ADR 0007: transactional paged state and deterministic continuous scheduling
 
-- Status: accepted; implementation and measurement pending
+- Status: accepted; implementation in progress; measurement pending
 - Date: 2026-08-03
 - Milestone: M5
 
@@ -444,6 +444,16 @@ mutation.
 
 ### Logical memory ledger
 
+Pre-measurement amendment (2026-08-03): actor integration review found that
+the original formulas charged only command metadata and one global control
+wake while omitting the bounded offered-prompt copies and accepted-control /
+deadline table. Before any M5 capture, the formulas were corrected to charge
+the maximum offered prompt in every command slot, one actor-control slot per
+maximum outstanding request, and the separate global wake/lifecycle slot. The
+shared offered prompt and newly admitted request prompt intentionally overlap
+until the command response is published. No earlier number is retained as M5
+evidence.
+
 The scheduler ledger is exact for declared semantic payload capacities and
 fixed logical metadata charges. It is not an allocator or RSS estimator. Every
 scheduler-owned payload is charged before allocation, every owner releases
@@ -474,7 +484,7 @@ request_used = prompt_storage + request_record + request_slot
 Shared identity:
 
 ```text
-shared_used = ordinary_command_capacity + control_wake_capacity
+shared_used = ordinary_command_capacity + actor_control_capacity
             + worker_scratch + sampling_scratch
             + coalesced_batch_capacity
             + model_resident_partition + page_pool_partition
@@ -482,19 +492,24 @@ shared_used = ordinary_command_capacity + control_wake_capacity
 total_used  = sum(request_used) + shared_used
 ```
 
-Before batch admission, the same per-request categories may be owned by a
-provisional offered-index namespace. An accepted batch commit changes only the
-owner label from offered index to internal request ID; it has no byte delta and
-is infallible. Rejected or abandoned prepared admissions release every
-provisional charge once. Exact snapshots include provisional owners, so staging
-cannot hide budget use or inflate accepted capacity.
+The production actor statically charges every ordinary command slot for
+`round_up_64(64 + max_prompt_tokens * 4)` bytes from construction through
+shutdown. A submitter claims a vacant slot before fallibly copying the offered
+prompt, and a ready command keeps that shared capacity through engine admission
+and response publication. Successful engine admission separately acquires the
+request-owned prompt charge before copying into the engine record. The shared
+offered-prompt charge and request prompt charge therefore intentionally overlap
+until the command payload is destroyed after the admission response; this is
+not a zero-delta owner relabel. A rejected or abandoned command destroys its
+offered payload exactly once while the statically reserved command partition
+remains unchanged.
 
 The owner/lifetime transitions are closed:
 
 | Charge | Owner and lifetime |
 | --- | --- |
-| ordinary command capacity | shared static partition from actor construction through shutdown; each occupied slot also obeys the count cap |
-| control wake capacity | shared static atomic/notification partition through shutdown; never consumed by ordinary submissions |
+| ordinary command capacity | shared static partition from actor construction through shutdown; each slot includes its fixed metadata and maximum offered prompt payload, while occupied/responded states obey the count cap |
+| actor control capacity | shared static partition through shutdown: 64 bytes of global actor lifecycle/wake metadata plus 64 bytes for each bounded accepted-control/deadline slot; never consumed by ordinary submissions |
 | prompt storage | request, from successful submission reservation through terminal cleanup; the original allocation remains charged after tokens are consumed |
 | request record and request slot | request, from successful submission through result reap/drop; a slot changes queued/ready/active status without a second charge |
 | active state and pending transaction capacity | request, reserved before promotion and retained until numerical state is destroyed; the pending buffers change only an in-use count per token |
@@ -507,11 +522,15 @@ The owner/lifetime transitions are closed:
 | page-pool partition | exact configured M2 cache payload capacity when a cache is attached, otherwise zero |
 | admission reserve | shared unavailable headroom through scheduler lifetime |
 
-Fixed logical metadata charges are 64 bytes per command, control-wake,
+Fixed logical metadata charges are 64 bytes per command, actor-control,
 request, output-event, terminal, expert-task, and state-page slot; 128 bytes per
-trace slot; and 512 bytes per retained request record. Payload charges use
-checked buffer capacities: four bytes per prompt token, four bytes per f32, two
-bytes per BF16, and adapter-reported state/pending/workspace layouts.
+trace slot; and 512 bytes per retained request record. Each actor command also
+includes the configured maximum offered-prompt payload before its per-slot
+charge is rounded. Actor control adds one 64-byte accepted-control/deadline slot
+per maximum outstanding request to a separate 64-byte global wake/lifecycle
+charge. Payload charges use checked buffer capacities: four bytes per prompt
+token, four bytes per f32, two bytes per BF16, and adapter-reported
+state/pending/workspace layouts.
 
 The model and optional M2 cache can pre-exist the scheduler, so their static
 partitions are not described as scheduler reserve-before-allocation. Scheduler

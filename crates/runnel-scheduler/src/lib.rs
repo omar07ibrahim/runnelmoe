@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod accounting;
+mod actor;
 mod config;
 mod control;
 mod endpoint;
@@ -21,6 +22,10 @@ mod request;
 mod ring;
 mod wave;
 
+pub use actor::{
+    ActorShutdownReport, RequestCancellation, RequestHandle, SchedulerActor, SchedulerClient,
+    Submission, TryRecvOutput,
+};
 pub use config::{
     MAX_BATCH_WIDTH, MAX_WAVES_PER_STEP, SchedulerConfig, SchedulerLimits, SharedStaticCharges,
     StateLayoutSummary,

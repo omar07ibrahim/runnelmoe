@@ -27,6 +27,7 @@ pub const MAX_LOGICAL_MEMORY_BYTES: u64 = 1_u64 << 40;
 
 const COMMAND_SLOT_BYTES: u64 = 64;
 const CONTROL_WAKE_BYTES: u64 = 64;
+const ACCEPTED_CONTROL_SLOT_BYTES: u64 = 64;
 const REQUEST_RECORD_BYTES: u64 = 512;
 const REQUEST_SLOT_BYTES: u64 = 64;
 const OUTPUT_EVENT_BYTES: u64 = 64;
@@ -910,11 +911,36 @@ fn shared_static_charges(
     geometry: &AdapterGeometry,
     tasks_per_wave: u64,
 ) -> SchedulerResult<SharedStaticCharges> {
+    let offered_prompt = checked_mul(
+        limits.max_prompt_tokens,
+        PROMPT_TOKEN_BYTES,
+        "maximum offered prompt payload",
+    )?;
+    let command_slot = round_charge(
+        checked_add(
+            COMMAND_SLOT_BYTES,
+            offered_prompt,
+            "ordinary command slot capacity",
+        )?,
+        "ordinary command slot capacity",
+    )?;
     let commands = checked_mul(
         limits.command_capacity,
-        COMMAND_SLOT_BYTES,
+        command_slot,
         "ordinary command capacity",
     )?;
+    ensure_host_allocation(commands, "ordinary command capacity")?;
+    let accepted_controls = checked_mul(
+        limits.max_outstanding_requests,
+        ACCEPTED_CONTROL_SLOT_BYTES,
+        "accepted actor control capacity",
+    )?;
+    let actor_control = checked_add(
+        CONTROL_WAKE_BYTES,
+        accepted_controls,
+        "actor control and wake capacity",
+    )?;
+    ensure_host_allocation(actor_control, "actor control and wake capacity")?;
     let workspace_per_worker = to_u64(
         geometry.execution_layout.workspace_charge_bytes(),
         "adapter workspace charge",
@@ -970,7 +996,7 @@ fn shared_static_charges(
     let total_bytes = checked_sum(
         &[
             commands,
-            CONTROL_WAKE_BYTES,
+            actor_control,
             worker_scratch,
             sampling_scratch,
             coalesced_batch,
@@ -983,7 +1009,7 @@ fn shared_static_charges(
     )?;
     Ok(SharedStaticCharges {
         actor_command_bytes: commands,
-        actor_control_bytes: CONTROL_WAKE_BYTES,
+        actor_control_bytes: actor_control,
         worker_scratch_bytes: worker_scratch,
         sampling_scratch_bytes: sampling_scratch,
         coalesced_batch_bytes: coalesced_batch,
@@ -1190,12 +1216,14 @@ mod tests {
         .sum::<u64>();
         assert_eq!(reconstructed, shared.total_bytes());
         assert_eq!(shared.total_bytes(), config.shared_static_charge_bytes());
-        assert_eq!(config.shared_static_charge_bytes(), 2_108_160);
+        assert_eq!(shared.actor_command_bytes(), 116_736);
+        assert_eq!(shared.actor_control_bytes(), 2_112);
+        assert_eq!(config.shared_static_charge_bytes(), 2_224_896);
         assert_eq!(config.pending_transaction_charge_bytes(), 384);
         assert_eq!(config.output_queue_charge_bytes(), 4_096);
         assert_eq!(config.minimum_request_charge_bytes(), 6_272);
         assert_eq!(config.worst_case_request_charge_bytes(), 78_336);
-        assert_eq!(config.minimum_total_charge_bytes(), 2_114_432);
+        assert_eq!(config.minimum_total_charge_bytes(), 2_231_168);
         assert!(config.minimum_total_charge_bytes() <= config.logical_memory_limit_bytes());
     }
 

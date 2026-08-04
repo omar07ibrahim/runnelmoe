@@ -24,9 +24,12 @@ late signal from partially publishing model state, RNG, output, or service
 credit. Each admitted request now has one generation-tagged, pre-reserved
 endpoint whose mutex remains held from output-capacity validation through the
 final state decision; its output queue and independently reserved terminal
-slot are the sole result authority. The concurrent actor, full
-stress/differential matrix, and preregistered evidence are not complete, so
-this is not an M5 closure or performance claim.
+slot are the sole result authority. A bounded Tokio actor now owns that core
+through one awaited blocking pump at a time, with a preallocated submission
+table and lane-independent cancellation, result draining, disconnection,
+deadline wakeups, and cooperative shutdown. The full preregistered
+stress/differential matrix and performance evidence are not complete, so this
+is not an M5 closure or performance claim.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling

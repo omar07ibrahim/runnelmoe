@@ -389,7 +389,7 @@ mod tests {
         let base = admission_base_plan(&config, 1).unwrap();
         let state = model.state_layout(1, config.state_page_tokens()).unwrap();
         let active = active_plan(&config, state).unwrap();
-        assert_eq!(shared.total_bytes(), 2_108_160);
+        assert_eq!(shared.total_bytes(), 2_224_896);
         assert_eq!(base.total_bytes(), 4_800);
         assert_eq!(active.total_bytes(), 1_472);
         assert_eq!(

@@ -262,10 +262,15 @@ the same guard. Endpoint and control lifecycle guards make admission and reap
 cross-registry transitions rollback-safe. Deterministic gated tests exercise
 late cancellation, inclusive expiry, precedence, credit recovery, stale slot
 reuse, endpoint saturation, disconnect, and lifecycle rollback. The concurrent
-actor, full adversarial interleaving matrix, independent trace/fairness replay,
-and accepted evidence remain incomplete until the rest of M5 lands. Weights
-remain eagerly resident in M5, so live cache-leased expert execution remains an
-explicit system gap.
+actor uses a preallocated generation-tagged submission table, ready-commit
+FIFO, direct request controls/endpoints, origin-relative Tokio deadlines, and
+one awaited blocking engine pump at a time. Responded commands retain their
+slots until consumed or abandoned, and cooperative shutdown waits for command
+claims and live endpoint ownership before destructive teardown. The full
+adversarial interleaving matrix, independent trace/fairness replay, and accepted
+evidence remain incomplete until the rest of M5 lands. Weights remain eagerly
+resident in M5, so live cache-leased expert execution remains an explicit
+system gap.
 
 ## Error model
 

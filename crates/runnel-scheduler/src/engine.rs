@@ -148,6 +148,12 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         })
     }
 
+    /// Returns the immutable validated configuration bound to this engine.
+    #[must_use]
+    pub const fn config(&self) -> &SchedulerConfig {
+        &self.config
+    }
+
     fn try_allocate_shared(
         adapter: &A,
         config: &SchedulerConfig,
