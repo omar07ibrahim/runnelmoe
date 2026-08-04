@@ -15,8 +15,8 @@ use runnel_scheduler::{
     ActorControlCasWitness, ActorDisconnectDisposition, ActorProbe, ActorProbeSnapshot,
     ActorReceiveWitness, ActorRequestDropWitnessSink, ActorSemanticObservationKind,
     ActorShutdownReport, ActorStressRecorder, ActorStressRecorderStatus, ActorStressRecording,
-    OutputEvent, RequestHandle, RequestSpec, SchedulerActor, SchedulerLimits, SchedulerResult,
-    TerminalOutcome, TerminalResult, TryRecvOutput,
+    OutputEvent, RequestHandle, RequestSpec, SchedulerActor, SchedulerError, SchedulerLimits,
+    SchedulerResult, TerminalOutcome, TerminalResult, TryRecvOutput,
 };
 use sha2::{Digest, Sha256};
 
@@ -279,13 +279,24 @@ pub(super) fn receive_once_with_witness(
 }
 
 pub(super) fn drop_receiver_with_witness(
-    mut handle: RequestHandle,
+    handle: RequestHandle,
     context: DropWitnessContext,
 ) -> HarnessResult<(
     SchedulerResult<ActorDisconnectDisposition>,
     Option<ActorControlCasWitness>,
 )> {
     let sink = ActorRequestDropWitnessSink::new();
+    drop_receiver_with_preallocated_witness(handle, sink, context)
+}
+
+pub(super) fn drop_receiver_with_preallocated_witness(
+    mut handle: RequestHandle,
+    sink: ActorRequestDropWitnessSink,
+    context: DropWitnessContext,
+) -> HarnessResult<(
+    SchedulerResult<ActorDisconnectDisposition>,
+    Option<ActorControlCasWitness>,
+)> {
     handle
         .arm_drop_witness(sink.clone())
         .map_err(|error| context.arm_error(error))?;
@@ -342,7 +353,7 @@ pub(super) async fn finish_receiver(
         }
     };
     require(
-        error.category() == runnel_scheduler::ErrorCategory::InvalidRequest,
+        matches!(&error, SchedulerError::RequestNotFound),
         format!("cleanup destructor returned an unexpected error: {error}"),
     )?;
     Ok(CleanupResult { terminal, outputs })

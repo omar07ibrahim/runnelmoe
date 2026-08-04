@@ -1102,10 +1102,12 @@ through completed shutdown.
 Every scripted action reserves two values from fresh shared-counter storage
 initialized to zero; each reservation records `fetch_add(1) + 1`. The
 invocation value is taken immediately before target lookup or scheduler API
-entry. The response value is taken only after the result, all structural
-witnesses, and any complete accepted-state entry have been published. Exactly
-1,024 actions therefore produce exactly the unique values `1..2048`. Cleanup
-uses a separate counter domain. Per-producer program order is binding, and
+entry. An exhausted submit has neither boundary, so it takes its invocation
+value immediately before evaluating the authenticated exhausted no-op. The
+response value is taken only after the result, all structural witnesses, and
+any complete accepted-state entry have been published. Exactly 1,024 actions
+therefore produce exactly the unique values `1..2048`. Cleanup uses a separate
+counter domain. Per-producer program order is binding, and
 `A.response < B.invocation` creates a cross-thread real-time edge. Invocation
 adjacency, response adjacency, the numeric order of overlapping intervals, and
 recorder append order are never linearization points. Every repetition must
