@@ -1,15 +1,24 @@
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{
+    Mutex, MutexGuard, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use runnel_scheduler::{
     ActorControlCasWitness, ActorDisconnectDisposition, ActorReceiveWitness, ActorTryPopKind,
     ActorTryPopWitness, ActorWakeWitness, CancelDisposition, OutputEvent, RequestCancellation,
     RequestHandle, SchedulerError, SchedulerResult, SubmitCommandWitness, TryRecvOutput,
 };
-use serde::{Serialize, Serializer};
+use serde::{Serialize, Serializer, ser::SerializeSeq};
 
-use super::common::{HarnessResult, REQUEST_COUNT, require, to_u64};
+use super::common::{
+    ACTION_COUNT, HarnessResult, REQUEST_COUNT, action_ordinal, action_producer, require, to_u64,
+    validate_producer_assignment,
+};
+use super::{Action, actions as generated_actions};
 
 const PRODUCER_COUNT: usize = 2;
+const ACTION_COUNTER_FINAL: u64 = 2 * ACTION_COUNT as u64;
+const PRODUCER_ACTION_COUNTS: [usize; PRODUCER_COUNT] = [518, 506];
 const COMMAND_SLOT_COUNT: u64 = 8;
 const REQUEST_SLOT_COUNT: u64 = 16;
 const MAX_CONTROL_GENERATION: u64 = u64::MAX >> 3;
@@ -1222,6 +1231,699 @@ impl RaceActionCapture {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RaceActionKey {
+    ordinal: u64,
+    producer: u8,
+    kind: RaceKind,
+    submit_attempt: Option<u64>,
+    client_index: Option<u64>,
+}
+
+impl RaceActionKey {
+    /// Authenticates static action fields before either producer reaches the
+    /// start barrier. The post-barrier path carries only this fixed-width key.
+    fn authenticate(action: &Action) -> HarnessResult<Self> {
+        validate_producer_assignment(action)?;
+        let ordinal = u64::from(action_ordinal(action));
+        let producer = u8::try_from(action_producer(action))
+            .map_err(|_| "race producer does not fit u8".to_owned())?;
+        require(
+            usize::from(producer) < PRODUCER_COUNT,
+            "race producer is out of range",
+        )?;
+
+        let (kind, submit_attempt, client_index) = match action {
+            Action::Submit {
+                exhausted,
+                request_index,
+                submit_attempt,
+                ..
+            } => {
+                let attempt = u64::from(*submit_attempt);
+                require(attempt <= 205, "race submit attempt is out of range")?;
+                let expected_index = (attempt < REQUEST_COUNT as u64).then_some(attempt);
+                require(
+                    request_index.0.map(u64::from) == expected_index,
+                    "race submit index differs from its attempt",
+                )?;
+                require(
+                    *exhausted == expected_index.is_none(),
+                    "race exhausted flag differs from its submit attempt",
+                )?;
+                (RaceKind::Submit, Some(attempt), expected_index)
+            }
+            Action::Cancel { request_index, .. } => {
+                (RaceKind::Cancel, None, Some(u64::from(*request_index)))
+            }
+            Action::Drop { request_index, .. } => (
+                RaceKind::ReceiverDrop,
+                None,
+                Some(u64::from(*request_index)),
+            ),
+            Action::Drain { request_index, .. } => {
+                (RaceKind::Drain, None, Some(u64::from(*request_index)))
+            }
+            Action::Wake { selector_index, .. } => {
+                (RaceKind::Wake, None, Some(u64::from(*selector_index)))
+            }
+        };
+        let key = Self {
+            ordinal,
+            producer,
+            kind,
+            submit_attempt,
+            client_index,
+        };
+        key.validate()?;
+        Ok(key)
+    }
+
+    fn validate(self) -> HarnessResult<()> {
+        require(
+            self.ordinal < ACTION_COUNT as u64,
+            "race key ordinal is out of range",
+        )?;
+        require(
+            usize::from(self.producer) < PRODUCER_COUNT,
+            "race key producer is out of range",
+        )?;
+        match self.kind {
+            RaceKind::Submit => {
+                let attempt = self
+                    .submit_attempt
+                    .ok_or_else(|| "race submit key omitted its attempt".to_owned())?;
+                require(attempt <= 205, "race submit key attempt is out of range")?;
+                require(
+                    u64::from(self.producer) == attempt % PRODUCER_COUNT as u64,
+                    "race submit key producer changed",
+                )?;
+                let expected_index = (attempt < REQUEST_COUNT as u64).then_some(attempt);
+                require(
+                    self.client_index == expected_index,
+                    "race submit key index changed",
+                )
+            }
+            RaceKind::Cancel | RaceKind::ReceiverDrop | RaceKind::Drain => {
+                require(
+                    self.submit_attempt.is_none(),
+                    "targeted race key retained a submit attempt",
+                )?;
+                let client_index = self
+                    .client_index
+                    .ok_or_else(|| "targeted race key omitted its index".to_owned())?;
+                require(
+                    client_index < REQUEST_COUNT as u64,
+                    "targeted race key index is out of range",
+                )?;
+                let home = client_index % PRODUCER_COUNT as u64;
+                let expected = if self.kind == RaceKind::Cancel {
+                    1 - home
+                } else {
+                    home
+                };
+                require(
+                    u64::from(self.producer) == expected,
+                    "targeted race key producer changed",
+                )
+            }
+            RaceKind::Wake => {
+                require(
+                    self.submit_attempt.is_none(),
+                    "wake race key retained a submit attempt",
+                )?;
+                require(
+                    self.client_index
+                        .is_some_and(|index| index < REQUEST_COUNT as u64),
+                    "wake race key selector is invalid",
+                )?;
+                require(
+                    u64::from(self.producer) == self.ordinal % PRODUCER_COUNT as u64,
+                    "wake race key producer changed",
+                )
+            }
+        }
+    }
+
+    fn capture(
+        self,
+        invocation: u64,
+        response: u64,
+        evidence: RaceActionEvidence,
+    ) -> RaceActionCapture {
+        RaceActionCapture(
+            self.ordinal,
+            u64::from(self.producer),
+            self.kind,
+            self.submit_attempt,
+            self.client_index,
+            invocation,
+            response,
+            evidence.result,
+            evidence.error,
+            evidence.request_id,
+            evidence.output,
+            evidence.command,
+            evidence.accepted,
+            evidence.control,
+            evidence.primary,
+            evidence.opportunistic,
+            evidence.cached_eof,
+            evidence.wake,
+        )
+    }
+
+    fn matches_capture(self, capture: RaceActionCapture) -> bool {
+        capture.0 == self.ordinal
+            && capture.1 == u64::from(self.producer)
+            && capture.2 == self.kind
+            && capture.3 == self.submit_attempt
+            && capture.4 == self.client_index
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RaceActionEvidence {
+    result: RaceResult,
+    error: Option<RaceError>,
+    request_id: Option<u64>,
+    output: Option<RaceOutput>,
+    command: CommandWitnessCapture,
+    accepted: AcceptedWitnessCapture,
+    control: ControlWitnessCapture,
+    primary: PopWitnessCapture,
+    opportunistic: PopWitnessCapture,
+    cached_eof: bool,
+    wake: WakeWitnessCapture,
+}
+
+impl RaceActionEvidence {
+    const fn with_result(result: RaceResult) -> Self {
+        Self {
+            result,
+            error: None,
+            request_id: None,
+            output: None,
+            command: CommandWitnessCapture::sentinel(),
+            accepted: AcceptedWitnessCapture::sentinel(),
+            control: ControlWitnessCapture::sentinel(),
+            primary: PopWitnessCapture::sentinel(PopKindCapture::Primary),
+            opportunistic: PopWitnessCapture::sentinel(PopKindCapture::OpportunisticEof),
+            cached_eof: false,
+            wake: WakeWitnessCapture::sentinel(),
+        }
+    }
+}
+
+struct RaceHistorySlot {
+    key: RaceActionKey,
+    started: AtomicBool,
+    invocation: OnceLock<u64>,
+    published: OnceLock<RaceActionCapture>,
+    complete: OnceLock<RaceActionCapture>,
+}
+
+impl RaceHistorySlot {
+    const fn new(key: RaceActionKey) -> Self {
+        Self {
+            key,
+            started: AtomicBool::new(false),
+            invocation: OnceLock::new(),
+            published: OnceLock::new(),
+            complete: OnceLock::new(),
+        }
+    }
+}
+
+struct RaceHistory {
+    counter: AtomicU64,
+    slots: Box<[RaceHistorySlot]>,
+}
+
+struct RaceInvocationToken {
+    ordinal: usize,
+    producer: u8,
+    invocation: u64,
+}
+
+struct PublishedRaceAction {
+    ordinal: usize,
+    producer: u8,
+    invocation: u64,
+    capture: RaceActionCapture,
+}
+
+impl RaceHistory {
+    fn new(actions: &[Action]) -> HarnessResult<Self> {
+        require(
+            actions.len() == ACTION_COUNT,
+            "race history action count changed",
+        )?;
+        require(
+            actions == generated_actions(ACTION_COUNT).as_slice(),
+            "race history actions differ from the authenticated corpus",
+        )?;
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(ACTION_COUNT)
+            .map_err(|_| "race history allocation failed".to_owned())?;
+        let mut producer_counts = [0_usize; PRODUCER_COUNT];
+        for (expected_ordinal, action) in actions.iter().enumerate() {
+            let key = RaceActionKey::authenticate(action)?;
+            require(
+                usize::try_from(key.ordinal).ok() == Some(expected_ordinal),
+                "race history action order is not consecutive",
+            )?;
+            producer_counts[usize::from(key.producer)] += 1;
+            slots.push(RaceHistorySlot::new(key));
+        }
+        require(
+            producer_counts == PRODUCER_ACTION_COUNTS,
+            "race history producer partition changed",
+        )?;
+        Ok(Self {
+            counter: AtomicU64::new(0),
+            slots: slots.into_boxed_slice(),
+        })
+    }
+
+    /// Called immediately before target lookup or scheduler API entry.
+    fn begin_action(&self, ordinal: usize, producer: u8) -> HarnessResult<RaceInvocationToken> {
+        let slot = self
+            .slots
+            .get(ordinal)
+            .ok_or_else(|| "race action ordinal is out of range".to_owned())?;
+        require(
+            slot.key.producer == producer,
+            "race action reached the wrong producer",
+        )?;
+        slot.started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "race action was begun more than once".to_owned())?;
+        let invocation = self.reserve_counter()?;
+        slot.invocation
+            .set(invocation)
+            .map_err(|_| "race invocation was published more than once".to_owned())?;
+        require(
+            invocation < ACTION_COUNTER_FINAL,
+            "race invocation counter is out of range",
+        )?;
+        Ok(RaceInvocationToken {
+            ordinal,
+            producer,
+            invocation,
+        })
+    }
+
+    /// Publishes normalized result and witness evidence before reserving the
+    /// response endpoint. The returned token is deliberately non-cloneable.
+    fn publish_evidence(
+        &self,
+        token: RaceInvocationToken,
+        evidence: RaceActionEvidence,
+    ) -> HarnessResult<PublishedRaceAction> {
+        let slot = self
+            .slots
+            .get(token.ordinal)
+            .ok_or_else(|| "published race ordinal is out of range".to_owned())?;
+        require(
+            slot.key.producer == token.producer,
+            "published race producer changed",
+        )?;
+        require(
+            slot.started.load(Ordering::SeqCst),
+            "race evidence was published before invocation",
+        )?;
+        require(
+            slot.invocation.get() == Some(&token.invocation),
+            "race evidence invocation differs from its reservation",
+        )?;
+        let provisional_response = token
+            .invocation
+            .checked_add(1)
+            .ok_or_else(|| "race provisional response overflowed".to_owned())?;
+        let capture = slot
+            .key
+            .capture(token.invocation, provisional_response, evidence);
+        capture.validate()?;
+        require(
+            slot.key.matches_capture(capture),
+            "published race evidence changed its static action",
+        )?;
+        slot.published
+            .set(capture)
+            .map_err(|_| "race evidence was published more than once".to_owned())?;
+        Ok(PublishedRaceAction {
+            ordinal: token.ordinal,
+            producer: token.producer,
+            invocation: token.invocation,
+            capture,
+        })
+    }
+
+    fn finish_action(&self, published: PublishedRaceAction) -> HarnessResult<()> {
+        let slot = self
+            .slots
+            .get(published.ordinal)
+            .ok_or_else(|| "completed race ordinal is out of range".to_owned())?;
+        require(
+            slot.key.producer == published.producer,
+            "completed race producer changed",
+        )?;
+        require(
+            slot.published.get() == Some(&published.capture),
+            "completed race evidence differs from its publication",
+        )?;
+        let response = self.reserve_counter()?;
+        require(
+            response <= ACTION_COUNTER_FINAL && response > published.invocation,
+            "race response counter is out of range",
+        )?;
+        let mut complete = published.capture;
+        complete.6 = response;
+        complete.validate()?;
+        require(
+            slot.key.matches_capture(complete),
+            "completed race record changed its static action",
+        )?;
+        slot.complete
+            .set(complete)
+            .map_err(|_| "race action was completed more than once".to_owned())
+    }
+
+    fn record_action(
+        &self,
+        token: RaceInvocationToken,
+        evidence: RaceActionEvidence,
+    ) -> HarnessResult<()> {
+        let published = self.publish_evidence(token, evidence)?;
+        self.finish_action(published)
+    }
+
+    fn reserve_counter(&self) -> HarnessResult<u64> {
+        self.counter
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| "race action counter overflowed".to_owned())
+    }
+
+    fn counter_value(&self) -> u64 {
+        self.counter.load(Ordering::SeqCst)
+    }
+
+    fn into_complete(self) -> HarnessResult<CompleteRaceHistory> {
+        let mut seen_counter_values = [false; ACTION_COUNTER_FINAL as usize + 1];
+        let mut producer_counts = [0_usize; PRODUCER_COUNT];
+        let mut previous = [None; PRODUCER_COUNT];
+        for (ordinal, slot) in self.slots.iter().enumerate() {
+            require(
+                slot.started.load(Ordering::SeqCst),
+                "race history retained a vacant action",
+            )?;
+            let published = slot
+                .published
+                .get()
+                .copied()
+                .ok_or_else(|| "race history retained an invoked-only action".to_owned())?;
+            require(
+                slot.invocation.get() == Some(&published.5),
+                "race history invocation publication changed",
+            )?;
+            let complete = slot
+                .complete
+                .get()
+                .copied()
+                .ok_or_else(|| "race history retained an evidence-only action".to_owned())?;
+            require(
+                usize::try_from(complete.0).ok() == Some(ordinal),
+                "race history tuple order differs from ordinal",
+            )?;
+            complete.validate()?;
+            require(
+                slot.key.matches_capture(complete),
+                "race history differs from its authenticated action",
+            )?;
+            let mut expected_publication = complete;
+            expected_publication.6 = expected_publication
+                .5
+                .checked_add(1)
+                .ok_or_else(|| "race publication interval overflowed".to_owned())?;
+            require(
+                published == expected_publication,
+                "race completion changed published evidence",
+            )?;
+
+            let producer = usize::from(slot.key.producer);
+            producer_counts[producer] += 1;
+            if let Some(previous_response) = previous[producer] {
+                require(
+                    previous_response < complete.5,
+                    "race producer program order was violated",
+                )?;
+            }
+            previous[producer] = Some(complete.6);
+            for value in [complete.5, complete.6] {
+                let value = usize::try_from(value)
+                    .map_err(|_| "race counter value does not fit usize".to_owned())?;
+                require(
+                    value != 0 && value <= ACTION_COUNTER_FINAL as usize,
+                    "race counter value is out of range",
+                )?;
+                require(!seen_counter_values[value], "race counter value was reused")?;
+                seen_counter_values[value] = true;
+            }
+        }
+        require(
+            producer_counts == PRODUCER_ACTION_COUNTS,
+            "complete race producer partition changed",
+        )?;
+        require(
+            self.counter_value() == ACTION_COUNTER_FINAL,
+            "race action counter did not finish at 2048",
+        )?;
+        require(
+            seen_counter_values[1..].iter().all(|seen| *seen),
+            "race action counter domain has a gap",
+        )?;
+        validate_global_submission_structure(&self.slots)?;
+        let overlap_pair = select_overlap_pair(&self.slots)?;
+        Ok(CompleteRaceHistory {
+            slots: self.slots,
+            overlap_pair,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RaceBoundary {
+    Command,
+    Control,
+    PrimaryEndpoint,
+    OpportunisticEndpoint,
+    Wake,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BoundaryMask(u8);
+
+impl BoundaryMask {
+    const COMMAND: u8 = 1 << 0;
+    const CONTROL: u8 = 1 << 1;
+    const PRIMARY_ENDPOINT: u8 = 1 << 2;
+    const OPPORTUNISTIC_ENDPOINT: u8 = 1 << 3;
+    const WAKE: u8 = 1 << 4;
+
+    fn from_capture(capture: RaceActionCapture) -> Self {
+        let mut mask = 0;
+        if capture.11.boundary_reached() {
+            mask |= Self::COMMAND;
+        }
+        if capture.13.boundary_reached() {
+            mask |= Self::CONTROL;
+        }
+        if capture.14.boundary_reached() {
+            mask |= Self::PRIMARY_ENDPOINT;
+        }
+        if capture.15.boundary_reached() {
+            mask |= Self::OPPORTUNISTIC_ENDPOINT;
+        }
+        if capture.17.boundary_reached() {
+            mask |= Self::WAKE;
+        }
+        Self(mask)
+    }
+
+    const fn first(self) -> Option<RaceBoundary> {
+        if self.0 & Self::COMMAND != 0 {
+            Some(RaceBoundary::Command)
+        } else if self.0 & Self::CONTROL != 0 {
+            Some(RaceBoundary::Control)
+        } else if self.0 & Self::PRIMARY_ENDPOINT != 0 {
+            Some(RaceBoundary::PrimaryEndpoint)
+        } else if self.0 & Self::OPPORTUNISTIC_ENDPOINT != 0 {
+            Some(RaceBoundary::OpportunisticEndpoint)
+        } else if self.0 & Self::WAKE != 0 {
+            Some(RaceBoundary::Wake)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct RaceOverlapPair(u64, RaceBoundary, u64, RaceBoundary);
+
+struct CompleteRaceHistory {
+    slots: Box<[RaceHistorySlot]>,
+    overlap_pair: RaceOverlapPair,
+}
+
+impl CompleteRaceHistory {
+    fn actions(&self) -> impl ExactSizeIterator<Item = RaceActionCapture> + '_ {
+        self.slots.iter().map(|slot| {
+            *slot
+                .complete
+                .get()
+                .expect("complete race history was validated")
+        })
+    }
+
+    const fn overlap_pair(&self) -> RaceOverlapPair {
+        self.overlap_pair
+    }
+}
+
+impl Serialize for CompleteRaceHistory {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(ACTION_COUNT))?;
+        for action in self.actions() {
+            sequence.serialize_element(&action)?;
+        }
+        sequence.end()
+    }
+}
+
+fn validate_global_submission_structure(slots: &[RaceHistorySlot]) -> HarnessResult<()> {
+    let mut ready_seen = [false; REQUEST_COUNT + 1];
+    let mut tickets_seen = [[false; REQUEST_COUNT + 1]; COMMAND_SLOT_COUNT as usize];
+    let mut ticket_counts = [0_usize; COMMAND_SLOT_COUNT as usize];
+    let mut accepted_by_ready = [None; REQUEST_COUNT + 1];
+    let mut command_count = 0_usize;
+
+    for slot in slots {
+        let action = *slot
+            .complete
+            .get()
+            .ok_or_else(|| "global race validation found an incomplete action".to_owned())?;
+        if !action.11.boundary_reached() {
+            continue;
+        }
+        command_count += 1;
+        let command_slot = usize::try_from(action.11.1)
+            .map_err(|_| "command slot does not fit usize".to_owned())?;
+        let ticket = usize::try_from(action.11.2)
+            .map_err(|_| "command ticket does not fit usize".to_owned())?;
+        let ready = usize::try_from(action.11.3)
+            .map_err(|_| "ready sequence does not fit usize".to_owned())?;
+        require(
+            ticket != 0 && ticket <= REQUEST_COUNT,
+            "command ticket exceeds the closed workload",
+        )?;
+        require(
+            ready != 0 && ready <= REQUEST_COUNT,
+            "ready sequence exceeds the closed workload",
+        )?;
+        require(!ready_seen[ready], "ready sequence was duplicated")?;
+        ready_seen[ready] = true;
+        require(
+            !tickets_seen[command_slot][ticket],
+            "command slot ticket was duplicated",
+        )?;
+        tickets_seen[command_slot][ticket] = true;
+        ticket_counts[command_slot] += 1;
+
+        if action.12.boundary_reached() {
+            accepted_by_ready[ready] = Some(action.12);
+        }
+    }
+
+    require(
+        command_count == REQUEST_COUNT,
+        "race history did not reach exactly 64 commands",
+    )?;
+    require(
+        ready_seen[1..].iter().all(|seen| *seen),
+        "race ready sequence is not exactly 1 through 64",
+    )?;
+    for (slot, count) in ticket_counts.into_iter().enumerate() {
+        require(
+            tickets_seen[slot][1..1 + count].iter().all(|seen| *seen),
+            "command slot tickets have a gap",
+        )?;
+    }
+
+    let mut last_control_generation = [0_u64; REQUEST_SLOT_COUNT as usize];
+    let mut last_endpoint_generation = [0_u64; REQUEST_SLOT_COUNT as usize];
+    for (expected_request_id, accepted) in
+        (1_u64..).zip(accepted_by_ready.into_iter().skip(1).flatten())
+    {
+        require(
+            accepted.1 == expected_request_id,
+            "accepted request IDs differ from ready-FIFO order",
+        )?;
+        let control_slot = usize::try_from(accepted.2)
+            .map_err(|_| "accepted control slot does not fit usize".to_owned())?;
+        let endpoint_slot = usize::try_from(accepted.4)
+            .map_err(|_| "accepted endpoint slot does not fit usize".to_owned())?;
+        require(
+            accepted.3 == last_control_generation[control_slot] + 1,
+            "accepted control generations do not increase in ready order",
+        )?;
+        require(
+            accepted.5 == last_endpoint_generation[endpoint_slot] + 1,
+            "accepted endpoint generations do not increase in ready order",
+        )?;
+        last_control_generation[control_slot] = accepted.3;
+        last_endpoint_generation[endpoint_slot] = accepted.5;
+    }
+    Ok(())
+}
+
+fn select_overlap_pair(slots: &[RaceHistorySlot]) -> HarnessResult<RaceOverlapPair> {
+    for left_ordinal in 0..slots.len() {
+        let left = *slots[left_ordinal]
+            .complete
+            .get()
+            .ok_or_else(|| "overlap scan found an incomplete left action".to_owned())?;
+        let Some(left_boundary) = BoundaryMask::from_capture(left).first() else {
+            continue;
+        };
+        for right_slot in slots.iter().skip(left_ordinal + 1) {
+            let right = *right_slot
+                .complete
+                .get()
+                .ok_or_else(|| "overlap scan found an incomplete right action".to_owned())?;
+            if left.1 == right.1 || !(left.5 < right.6 && right.5 < left.6) {
+                continue;
+            }
+            let Some(right_boundary) = BoundaryMask::from_capture(right).first() else {
+                continue;
+            };
+            return Ok(RaceOverlapPair(
+                left.0,
+                left_boundary,
+                right.0,
+                right_boundary,
+            ));
+        }
+    }
+    Err("race history lacks a qualifying cross-producer overlap".to_owned())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AcceptedIdentity {
     request_id: u64,
     control_slot: u64,
@@ -1596,6 +2298,346 @@ mod tests {
 
     fn control_word(generation: u64, flags: u64) -> u64 {
         (generation << 3) | flags
+    }
+
+    fn synthetic_evidence(key: RaceActionKey) -> RaceActionEvidence {
+        match key.kind {
+            RaceKind::Submit => {
+                let attempt = key.submit_attempt.expect("submit attempt");
+                if attempt >= REQUEST_COUNT as u64 {
+                    return RaceActionEvidence::with_result(RaceResult::SubmitOfferExhausted);
+                }
+                let identity = AcceptedIdentity {
+                    request_id: attempt + 1,
+                    control_slot: attempt % REQUEST_SLOT_COUNT,
+                    control_generation: attempt / REQUEST_SLOT_COUNT + 1,
+                    endpoint_slot: attempt % REQUEST_SLOT_COUNT,
+                    endpoint_generation: attempt / REQUEST_SLOT_COUNT + 1,
+                };
+                let mut evidence = RaceActionEvidence::with_result(RaceResult::SubmitAccepted);
+                evidence.request_id = Some(identity.request_id);
+                evidence.command = CommandWitnessCapture(
+                    true,
+                    attempt % COMMAND_SLOT_COUNT,
+                    attempt / COMMAND_SLOT_COUNT + 1,
+                    attempt + 1,
+                );
+                evidence.accepted = AcceptedWitnessCapture::from_identity(identity);
+                evidence
+            }
+            RaceKind::Cancel | RaceKind::ReceiverDrop | RaceKind::Drain => {
+                RaceActionEvidence::with_result(RaceResult::TargetUnavailable)
+            }
+            RaceKind::Wake => {
+                let mut evidence = RaceActionEvidence::with_result(RaceResult::WakeSignaled);
+                evidence.wake = WakeWitnessCapture(true, false, key.ordinal + 1, key.ordinal + 2);
+                evidence
+            }
+        }
+    }
+
+    fn record_synthetic(history: &RaceHistory, ordinal: usize) {
+        let key = history.slots[ordinal].key;
+        let token = history
+            .begin_action(ordinal, key.producer)
+            .expect("synthetic invocation");
+        history
+            .record_action(token, synthetic_evidence(key))
+            .expect("synthetic completion");
+    }
+
+    fn complete_synthetic_history() -> RaceHistory {
+        let workload = authenticated_workload().expect("authenticated workload");
+        let history = RaceHistory::new(&workload.actions).expect("race history");
+
+        // Ordinal zero is a producer-zero unavailable drain. Complete it, then
+        // deliberately overlap the first producer-zero and producer-one
+        // commands without weakening either producer's program order.
+        record_synthetic(&history, 0);
+        let left_key = history.slots[1].key;
+        let right_key = history.slots[2].key;
+        let left = history
+            .begin_action(1, left_key.producer)
+            .expect("left invocation");
+        let right = history
+            .begin_action(2, right_key.producer)
+            .expect("right invocation");
+        let left = history
+            .publish_evidence(left, synthetic_evidence(left_key))
+            .expect("left evidence publication");
+        let right = history
+            .publish_evidence(right, synthetic_evidence(right_key))
+            .expect("right evidence publication");
+        history.finish_action(left).expect("left completion");
+        history.finish_action(right).expect("right completion");
+
+        for ordinal in 3..ACTION_COUNT {
+            record_synthetic(&history, ordinal);
+        }
+        history
+    }
+
+    fn overlap_slot(key: RaceActionKey, capture: RaceActionCapture) -> RaceHistorySlot {
+        let slot = RaceHistorySlot::new(key);
+        slot.complete.set(capture).expect("overlap capture");
+        slot
+    }
+
+    #[test]
+    fn complete_history_freezes_counter_program_order_and_overlap() {
+        let history = complete_synthetic_history();
+        assert_eq!(history.counter_value(), ACTION_COUNTER_FINAL);
+        let complete = history.into_complete().expect("complete race history");
+        assert_eq!(complete.actions().len(), ACTION_COUNT);
+        assert_eq!(complete.actions().next().expect("first action").0, 0);
+        assert_eq!(complete.actions().last().expect("last action").0, 1_023);
+        assert_eq!(
+            complete.overlap_pair(),
+            RaceOverlapPair(1, RaceBoundary::Command, 2, RaceBoundary::Command)
+        );
+        let encoded = serde_json::to_value(&complete).expect("history JSON");
+        assert_eq!(
+            encoded.as_array().expect("action array").len(),
+            ACTION_COUNT
+        );
+    }
+
+    #[test]
+    fn global_validation_allows_unused_command_slots_without_panicking() {
+        let mut history = complete_synthetic_history();
+        let mut next_ticket = 0_u64;
+        for slot in &mut history.slots {
+            if !slot
+                .complete
+                .get()
+                .expect("complete action")
+                .11
+                .boundary_reached()
+            {
+                continue;
+            }
+            next_ticket += 1;
+            let ready_sequence = slot.complete.get().expect("complete action").11.3;
+            slot.published.get_mut().expect("published action").11 =
+                CommandWitnessCapture(true, 0, next_ticket, ready_sequence);
+            slot.complete.get_mut().expect("complete action").11 =
+                CommandWitnessCapture(true, 0, next_ticket, ready_sequence);
+        }
+        assert_eq!(next_ticket, REQUEST_COUNT as u64);
+        history
+            .into_complete()
+            .expect("single command-slot history remains valid");
+    }
+
+    #[test]
+    fn evidence_publication_precedes_response_reservation() {
+        let workload = authenticated_workload().expect("authenticated workload");
+        let history = RaceHistory::new(&workload.actions).expect("race history");
+        let key = history.slots[0].key;
+        let invocation = history.begin_action(0, key.producer).expect("invocation");
+        assert_eq!(history.counter_value(), 1);
+        let published = history
+            .publish_evidence(invocation, synthetic_evidence(key))
+            .expect("evidence publication");
+        assert!(history.slots[0].published.get().is_some());
+        assert!(history.slots[0].complete.get().is_none());
+        assert_eq!(history.counter_value(), 1);
+        history
+            .finish_action(published)
+            .expect("response completion");
+        assert_eq!(history.counter_value(), 2);
+        assert!(history.slots[0].complete.get().is_some());
+    }
+
+    #[test]
+    fn duplicate_begin_fails_before_consuming_another_counter_value() {
+        let workload = authenticated_workload().expect("authenticated workload");
+        let history = RaceHistory::new(&workload.actions).expect("race history");
+        let producer = history.slots[0].key.producer;
+        let _token = history.begin_action(0, producer).expect("first invocation");
+        assert_eq!(history.counter_value(), 1);
+        assert!(history.begin_action(0, producer).is_err());
+        assert_eq!(history.counter_value(), 1);
+    }
+
+    #[test]
+    fn collection_rejects_every_incomplete_slot_phase() {
+        let workload = authenticated_workload().expect("authenticated workload");
+        assert!(
+            RaceHistory::new(&workload.actions)
+                .expect("vacant history")
+                .into_complete()
+                .is_err()
+        );
+
+        let invoked = RaceHistory::new(&workload.actions).expect("invoked history");
+        let key = invoked.slots[0].key;
+        let _token = invoked
+            .begin_action(0, key.producer)
+            .expect("invoked action");
+        assert!(invoked.into_complete().is_err());
+
+        let published = RaceHistory::new(&workload.actions).expect("published history");
+        let key = published.slots[0].key;
+        let token = published
+            .begin_action(0, key.producer)
+            .expect("published invocation");
+        let _published = published
+            .publish_evidence(token, synthetic_evidence(key))
+            .expect("published evidence");
+        assert!(published.into_complete().is_err());
+    }
+
+    #[test]
+    fn history_authenticates_static_actions_and_counter_domain() {
+        let workload = authenticated_workload().expect("authenticated workload");
+        let mut reordered = workload.actions.clone();
+        reordered.swap(0, 1);
+        assert!(RaceHistory::new(&reordered).is_err());
+        let mut altered_selector = workload.actions.clone();
+        let Action::Drain { request_index, .. } = &mut altered_selector[0] else {
+            panic!("frozen first action changed");
+        };
+        *request_index = 44;
+        assert!(RaceHistory::new(&altered_selector).is_err());
+
+        let overflow = RaceHistory::new(&workload.actions).expect("overflow history");
+        overflow
+            .counter
+            .store(ACTION_COUNTER_FINAL, Ordering::SeqCst);
+        let producer = overflow.slots[0].key.producer;
+        assert!(overflow.begin_action(0, producer).is_err());
+        assert_eq!(overflow.counter_value(), ACTION_COUNTER_FINAL + 1);
+
+        let maximum = RaceHistory::new(&workload.actions).expect("maximum history");
+        maximum.counter.store(u64::MAX, Ordering::SeqCst);
+        let producer = maximum.slots[0].key.producer;
+        assert!(maximum.begin_action(0, producer).is_err());
+        assert_eq!(maximum.counter_value(), 0);
+
+        let mut corrupted = complete_synthetic_history();
+        corrupted.slots[7].key.ordinal = 8;
+        assert!(corrupted.into_complete().is_err());
+
+        let mut wrong_generation = complete_synthetic_history();
+        let first_submit = wrong_generation
+            .slots
+            .iter_mut()
+            .find(|slot| slot.key.submit_attempt == Some(0))
+            .expect("first submit");
+        first_submit
+            .published
+            .get_mut()
+            .expect("published submit")
+            .12
+            .3 = 2;
+        first_submit
+            .complete
+            .get_mut()
+            .expect("complete submit")
+            .12
+            .3 = 2;
+        assert!(wrong_generation.into_complete().is_err());
+
+        let mut duplicate_counter = complete_synthetic_history();
+        let duplicate_response = duplicate_counter.slots[1]
+            .complete
+            .get()
+            .expect("left complete")
+            .6;
+        duplicate_counter.slots[2]
+            .complete
+            .get_mut()
+            .expect("right complete")
+            .6 = duplicate_response;
+        assert!(duplicate_counter.into_complete().is_err());
+    }
+
+    #[test]
+    fn overlap_requires_opposite_producers_strict_intervals_and_boundaries() {
+        let workload = authenticated_workload().expect("authenticated workload");
+        let left_key = RaceActionKey::authenticate(&workload.actions[1]).expect("left key");
+        let right_key = RaceActionKey::authenticate(&workload.actions[2]).expect("right key");
+        let same_key = RaceActionKey::authenticate(&workload.actions[3]).expect("same key");
+        let left = left_key.capture(1, 4, synthetic_evidence(left_key));
+        let right_nonoverlap = right_key.capture(4, 6, synthetic_evidence(right_key));
+        assert!(
+            select_overlap_pair(&[
+                overlap_slot(left_key, left),
+                overlap_slot(right_key, right_nonoverlap),
+            ])
+            .is_err()
+        );
+
+        let same = same_key.capture(2, 5, synthetic_evidence(same_key));
+        assert!(
+            select_overlap_pair(&[overlap_slot(left_key, left), overlap_slot(same_key, same),])
+                .is_err()
+        );
+
+        let sentinel_key = RaceActionKey::authenticate(&workload.actions[0]).expect("sentinel key");
+        let sentinel = sentinel_key.capture(1, 4, synthetic_evidence(sentinel_key));
+        let right = right_key.capture(2, 5, synthetic_evidence(right_key));
+        assert!(
+            select_overlap_pair(&[
+                overlap_slot(sentinel_key, sentinel),
+                overlap_slot(right_key, right),
+            ])
+            .is_err()
+        );
+
+        let pair =
+            select_overlap_pair(&[overlap_slot(left_key, left), overlap_slot(right_key, right)])
+                .expect("qualifying overlap");
+        assert_eq!(
+            pair,
+            RaceOverlapPair(1, RaceBoundary::Command, 2, RaceBoundary::Command)
+        );
+    }
+
+    #[test]
+    fn boundary_mask_uses_the_frozen_precedence() {
+        let workload = authenticated_workload().expect("authenticated workload");
+        let key = RaceActionKey::authenticate(&workload.actions[1]).expect("action key");
+        let mut capture = key.capture(1, 2, synthetic_evidence(key));
+        capture.13 = ControlWitnessCapture(
+            ControlOperationCapture::Cancel,
+            true,
+            0,
+            1,
+            Hex64(control_word(1, 0)),
+            Hex64(control_word(1, CANCELLED_FLAG)),
+            Some(ControlDispositionCapture::Requested),
+        );
+        capture.14 = PopWitnessCapture(PopKindCapture::Primary, true, 0, 1, 0, 0, None);
+        capture.15 = PopWitnessCapture(PopKindCapture::OpportunisticEof, true, 0, 1, 0, 0, None);
+        capture.17 = WakeWitnessCapture(true, false, 1, 2);
+        assert_eq!(
+            BoundaryMask::from_capture(capture).first(),
+            Some(RaceBoundary::Command)
+        );
+        capture.11 = CommandWitnessCapture::sentinel();
+        assert_eq!(
+            BoundaryMask::from_capture(capture).first(),
+            Some(RaceBoundary::Control)
+        );
+        capture.13 = ControlWitnessCapture::sentinel();
+        assert_eq!(
+            BoundaryMask::from_capture(capture).first(),
+            Some(RaceBoundary::PrimaryEndpoint)
+        );
+        capture.14 = PopWitnessCapture::sentinel(PopKindCapture::Primary);
+        assert_eq!(
+            BoundaryMask::from_capture(capture).first(),
+            Some(RaceBoundary::OpportunisticEndpoint)
+        );
+        capture.15 = PopWitnessCapture::sentinel(PopKindCapture::OpportunisticEof);
+        assert_eq!(
+            BoundaryMask::from_capture(capture).first(),
+            Some(RaceBoundary::Wake)
+        );
+        capture.17 = WakeWitnessCapture::sentinel();
+        assert_eq!(BoundaryMask::from_capture(capture).first(), None);
     }
 
     #[test]
