@@ -86,6 +86,14 @@
     "max_prompt_tokens": 4,
     "max_queued_requests": 16,
     "max_retained_terminal_results": 16,
+    "model_identity": {
+      "artifact_id": "sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c",
+      "object_digest": "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab",
+      "object_length": 5600,
+      "page_table_digest": "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
+      "page_table_length": 96,
+      "spec_file_sha256": "sha256:ed57d7961e65c76223c169cabebaff9c02d8293da026abb0c0c0a22d38079845"
+    },
     "output_capacity_per_request": 2,
     "page_pool_partition_bytes": 0,
     "state_page_tokens": 4,
@@ -198,7 +206,7 @@
     "action_words": "runnel-m5-actor-stress-v1\u0000",
     "request_descriptors": "runnel-m5-actor-request-v1\u0000"
   },
-  "fixture_id": "sha256:297827cef0bde04a5a1e6af549c565b5548d223a79dd9b80aacb58142c364436",
+  "fixture_id": "sha256:5010492fb74eda207511b26811992ed4779814185b9f184663b37a37747bd051",
   "kind_codes": {
     "0": "submit",
     "1": "cancel",
@@ -218,6 +226,6 @@
     "producer_0": 518,
     "producer_1": 506
   },
-  "schema": "runnel.actor-stress-vectors/1",
+  "schema": "runnel.actor-stress-vectors/2",
   "specification": "runnel-m5-actor-stress-v1"
 }

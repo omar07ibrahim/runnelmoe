@@ -59,10 +59,17 @@ implementations.
 stress before any M5 capture or golden runtime digest. The separately
 structured standard-library implementation in `oracle/scheduler.py` derives 64
 bounded direct-token descriptors and 1,024 actor actions from the SHA-256
-domains in ADR 0007. It also binds the exact tiny-v3 scalar actor limits,
-producer assignment, exhausted-submit behavior, and ignored-but-consumed wake
-selectors. It contains no Rust result, output token transcript, timing, or
-terminal claim.
+domains in ADR 0007. It also binds the exact tiny-v3 scalar actor limits and
+authenticated model inputs, producer assignment, exhausted-submit behavior,
+and ignored-but-consumed wake selectors. The model identity includes the
+canonical spec-file hash, artifact ID, object digest and length, and page-table
+digest and length. It contains no Rust result, output token transcript, timing,
+or terminal claim.
+
+The corpus uses closed schema `runnel.actor-stress-vectors/2`. Its workload
+identity and filename remain `runnel-m5-actor-stress-v1` and
+`actor-stress-v1.json`: schema version two adds required authenticated-model
+custody without changing the frozen descriptor or action streams.
 
 Frozen identity:
 
@@ -70,10 +77,14 @@ Frozen identity:
   `sha256:d902ecf3377310de99471f41287f62730671263b8e339ac03b87ee5d6edef42b`;
 - action sequence:
   `sha256:430810784f31659367ecc4fecb5cf8693b4758176debe4a4769dc7cc62611b73`;
+- tiny-v3 spec file:
+  `sha256:ed57d7961e65c76223c169cabebaff9c02d8293da026abb0c0c0a22d38079845`;
+- authenticated tiny-v3 artifact:
+  `sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c`;
 - semantic fixture ID:
-  `sha256:297827cef0bde04a5a1e6af549c565b5548d223a79dd9b80aacb58142c364436`;
+  `sha256:5010492fb74eda207511b26811992ed4779814185b9f184663b37a37747bd051`;
 - complete file SHA-256:
-  `eb4a170a70c734471f6be0d33767f6d0d7102662307bd8860f9bc527d317e9b1`.
+  `eca1faeee91a41d19d98be7ffdad6fc5cebb9027f3e7a634c01ea1cc394fb574`.
 
 The action counts are 206 submit, 220 cancel, 222 receiver-drop, 237 drain,
 and 139 wake actions. Of the submit actions, 142 occur after the 64-description

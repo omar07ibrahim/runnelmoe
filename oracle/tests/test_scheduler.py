@@ -4,6 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import copy
 import hashlib
 import io
+import json
 from itertools import islice
 from pathlib import Path
 import tempfile
@@ -14,6 +15,7 @@ from oracle import scheduler
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = REPOSITORY_ROOT / "fixtures" / "scheduler" / "actor-stress-v1.json"
+TINY_V3_SPEC_PATH = REPOSITORY_ROOT / "fixtures" / "tiny-v3" / "spec.json"
 EXPECTED_DESCRIPTOR_DIGEST = (
     "sha256:d902ecf3377310de99471f41287f62730671263b8e339ac03b87ee5d6edef42b"
 )
@@ -21,9 +23,9 @@ EXPECTED_ACTION_DIGEST = (
     "sha256:430810784f31659367ecc4fecb5cf8693b4758176debe4a4769dc7cc62611b73"
 )
 EXPECTED_FIXTURE_ID = (
-    "sha256:297827cef0bde04a5a1e6af549c565b5548d223a79dd9b80aacb58142c364436"
+    "sha256:5010492fb74eda207511b26811992ed4779814185b9f184663b37a37747bd051"
 )
-EXPECTED_FILE_SHA256 = "eb4a170a70c734471f6be0d33767f6d0d7102662307bd8860f9bc527d317e9b1"
+EXPECTED_FILE_SHA256 = "eca1faeee91a41d19d98be7ffdad6fc5cebb9027f3e7a634c01ea1cc394fb574"
 
 
 class SchedulerOracleTests(unittest.TestCase):
@@ -268,6 +270,14 @@ class SchedulerOracleTests(unittest.TestCase):
                 "max_prompt_tokens": 4,
                 "max_queued_requests": 16,
                 "max_retained_terminal_results": 16,
+                "model_identity": {
+                    "artifact_id": "sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c",
+                    "object_digest": "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab",
+                    "object_length": 5_600,
+                    "page_table_digest": "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
+                    "page_table_length": 96,
+                    "spec_file_sha256": "sha256:ed57d7961e65c76223c169cabebaff9c02d8293da026abb0c0c0a22d38079845",
+                },
                 "output_capacity_per_request": 2,
                 "page_pool_partition_bytes": 0,
                 "state_page_tokens": 4,
@@ -315,6 +325,65 @@ class SchedulerOracleTests(unittest.TestCase):
             positions = len(descriptor["prompt"]) + descriptor["max_new_tokens"] - 1
             self.assertLessEqual(positions, 16)
 
+    def test_model_identity_matches_the_frozen_tiny_v3_spec(self) -> None:
+        raw = TINY_V3_SPEC_PATH.read_bytes()
+        spec = json.loads(raw)
+        self.assertEqual(
+            scheduler.MODEL_IDENTITY["spec_file_sha256"],
+            f"sha256:{hashlib.sha256(raw).hexdigest()}",
+        )
+        self.assertEqual(
+            {
+                key: value
+                for key, value in scheduler.MODEL_IDENTITY.items()
+                if key != "spec_file_sha256"
+            },
+            spec["artifact"],
+        )
+        self.assertEqual(scheduler.ACTOR_CONFIG["adapter"], "tiny-v3")
+        self.assertEqual(scheduler.ACTOR_CONFIG["backend"], "scalar")
+
+    def test_model_identity_mutations_fail_closed(self) -> None:
+        fixture = scheduler.build_fixture()
+        for field, original in scheduler.MODEL_IDENTITY.items():
+            mutated = copy.deepcopy(fixture)
+            mutated_identity = mutated["actor_config"]["model_identity"]
+            mutated_identity[field] = (
+                original + ".mutated" if isinstance(original, str) else original + 1
+            )
+            mutated["fixture_id"] = scheduler.fixture_identity(mutated)
+            with self.subTest(model_identity_field=field):
+                with self.assertRaises(scheduler.SchedulerFixtureError):
+                    scheduler.parse_document_bytes(scheduler.canonical_bytes(mutated))
+
+        for field in ("adapter", "backend"):
+            mutated = copy.deepcopy(fixture)
+            mutated["actor_config"][field] += ".mutated"
+            mutated["fixture_id"] = scheduler.fixture_identity(mutated)
+            with self.subTest(actor_model_field=field):
+                with self.assertRaises(scheduler.SchedulerFixtureError):
+                    scheduler.parse_document_bytes(scheduler.canonical_bytes(mutated))
+
+        for field in ("object_length", "page_table_length"):
+            boolean_integer = copy.deepcopy(fixture)
+            boolean_integer["actor_config"]["model_identity"][field] = True
+            boolean_integer["fixture_id"] = scheduler.fixture_identity(boolean_integer)
+            with self.subTest(boolean_model_integer=field):
+                with self.assertRaises(scheduler.SchedulerFixtureError):
+                    scheduler.parse_document_bytes(
+                        scheduler.canonical_bytes(boolean_integer)
+                    )
+
+        unknown_model_field = copy.deepcopy(fixture)
+        unknown_model_field["actor_config"]["model_identity"]["unknown"] = 0
+        unknown_model_field["fixture_id"] = scheduler.fixture_identity(
+            unknown_model_field
+        )
+        with self.assertRaises(scheduler.SchedulerFixtureError):
+            scheduler.parse_document_bytes(
+                scheduler.canonical_bytes(unknown_model_field)
+            )
+
     def test_committed_fixture_equals_regeneration_and_frozen_hashes(self) -> None:
         raw = FIXTURE_PATH.read_bytes()
         document = scheduler.parse_document_bytes(raw)
@@ -348,14 +417,14 @@ class SchedulerOracleTests(unittest.TestCase):
         raw = scheduler.generated_bytes()
         duplicate = raw.replace(
             b'{\n',
-            b'{\n  "schema": "runnel.actor-stress-vectors/1",\n',
+            b'{\n  "schema": "runnel.actor-stress-vectors/2",\n',
             1,
         )
         cases = (
             raw[:-1],
             raw.replace(b"\n", b" \n", 1),
             duplicate,
-            raw.replace(b'"schema": "runnel.actor-stress-vectors/1"', b'"schema": NaN'),
+            raw.replace(b'"schema": "runnel.actor-stress-vectors/2"', b'"schema": NaN'),
         )
         for payload in cases:
             with self.subTest(payload=payload[:40]):

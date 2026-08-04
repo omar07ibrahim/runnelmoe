@@ -23,7 +23,7 @@ import tempfile
 from typing import Any, Iterable, Iterator, NoReturn, Sequence
 
 
-SCHEMA = "runnel.actor-stress-vectors/1"
+SCHEMA = "runnel.actor-stress-vectors/2"
 SPECIFICATION = "runnel-m5-actor-stress-v1"
 ACTION_DOMAIN = b"runnel-m5-actor-stress-v1\0"
 REQUEST_DOMAIN = b"runnel-m5-actor-request-v1\0"
@@ -46,6 +46,14 @@ MAX_U32 = (1 << 32) - 1
 MAX_FIXTURE_BYTES = 256 * 1024
 
 ACTION_KINDS = ("submit", "cancel", "drop", "drain", "wake")
+MODEL_IDENTITY = {
+    "artifact_id": "sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c",
+    "object_digest": "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab",
+    "object_length": 5_600,
+    "page_table_digest": "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
+    "page_table_length": 96,
+    "spec_file_sha256": "sha256:ed57d7961e65c76223c169cabebaff9c02d8293da026abb0c0c0a22d38079845",
+}
 ACTOR_CONFIG = {
     "adapter": "tiny-v3",
     "admission_reserve_bytes": 1_048_576,
@@ -60,6 +68,7 @@ ACTOR_CONFIG = {
     "max_prompt_tokens": 4,
     "max_queued_requests": 16,
     "max_retained_terminal_results": 16,
+    "model_identity": MODEL_IDENTITY,
     "output_capacity_per_request": 2,
     "page_pool_partition_bytes": 0,
     "state_page_tokens": 4,
@@ -274,7 +283,10 @@ def build_fixture() -> dict[str, Any]:
         action["kind"] == "submit" and action["exhausted"] for action in actions
     )
     document: dict[str, Any] = {
-        "actor_config": dict(ACTOR_CONFIG),
+        "actor_config": {
+            **ACTOR_CONFIG,
+            "model_identity": dict(MODEL_IDENTITY),
+        },
         "action_counts": {
             "by_kind": {kind: by_kind[kind] for kind in ACTION_KINDS},
             "exhausted_submits": exhausted_submits,
@@ -371,7 +383,12 @@ def validate_document(document: Any) -> dict[str, Any]:
     if document["fixture_id"] != fixture_identity(document):
         _fail("actor stress fixture identity digest differs")
 
-    _expect_keys(document["actor_config"], set(ACTOR_CONFIG), "actor config")
+    actor_config = _expect_keys(
+        document["actor_config"], set(ACTOR_CONFIG), "actor config"
+    )
+    _expect_keys(
+        actor_config["model_identity"], set(MODEL_IDENTITY), "actor model identity"
+    )
     _expect_keys(document["domains"], {"action_words", "request_descriptors"}, "domains")
     _expect_keys(
         document["algorithms"],

@@ -2,7 +2,7 @@
 
 - Status: accepted; implementation in progress; measurement pending
 - Date: 2026-08-03
-- Last amended: 2026-08-04 (pre-measurement stress-protocol clarification)
+- Last amended: 2026-08-04 (pre-result stress-protocol and transcript clarification)
 - Milestone: M5
 
 ## Context
@@ -894,6 +894,23 @@ partition, and a 1,048,576-byte admission reserve. The global context envelope
 is 19 because configuration validates `4 + 16 - 1`; every derived request below
 still has at most 16 model positions.
 
+Before actor construction, the harness authenticates the canonical
+`fixtures/tiny-v3/spec.json` bytes as
+`sha256:ed57d7961e65c76223c169cabebaff9c02d8293da026abb0c0c0a22d38079845`.
+The generated artifact must then validate as artifact ID
+`sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c`,
+one 5,600-byte object with digest
+`sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab`,
+and a 96-byte page table with digest
+`sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c`.
+The scalar backend is mandatory. A model/spec identity mismatch invalidates
+the run; it is never an alternate golden outcome.
+
+The committed custody document uses closed schema
+`runnel.actor-stress-vectors/2`. Its pre-result `/1` predecessor froze the same
+descriptor and action sequences but did not bind these model inputs, so it is
+superseded and is not admissible as golden evidence.
+
 The 64 offered descriptions are derived independently of the action stream.
 For zero-based request index `i`, let `d` be the 32 bytes of:
 
@@ -939,6 +956,14 @@ actor. All submit-kind actions are assigned to producer
 drain and receiver-drop actions run on that producer, cancellation runs on the
 opposite producer, and wake action ordinal `a` runs on producer `a mod 2`.
 
+The fault-free request-ID contract starts at one. Each successful engine
+admission consumes exactly the next consecutive ID in its admission
+linearization order; a rejected offer consumes no ID. The golden's serialized
+IDs must therefore be `1..N` in its successful-admission order. A race history
+derives the same consecutive assignment from its witnessed admission order.
+Identity exhaustion or a gap, duplicate, or out-of-order assignment invalidates
+the run rather than defining another transcript.
+
 An accepted request stores its cancellation authority separately from its sole
 receiver. Dropping the receiver does not drop that authority; it remains usable
 until its generation becomes terminal and is recycled. A targeted operation
@@ -947,8 +972,10 @@ already consumed is an `unavailable` no-op and makes no actor API call. A
 stored authority that has since become stale is still called and records its
 typed API error. A drain action performs exactly one nonblocking receive
 attempt: it consumes at most one FIFO output event, observes empty, or
-acknowledges EOF. Receiver drop explicitly publishes disconnect before
-consuming the handle. Wake is global and never inspects the selected request.
+acknowledges EOF. A receiver-drop action consumes the sole handle; that
+handle's destructor publishes disconnect exactly once before relinquishing the
+receiver, and the harness does not make a second explicit-disconnect call.
+Wake is global and never inspects the selected request.
 
 #### Golden execution, cleanup, and race witnesses
 
@@ -968,12 +995,24 @@ request indices in ascending order and requests cancellation through every
 still-generation-valid stored authority. It then releases the pump and waits
 for quiescence. In ascending request-index order, each remaining receiver first
 consumes its terminal result, then drains committed output in FIFO order through
-EOF, and is dropped; a receiver already dropped by the script is skipped. The
-harness drops the stored cancellation authorities, waits for quiescence, and
-performs cooperative actor shutdown. Terminal and output publication observers
-retain semantic records even when a receiver was previously dropped, so
-discarded client delivery cannot erase a committed event from the golden
-transcript.
+EOF, and is dropped; a receiver already dropped by the script is skipped. After
+each such receiver is dropped, the harness waits for acknowledged actor
+quiescence and requires that endpoint generation to have reaped. The harness
+then drops the stored cancellation authorities, waits for quiescence, and
+requires zero outstanding requests and zero request-owned ledger bytes before
+cooperative actor shutdown. Consequently shutdown itself cancels and
+terminalizes no request, discards no output, and releases no request-owned
+bytes. Terminal and output publication observers retain semantic records even
+when a receiver was previously dropped, so discarded client delivery cannot
+erase a committed event from the golden transcript.
+
+Only deterministic request-level outcomes allowed by the frozen actions are
+serialized. A host allocation failure, authenticated-artifact failure, worker
+or adapter failure, actor panic, timeout, observer overflow/poison, unexpected
+closed state, or internal invariant error invalidates the complete run and is
+not an action-record alternative. In particular, allocation failure is
+distinguished from the expected bounded-capacity `resource_exhausted`
+admission result even though both share the public error category.
 
 The genuine race uses the identical actions and producer assignment for 32
 repetitions. After initial actor quiescence, both producers wait behind one
@@ -1014,7 +1053,7 @@ integer is unsigned little-endian, reserved fields must be zero, and no native
 structural witness enters this semantic digest. The byte stream is:
 
 ```text
-"runnel-m5-actor-semantic-transcript-v1\0"
+"runnel-m5-actor-semantic-transcript-v2\0"
 u32(1024 action records)
 u32(output publication count)
 u32(terminal publication count)
@@ -1065,19 +1104,32 @@ add no further EOF record.
 The final record has tag `0x05`, followed by
 `accepted_submissions:u32`, `rejected_submissions:u32`,
 `shutdown_cancellations:u32`, `terminated_requests:u32`,
-`discarded_output_events:u32`, `reserved:u32`, `engine_steps:u64`,
-`pump_entries:u64`, `released_request_bytes:u64`,
-`remaining_shared_bytes:u64`, `final_request_bytes:u64`, and
-`final_shared_bytes:u64`. Actor and engine report fields are copied exactly
-after checked conversion to the declared widths; `pump_entries` is the
-previously defined cap delta, and the final byte fields are the post-shutdown
-ledger snapshot. `rejected_submissions` therefore excludes exhausted offers
-and unavailable operations, because neither calls the actor. Both final byte
-fields and `remaining_shared_bytes` must be zero. Cleanup operations are fixed
-by the preceding contract and are not additional action records; their effects
-appear in output, terminal, EOF, and shutdown records. Independently structured
-Rust and Python generators must agree on every transcript byte before the
-expected golden digest is committed.
+`discarded_output_events:u32`, `reserved:u32`,
+`released_request_bytes:u64`, `remaining_shared_bytes:u64`,
+`final_request_bytes:u64`, and `final_shared_bytes:u64`. Actor and engine
+report fields are copied exactly after checked conversion to the declared
+widths. `rejected_submissions` excludes exhausted offers and unavailable
+operations, because neither calls the actor. The pre-shutdown zero-ownership
+gate requires `shutdown_cancellations`, `terminated_requests`,
+`discarded_output_events`, `released_request_bytes`, and all three remaining or
+final byte fields to be zero. Cleanup operations are fixed by the preceding
+contract and are not additional action records; their effects appear in
+output, terminal, EOF, and shutdown records.
+
+Physical `engine_steps` and `pump_entries` are captured alongside the golden
+result as observed bounded diagnostics, but neither enters this semantic byte
+stream or its digest. Wake coalescing may change no-work owner re-entry counts
+without changing any request semantics, so binding those counts into the
+golden would reject a valid implementation-preserving scheduling change. The
+4,096-entry pump cap remains a required guardrail, measured as the previously
+defined delta, and the capture retains both diagnostic counts. Independently
+structured Rust and Python generators must agree on every semantic transcript
+byte before the expected golden digest is committed.
+
+Removing those two physical counters changes the binary record layout, so this
+corrected pre-result format uses the `v2` domain above. The never-populated `v1`
+domain from the preceding draft is superseded and must not be accepted as M5
+evidence.
 
 The `actor-concurrency-stress` correctness row aggregates the golden and race
 subtests. Only the gated golden execution has a committed semantic digest; race

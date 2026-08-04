@@ -66,11 +66,12 @@ import this oracle, and the oracle does not consume production outputs.
 `scheduler.py` is a standard-library-only implementation of the domain-separated
 SHA-256 word stream, rejection sampling, synthetic request descriptors, action
 selection, and two-producer assignment frozen by ADR 0007. Its committed
-`actor-stress-v1.json` fixture contains inputs and configuration only: it does
-not import the Rust scheduler, model an actor result, or claim a golden terminal
-digest. The checker performs bounded no-follow reads, rejects noncanonical or
-open-schema JSON, recomputes every identity, and requires byte equality with a
-fresh independent generation.
+`actor-stress-v1.json` fixture contains inputs and configuration only, including
+the exact tiny-v3 scalar spec-file hash and authenticated artifact identity. It
+does not import the Rust scheduler, model an actor result, or claim a golden
+terminal digest. The checker performs bounded no-follow reads, rejects
+noncanonical or open-schema JSON, recomputes every identity, and requires byte
+equality with a fresh independent generation.
 
 ## Independent cache-policy oracle
 

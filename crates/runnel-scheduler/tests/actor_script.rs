@@ -5,15 +5,21 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use runnel_fixture::FixtureArtifact;
+
 const ACTION_DOMAIN: &[u8] = b"runnel-m5-actor-stress-v1\0";
 const DESCRIPTOR_DOMAIN: &[u8] = b"runnel-m5-actor-request-v1\0";
 const FIXTURE_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../fixtures/scheduler/actor-stress-v1.json"
 ));
+const TINY_V3_SPEC_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/tiny-v3/spec.json"
+));
 const FIXTURE_FILE_DIGEST: &str =
-    "sha256:eb4a170a70c734471f6be0d33767f6d0d7102662307bd8860f9bc527d317e9b1";
-const FIXTURE_ID: &str = "sha256:297827cef0bde04a5a1e6af549c565b5548d223a79dd9b80aacb58142c364436";
+    "sha256:eca1faeee91a41d19d98be7ffdad6fc5cebb9027f3e7a634c01ea1cc394fb574";
+const FIXTURE_ID: &str = "sha256:5010492fb74eda207511b26811992ed4779814185b9f184663b37a37747bd051";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NullableU32(Option<u32>);
@@ -137,12 +143,24 @@ struct ActorConfig {
     max_prompt_tokens: usize,
     max_queued_requests: usize,
     max_retained_terminal_results: usize,
+    model_identity: ModelIdentity,
     output_capacity_per_request: usize,
     page_pool_partition_bytes: u64,
     state_page_tokens: usize,
     trace_capacity: usize,
     waves_per_step: usize,
     worker_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ModelIdentity {
+    artifact_id: String,
+    object_digest: String,
+    object_length: u64,
+    page_table_digest: String,
+    page_table_length: u64,
+    spec_file_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -399,6 +417,7 @@ fn sha256_label(bytes: &[u8]) -> String {
 }
 
 fn expected_actor_config() -> ActorConfig {
+    let fixture_identity = FixtureArtifact::build_v3().identity();
     ActorConfig {
         adapter: "tiny-v3".into(),
         admission_reserve_bytes: 1_048_576,
@@ -413,6 +432,14 @@ fn expected_actor_config() -> ActorConfig {
         max_prompt_tokens: 4,
         max_queued_requests: 16,
         max_retained_terminal_results: 16,
+        model_identity: ModelIdentity {
+            artifact_id: fixture_identity.artifact_id.to_string(),
+            object_digest: fixture_identity.object_digest.to_string(),
+            object_length: fixture_identity.object_length,
+            page_table_digest: fixture_identity.page_table_digest.to_string(),
+            page_table_length: fixture_identity.page_table_length,
+            spec_file_sha256: sha256_label(TINY_V3_SPEC_BYTES),
+        },
         output_capacity_per_request: 2,
         page_pool_partition_bytes: 0,
         state_page_tokens: 4,
@@ -498,7 +525,7 @@ fn committed_actor_stress_fixture_matches_the_independent_contract() {
         FIXTURE_ID
     );
 
-    assert_eq!(fixture.schema, "runnel.actor-stress-vectors/1");
+    assert_eq!(fixture.schema, "runnel.actor-stress-vectors/2");
     assert_eq!(fixture.specification, "runnel-m5-actor-stress-v1");
     assert_eq!(fixture.domains.action_words.as_bytes(), ACTION_DOMAIN);
     assert_eq!(
@@ -581,6 +608,25 @@ fn closed_schema_rejects_unknown_field_mutations() {
         .expect("actor config is an object")
         .insert("unknown_limit".into(), Value::from(1));
     assert!(serde_json::from_value::<Fixture>(config_mutation).is_err());
+
+    let mut identity_mutation = fixture.clone();
+    identity_mutation
+        .pointer_mut("/actor_config/model_identity")
+        .and_then(Value::as_object_mut)
+        .expect("model identity is an object")
+        .insert("unknown_identity".into(), Value::Null);
+    assert!(serde_json::from_value::<Fixture>(identity_mutation).is_err());
+
+    for pointer in [
+        "/actor_config/model_identity/object_length",
+        "/actor_config/model_identity/page_table_length",
+    ] {
+        let mut boolean_length = fixture.clone();
+        *boolean_length
+            .pointer_mut(pointer)
+            .expect("model length is present") = Value::Bool(true);
+        assert!(serde_json::from_value::<Fixture>(boolean_length).is_err());
+    }
 
     let mut vector_mutation = fixture;
     vector_mutation
