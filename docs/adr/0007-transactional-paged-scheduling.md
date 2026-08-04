@@ -966,16 +966,32 @@ the run rather than defining another transcript.
 
 An accepted request stores its cancellation authority separately from its sole
 receiver. Dropping the receiver does not drop that authority; it remains usable
-until its generation becomes terminal and is recycled. A targeted operation
-whose needed authority or receiver is absent, not yet accepted, rejected, or
-already consumed is an `unavailable` no-op and makes no actor API call. A
-stored authority that has since become stale is still called and records its
-typed API error. A drain action performs exactly one nonblocking receive
-attempt: it consumes at most one FIFO output event, observes empty, or
-acknowledges EOF. A receiver-drop action consumes the sole handle; that
-handle's destructor publishes disconnect exactly once before relinquishing the
-receiver, and the harness does not make a second explicit-disconnect call.
-Wake is global and never inspects the selected request.
+through terminal publication. Recycling returns the control slot to its free
+list but deliberately leaves the terminal generation word intact until a later
+bind replaces it, so a retained authority may continue to observe
+`already_terminal` after its request record has reaped; after rebind it reports
+the typed stale-generation error. A targeted operation whose needed authority
+or receiver is absent, not yet accepted, rejected, or already consumed is an
+`unavailable` no-op and makes no actor API call. A stored authority that has
+since become stale is still called and records its typed API error. A drain
+action performs exactly one nonblocking receive attempt: it consumes at most
+one FIFO output event, observes empty, or acknowledges EOF. A receiver-drop
+action consumes the sole handle; that handle's destructor publishes disconnect
+exactly once before relinquishing the receiver, and the harness does not make a
+second explicit-disconnect call. Wake is global and never inspects the selected
+request.
+
+For this bounded corpus, the 16 control slots use a frozen deterministic reuse
+rule so stale-authority evidence is independently replayable. Initial binds
+consume slot indices `0..15` in ascending order. Recycling appends the freed
+index to the free stack, and the next successful admission binds the most
+recently recycled index (LIFO), incrementing its generation and making every
+older authority for that slot stale. A rejected admission consumes no slot and
+does not change this stack. The Python capture verifier replays this rule from
+accepted submissions and quiescent receiver drops; a cleanup disposition that
+does not match the derived current generation invalidates the capture. This
+reuse rule affects structural capture custody but not semantic transcript
+bytes.
 
 #### Golden execution, cleanup, and race witnesses
 
@@ -990,21 +1006,48 @@ owner's `pump` function, including command-only and no-work entries; engine
 step count is not a substitute. The cap is a delta of 4,096 pump entries from
 the initial acknowledged quiescence through completed shutdown.
 
+The accounting fields returned with acknowledged quiescence are the owner's
+publication from the completed pump preceding that park. After every scripted
+receiver drop, the golden additionally requires the exact live request-record
+count to equal the number of receivers still owned by the two producers. Script
+actions never consume a terminal result, so a still-owned receiver prevents its
+generation from reaping; this equality therefore proves every script-dropped
+receiver's request record has reaped. It does not infer cancellation-authority
+staleness: the control registry retains a terminal generation word after
+recycle until that slot is rebound.
+
 Cleanup begins from quiescence. While the pump is held, the coordinator visits
-request indices in ascending order and requests cancellation through every
-still-generation-valid stored authority. It then releases the pump and waits
-for quiescence. In ascending request-index order, each remaining receiver first
-consumes its terminal result, then drains committed output in FIFO order through
-EOF, and is dropped; a receiver already dropped by the script is skipped. After
-each such receiver is dropped, the harness waits for acknowledged actor
-quiescence and requires that endpoint generation to have reaped. The harness
-then drops the stored cancellation authorities, waits for quiescence, and
-requires zero outstanding requests and zero request-owned ledger bytes before
-cooperative actor shutdown. Consequently shutdown itself cancels and
+every accepted request index in ascending order and probes its stored
+cancellation authority. Because every action is followed by acknowledged
+quiescence and cleanup probes each authority exactly once, a live receiver
+permits only `requested` or `already_terminal`; `already_requested` is
+unreachable and invalid in this protocol. A script-dropped and proven-reaped
+record permits only the retained `already_terminal` tombstone or the typed
+stale-generation error after slot reuse. Every probe must witness a nonzero
+generation at its control-word boundary. A `requested` result must correlate
+with a later `cancelled` terminal, as must `requested` from a scripted
+cancellation action. The harness records all cleanup
+dispositions in the logical cross-language capture but excludes them from the
+semantic transcript bytes.
+
+The coordinator then releases the pump and waits for quiescence. In ascending
+request-index order, each remaining receiver first consumes its terminal result,
+then drains the exact FIFO suffix of committed output through EOF, and is
+dropped; a receiver already dropped by the script is skipped. After each such
+receiver is dropped, the harness waits for acknowledged actor quiescence and
+requires exactly one fewer live request record. The terminal control tombstone
+must remain generation-valid because no new bind occurs during cleanup. The
+harness then drops the stored cancellation authorities, waits for quiescence,
+and requires zero outstanding requests and zero request-owned ledger bytes
+before cooperative actor shutdown. Consequently shutdown itself cancels and
 terminalizes no request, discards no output, and releases no request-owned
 bytes. Terminal and output publication observers retain semantic records even
 when a receiver was previously dropped, so discarded client delivery cannot
-erase a committed event from the golden transcript. Before actor construction,
+erase a committed event from the golden transcript. Observer-vector order is
+retention order only: endpoint mutation unlocks before recorder append, so the
+golden treats observations as identity-keyed effects and applies the explicit
+sorting rules below rather than interpreting append order as a linearization
+order. Before actor construction,
 the observer pre-reserves a logical lifetime capacity of exactly 675 records:
 the frozen descriptors permit at most 547 output publications, plus at most 64
 terminal publications and 64 first-EOF acknowledgements. Its allocation may
@@ -1118,8 +1161,9 @@ operations, because neither calls the actor. The pre-shutdown zero-ownership
 gate requires `shutdown_cancellations`, `terminated_requests`,
 `discarded_output_events`, `released_request_bytes`, and all three remaining or
 final byte fields to be zero. Cleanup operations are fixed by the preceding
-contract and are not additional action records; their effects appear in
-output, terminal, EOF, and shutdown records.
+contract and are not additional action records. Their authority dispositions
+are retained only in the logical cross-language capture, while their semantic
+effects appear in output, terminal, EOF, and shutdown records.
 
 Physical `engine_steps` and `pump_entries` are captured alongside the golden
 result as observed bounded diagnostics, but neither enters this semantic byte

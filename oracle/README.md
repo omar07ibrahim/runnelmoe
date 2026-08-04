@@ -73,6 +73,40 @@ terminal digest. The checker performs bounded no-follow reads, rejects
 noncanonical or open-schema JSON, recomputes every identity, and requires byte
 equality with a fresh independent generation.
 
+`actor_transcript.py` is a separate, standard-library-first verifier for the
+logical results emitted by the feature-gated Rust actor golden. It regenerates
+the 1,024 actions, reconstructs request identity and FIFO relations, validates
+terminal, cleanup-authority, shutdown, recorder, and bounded-pump invariants,
+then independently emits the fixed-width ADR 0007 transcript. The optional
+`--validate-model` gate lazily loads PyTorch and recomputes every accepted
+request from the authenticated tiny-v3 specification; Rust output must be an
+exact generated prefix, and completed requests must match the complete oracle
+sequence.
+
+Before a digest is frozen, the cross-language custody handshake uses only new
+files in a private tmpfs directory. Python never receives the Rust transcript,
+and the final Rust invocation compares the independently produced bytes:
+
+```console
+exchange_dir="$(mktemp -d /dev/shm/runnel-actor-golden.XXXXXX)"
+RUNNEL_ACTOR_GOLDEN_CAPTURE="$exchange_dir/capture.json" \
+  cargo test -p runnel-scheduler --test actor_script --no-default-features \
+    --features actor-stress-instrumentation \
+    deterministic_actor_semantic_golden_is_bounded_and_structurally_sound \
+    --locked --offline
+python -m oracle.actor_transcript "$exchange_dir/capture.json" \
+  --transcript "$exchange_dir/python-transcript.bin" --validate-model
+RUNNEL_ACTOR_PYTHON_TRANSCRIPT="$exchange_dir/python-transcript.bin" \
+  cargo test -p runnel-scheduler --test actor_script --no-default-features \
+    --features actor-stress-instrumentation \
+    deterministic_actor_semantic_golden_is_bounded_and_structurally_sound \
+    --locked --offline
+```
+
+The capture and transcript readers are bounded regular-file/no-follow paths;
+the transcript destination is create-new. The binary transcript is an exchange
+artifact, not a repository artifact.
+
 ## Independent cache-policy oracle
 
 `cache_policy.py` is a separate standard-library reference for the M3 online

@@ -167,5 +167,21 @@ jobs:
         run: python -m oracle.sampling --check
       - name: Verify committed scheduler stress inputs
         run: python -m oracle.scheduler --check
+      - name: Cross-check the bounded actor semantic golden
+        run: |
+          exchange_dir="$(mktemp -d /dev/shm/runnel-actor-golden.XXXXXX)"
+          test "$(stat -c %a "$exchange_dir")" = 700
+          RUNNEL_ACTOR_GOLDEN_CAPTURE="$exchange_dir/capture.json" \
+            cargo test -p runnel-scheduler --test actor_script \
+              --no-default-features --features actor-stress-instrumentation \
+              deterministic_actor_semantic_golden_is_bounded_and_structurally_sound \
+              --locked
+          python -m oracle.actor_transcript "$exchange_dir/capture.json" \
+            --transcript "$exchange_dir/python-transcript.bin" --validate-model
+          RUNNEL_ACTOR_PYTHON_TRANSCRIPT="$exchange_dir/python-transcript.bin" \
+            cargo test -p runnel-scheduler --test actor_script \
+              --no-default-features --features actor-stress-instrumentation \
+              deterministic_actor_semantic_golden_is_bounded_and_structurally_sound \
+              --locked
       - name: Test the independent oracle
         run: python -m unittest discover -s oracle/tests -v

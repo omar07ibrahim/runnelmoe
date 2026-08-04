@@ -413,6 +413,7 @@ dependencies = [
 name = "runnel-scheduler"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "runnel-fixture",
  "runnel-format",
  "runnel-runtime",

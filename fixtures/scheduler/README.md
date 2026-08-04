@@ -102,3 +102,29 @@ Deliberate regeneration uses `python -m oracle.scheduler --write` and requires
 reviewing every identity above plus the literal independent test vectors. The
 checker performs a bounded no-follow regular-file read, enforces canonical
 closed-schema JSON, and requires exact byte equality with fresh regeneration.
+
+## Actor semantic golden custody
+
+The feature-gated Rust golden executes the authenticated corpus against the
+scalar tiny-v3 actor with limits constructed directly from the frozen actor
+configuration. It serializes a canonical logical capture, not a precomputed
+answer: action results, raw request-keyed publications, every held-pump cleanup
+cancellation disposition, zero-effect shutdown accounting, and bounded
+diagnostics. Physical observation order is not treated as a linearization
+order. Stale-versus-terminal cleanup authority results use the ADR's frozen
+16-slot LIFO recycle/rebind rule, which the independent verifier replays from
+accepted submissions and quiescent receiver drops.
+
+`oracle/actor_transcript.py` independently regenerates the input stream and
+derives request mappings, FIFO order, fixed-width codes, sentinels, sorting,
+and transcript bytes. With `--validate-model`, it also rebuilds tiny-v3 in
+PyTorch and requires every observed token sequence to be the exact permitted
+prefix. The Rust harness can create a new logical capture and, in a separate
+invocation, byte-compare the independently created Python transcript. Detailed
+commands and file-safety constraints are in `oracle/README.md`.
+
+The first custody commit intentionally contains no accepted capture or expected
+digest. A later commit may freeze them only after repeated deterministic runs,
+exact cross-language byte agreement, independent review, and green hosted CI.
+The binary transcript remains ephemeral even after the canonical JSON capture
+and its semantic SHA-256 are accepted.

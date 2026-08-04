@@ -193,6 +193,9 @@ pub struct ActorStressRecording {
 
 #[cfg(any(test, feature = "actor-stress-instrumentation"))]
 impl ActorStressRecording {
+    /// Returns the retained semantic effects. This is recorder append order,
+    /// not a cross-thread linearization order; consumers must normalize by the
+    /// documented identity keys.
     #[must_use]
     pub fn observations(&self) -> &[ActorSemanticObservation] {
         &self.observations

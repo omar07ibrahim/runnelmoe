@@ -672,3 +672,7 @@ fn canonical_object_writer_sorts_keys_recursively() {
         b"{\n  \"a\": {\n    \"a\": 3,\n    \"z\": 2\n  },\n  \"z\": 1\n}\n"
     );
 }
+
+#[cfg(feature = "actor-stress-instrumentation")]
+#[path = "actor_script/golden.rs"]
+mod golden;

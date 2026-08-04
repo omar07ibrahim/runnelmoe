@@ -854,7 +854,8 @@ pub struct ActorProbeSnapshot {
     pub command_in_flight: usize,
     /// Current admission responses awaiting submitter consumption.
     pub command_responded: usize,
-    /// Exact queued, active, or retained-terminal engine request count.
+    /// Exact live engine request-record count, including terminal records
+    /// awaiting endpoint acknowledgement or recycling.
     pub outstanding_requests: u64,
     /// Latest exact request-owned ledger bytes observed by the owner.
     pub request_bytes: u64,
