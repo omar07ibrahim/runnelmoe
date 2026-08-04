@@ -8,7 +8,10 @@
 
 mod accounting;
 mod config;
+mod control;
 mod engine;
+#[cfg(test)]
+mod engine_adversarial_tests;
 mod error;
 mod id;
 mod ledger;

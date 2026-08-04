@@ -250,11 +250,16 @@ the full 1,024-position context without growth. The synchronous scheduler now
 composes adapter state, DRR credit, RNG, output, phase, and trace publication at
 one non-yielding boundary. It uses bounded FIFO admission, retained-round DRR,
 expert-sorted waves, per-request output backpressure, exact category ownership,
-and prevalidated release permits for terminal/reap/shutdown cleanup. The
-concurrent control owner, adversarial interleaving matrix, independent
-trace/fairness replay, and accepted evidence remain incomplete until the rest
-of M5 lands. Weights remain eagerly resident in M5, so live cache-leased expert
-execution remains an explicit system gap.
+generation-bound atomic request controls, and prevalidated release permits for
+terminal/reap/shutdown cleanup. A live monotonic-clock and control snapshot is
+taken inside the adapter's validated commit callback; suppression drops both
+unapplied permits before terminal cleanup, so that position publishes no state,
+RNG, output, trace, or service-credit debit. Deterministic gated tests exercise
+late cancellation, inclusive expiry, precedence, credit recovery, and stale
+slot reuse. The concurrent actor, full adversarial interleaving matrix,
+independent trace/fairness replay, and accepted evidence remain incomplete
+until the rest of M5 lands. Weights remain eagerly resident in M5, so live
+cache-leased expert execution remains an explicit system gap.
 
 ## Error model
 

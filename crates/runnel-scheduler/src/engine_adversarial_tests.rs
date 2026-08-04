@@ -1,0 +1,853 @@
+use std::{
+    mem::size_of,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    thread,
+};
+
+use runnel_runtime::{
+    AdapterExecutionLayout, AdapterWorkIdentity, DecoderAdapter, Result as RuntimeResult,
+    RuntimeError, SamplingPolicy, StateLayoutAccounting,
+};
+
+use crate::control::ControlBinding;
+use crate::{
+    CancelDisposition, ErrorCategory, LedgerCategory, LedgerOwnership, RequestPhase, RequestSpec,
+    SchedulerConfig, SchedulerEngine, SchedulerLimits, StepReport, TerminalOutcome,
+};
+
+static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Default)]
+struct GateState {
+    claimed: bool,
+    arrived: bool,
+    released: bool,
+}
+
+/// A deterministic, no-sleep rendezvous immediately before the adapter's
+/// validated commit callback. Only the first callback is held.
+#[derive(Default)]
+struct CommitGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+impl CommitGate {
+    fn passthrough() -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                claimed: true,
+                arrived: false,
+                released: true,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn block_first_callback(&self) {
+        let mut state = self.state.lock().expect("commit gate lock");
+        if state.claimed {
+            return;
+        }
+        state.claimed = true;
+        state.arrived = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).expect("commit gate wait");
+        }
+    }
+
+    fn wait_until_arrived(&self) {
+        let mut state = self.state.lock().expect("commit gate lock");
+        while !state.arrived {
+            state = self.changed.wait(state).expect("commit gate wait");
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("commit gate lock");
+        assert!(state.arrived, "commit gate released before adapter arrived");
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct ApplyCancelHook {
+    binding: Mutex<Option<ControlBinding>>,
+    disposition: Mutex<Option<Result<CancelDisposition, ErrorCategory>>>,
+}
+
+impl ApplyCancelHook {
+    fn install(&self, binding: ControlBinding) {
+        let previous = self
+            .binding
+            .lock()
+            .expect("apply-cancel binding lock")
+            .replace(binding);
+        assert!(previous.is_none(), "apply-cancel binding installed twice");
+    }
+
+    fn cancel_before_state_mutation(&self) {
+        let Some(binding) = self
+            .binding
+            .lock()
+            .expect("apply-cancel binding lock")
+            .take()
+        else {
+            return;
+        };
+        let disposition = binding.cancel().map_err(|error| error.category());
+        let previous = self
+            .disposition
+            .lock()
+            .expect("apply-cancel result lock")
+            .replace(disposition);
+        assert!(previous.is_none(), "apply-cancel result published twice");
+    }
+
+    fn disposition(&self) -> Option<Result<CancelDisposition, ErrorCategory>> {
+        *self.disposition.lock().expect("apply-cancel result lock")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GateStateLayout {
+    max_tokens: usize,
+    payload_bytes: usize,
+    charge_bytes: usize,
+}
+
+impl StateLayoutAccounting for GateStateLayout {
+    fn payload_bytes(self) -> usize {
+        self.payload_bytes
+    }
+
+    fn charge_bytes(self) -> usize {
+        self.charge_bytes
+    }
+}
+
+struct DecoderState {
+    identity: u64,
+    revision: u64,
+    position: usize,
+    tokens: Vec<u32>,
+    apply_count: Arc<AtomicUsize>,
+    apply_cancel: Option<Arc<ApplyCancelHook>>,
+}
+
+struct PreparedToken {
+    identity: AdapterWorkIdentity,
+    input_token: u32,
+}
+
+struct ExpertTask {
+    identity: AdapterWorkIdentity,
+    input_token: u32,
+}
+
+struct ExpertContribution {
+    identity: AdapterWorkIdentity,
+    input_token: u32,
+}
+
+struct PendingCommit {
+    identity: AdapterWorkIdentity,
+    input_token: u32,
+    logits: [f32; 4],
+}
+
+struct CommitPermit<'a> {
+    state: &'a mut DecoderState,
+    input_token: u32,
+    next_position: usize,
+    next_revision: u64,
+}
+
+struct GatedAdapter {
+    model_id: u64,
+    next_state_id: AtomicU64,
+    next_transaction_id: AtomicU64,
+    gate: Arc<CommitGate>,
+    apply_count: Arc<AtomicUsize>,
+    apply_cancel: Option<Arc<ApplyCancelHook>>,
+}
+
+impl GatedAdapter {
+    fn new(gate: Arc<CommitGate>, apply_count: Arc<AtomicUsize>) -> Self {
+        Self {
+            model_id: issue(&NEXT_MODEL_ID, RuntimeError::ModelIdentityExhausted)
+                .expect("test model identity"),
+            next_state_id: AtomicU64::new(1),
+            next_transaction_id: AtomicU64::new(1),
+            gate,
+            apply_count,
+            apply_cancel: None,
+        }
+    }
+
+    fn with_apply_cancel(
+        gate: Arc<CommitGate>,
+        apply_count: Arc<AtomicUsize>,
+        apply_cancel: Arc<ApplyCancelHook>,
+    ) -> Self {
+        Self {
+            apply_cancel: Some(apply_cancel),
+            ..Self::new(gate, apply_count)
+        }
+    }
+}
+
+impl DecoderAdapter for GatedAdapter {
+    type StateLayout = GateStateLayout;
+    type State = DecoderState;
+    type Workspace = ();
+    type PreparedToken = PreparedToken;
+    type ExpertTask = ExpertTask;
+    type ExpertTasks = std::array::IntoIter<ExpertTask, 1>;
+    type ExpertContribution = ExpertContribution;
+    type PendingStateCommit = PendingCommit;
+    type StateCommitPermit<'a> = CommitPermit<'a>;
+
+    fn execution_layout(&self) -> RuntimeResult<AdapterExecutionLayout> {
+        AdapterExecutionLayout::new(
+            1,
+            size_of::<PreparedToken>(),
+            size_of::<ExpertTask>(),
+            size_of::<ExpertContribution>(),
+            size_of::<PendingCommit>(),
+            0,
+            0,
+        )
+    }
+
+    fn vocabulary_size(&self) -> usize {
+        4
+    }
+
+    fn is_stop_token(&self, _token: u32) -> bool {
+        false
+    }
+
+    fn state_layout(
+        &self,
+        max_tokens: usize,
+        page_tokens: usize,
+    ) -> RuntimeResult<GateStateLayout> {
+        if max_tokens == 0 || page_tokens == 0 {
+            return Err(RuntimeError::InvalidStateLayout(
+                "gated test state geometry must be nonzero",
+            ));
+        }
+        let payload_bytes =
+            max_tokens
+                .checked_mul(size_of::<u32>())
+                .ok_or(RuntimeError::ResourceSizeOverflow {
+                    resource: "gated test state payload",
+                })?;
+        let charge_bytes = payload_bytes
+            .checked_add(63)
+            .map(|bytes| bytes / 64 * 64)
+            .ok_or(RuntimeError::ResourceSizeOverflow {
+                resource: "gated test state charge",
+            })?;
+        Ok(GateStateLayout {
+            max_tokens,
+            payload_bytes,
+            charge_bytes,
+        })
+    }
+
+    fn new_state(&self, layout: GateStateLayout) -> RuntimeResult<DecoderState> {
+        let mut tokens = Vec::new();
+        tokens.try_reserve_exact(layout.max_tokens).map_err(|_| {
+            RuntimeError::ResourceExhausted {
+                resource: "gated test state",
+                bytes: layout.payload_bytes,
+            }
+        })?;
+        tokens.resize(layout.max_tokens, 0);
+        Ok(DecoderState {
+            identity: issue(&self.next_state_id, RuntimeError::StateIdentityExhausted)?,
+            revision: 0,
+            position: 0,
+            tokens,
+            apply_count: Arc::clone(&self.apply_count),
+            apply_cancel: self.apply_cancel.as_ref().map(Arc::clone),
+        })
+    }
+
+    fn new_workspace(&self) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn prepare_token(
+        &self,
+        state: &DecoderState,
+        token: u32,
+        _workspace: &mut (),
+    ) -> RuntimeResult<PreparedToken> {
+        if usize::try_from(token).map_or(true, |token| token >= self.vocabulary_size()) {
+            return Err(RuntimeError::InvalidToken {
+                vocab_size: self.vocabulary_size(),
+            });
+        }
+        if state.position >= state.tokens.len() {
+            return Err(RuntimeError::ContextLimit {
+                limit: state.tokens.len(),
+            });
+        }
+        state
+            .revision
+            .checked_add(1)
+            .ok_or(RuntimeError::StateRevisionExhausted)?;
+        let transaction_id = issue(
+            &self.next_transaction_id,
+            RuntimeError::AdapterTransactionIdentityExhausted,
+        )?;
+        Ok(PreparedToken {
+            identity: AdapterWorkIdentity::try_new(
+                transaction_id,
+                self.model_id,
+                state.identity,
+                state.revision,
+                state.position,
+            )?,
+            input_token: token,
+        })
+    }
+
+    fn prepared_identity(&self, prepared: &PreparedToken) -> AdapterWorkIdentity {
+        prepared.identity
+    }
+
+    fn expert_tasks(&self, prepared: &PreparedToken) -> Self::ExpertTasks {
+        [ExpertTask {
+            identity: prepared.identity,
+            input_token: prepared.input_token,
+        }]
+        .into_iter()
+    }
+
+    fn task_identity(&self, task: &ExpertTask) -> AdapterWorkIdentity {
+        task.identity
+    }
+
+    fn task_router_rank(&self, _task: &ExpertTask) -> u16 {
+        0
+    }
+
+    fn task_expert_id(&self, _task: &ExpertTask) -> u16 {
+        0
+    }
+
+    fn execute_expert(
+        &self,
+        task: ExpertTask,
+        _workspace: &mut (),
+    ) -> RuntimeResult<ExpertContribution> {
+        Ok(ExpertContribution {
+            identity: task.identity,
+            input_token: task.input_token,
+        })
+    }
+
+    fn contribution_identity(&self, contribution: &ExpertContribution) -> AdapterWorkIdentity {
+        contribution.identity
+    }
+
+    fn contribution_router_rank(&self, _contribution: &ExpertContribution) -> u16 {
+        0
+    }
+
+    fn contribution_expert_id(&self, _contribution: &ExpertContribution) -> u16 {
+        0
+    }
+
+    fn finish_token(
+        &self,
+        prepared: PreparedToken,
+        contributions: &[ExpertContribution],
+        _workspace: &mut (),
+    ) -> RuntimeResult<PendingCommit> {
+        let [contribution] = contributions else {
+            return Err(RuntimeError::InvalidExpertContribution(
+                "gated test adapter expects one contribution",
+            ));
+        };
+        if contribution.identity != prepared.identity
+            || contribution.input_token != prepared.input_token
+        {
+            return Err(RuntimeError::InvalidExpertContribution(
+                "gated test contribution identity mismatch",
+            ));
+        }
+        let sampled_token = (prepared.input_token + 1) % 4;
+        let mut logits = [0.0_f32; 4];
+        logits[usize::try_from(sampled_token).expect("sampled token index")] = 10.0;
+        Ok(PendingCommit {
+            identity: prepared.identity,
+            input_token: prepared.input_token,
+            logits,
+        })
+    }
+
+    fn pending_identity(&self, pending: &PendingCommit) -> AdapterWorkIdentity {
+        pending.identity
+    }
+
+    fn pending_logits<'a>(&self, pending: &'a PendingCommit) -> &'a [f32] {
+        &pending.logits
+    }
+
+    fn with_validated_state_commit<R, F>(
+        &self,
+        state: &mut DecoderState,
+        pending: &PendingCommit,
+        apply: F,
+    ) -> RuntimeResult<R>
+    where
+        F: for<'permit> FnOnce(CommitPermit<'permit>) -> R,
+    {
+        if pending.identity.model_instance_id() != self.model_id
+            || pending.identity.state_id().get() != state.identity
+            || pending.identity.state_revision() != state.revision
+            || pending.identity.position() != state.position
+        {
+            return Err(RuntimeError::InvalidAdapterWork(
+                "gated test pending identity mismatch",
+            ));
+        }
+        let next_position = state
+            .position
+            .checked_add(1)
+            .ok_or(RuntimeError::StateRevisionExhausted)?;
+        if next_position > state.tokens.len() {
+            return Err(RuntimeError::ContextLimit {
+                limit: state.tokens.len(),
+            });
+        }
+        let next_revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(RuntimeError::StateRevisionExhausted)?;
+
+        self.gate.block_first_callback();
+        Ok(apply(CommitPermit {
+            state,
+            input_token: pending.input_token,
+            next_position,
+            next_revision,
+        }))
+    }
+
+    fn apply_state_commit(permit: CommitPermit<'_>) {
+        if let Some(hook) = &permit.state.apply_cancel {
+            hook.cancel_before_state_mutation();
+        }
+        permit.state.tokens[permit.state.position] = permit.input_token;
+        permit.state.position = permit.next_position;
+        permit.state.revision = permit.next_revision;
+        permit.state.apply_count.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn issue(counter: &AtomicU64, exhausted: RuntimeError) -> RuntimeResult<u64> {
+    let mut candidate = counter.load(Ordering::Relaxed);
+    loop {
+        if candidate == 0 {
+            return Err(exhausted);
+        }
+        let successor = candidate.checked_add(1).unwrap_or(0);
+        match counter.compare_exchange_weak(
+            candidate,
+            successor,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(candidate),
+            Err(observed) => candidate = observed,
+        }
+    }
+}
+
+fn new_engine(
+    gate: Arc<CommitGate>,
+    apply_count: Arc<AtomicUsize>,
+    batch_width: u64,
+) -> SchedulerEngine<GatedAdapter> {
+    let adapter = GatedAdapter::new(gate, apply_count);
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = batch_width;
+    limits.waves_per_step = 1;
+    let config = SchedulerConfig::new(&adapter, limits).expect("gated scheduler config");
+    SchedulerEngine::new(adapter, config).expect("gated scheduler engine")
+}
+
+fn assert_no_active_request_ownership(engine: &SchedulerEngine<GatedAdapter>) {
+    let ledger = engine.ledger_snapshot();
+    for category in [
+        LedgerCategory::PromptStorage,
+        LedgerCategory::ActiveState,
+        LedgerCategory::PendingTransaction,
+    ] {
+        assert_eq!(
+            ledger.category(category).used(),
+            0,
+            "{category} ownership leaked after terminalization"
+        );
+    }
+}
+
+fn assert_all_request_ownership_reaped(
+    engine: &SchedulerEngine<GatedAdapter>,
+    pristine_total_used: u64,
+    pristine_shared_used: u64,
+) {
+    let ledger = engine.ledger_snapshot();
+    assert_eq!(ledger.request_used(), 0);
+    assert_eq!(ledger.shared_used(), pristine_shared_used);
+    assert_eq!(ledger.total_used(), pristine_total_used);
+    for category in LedgerCategory::ALL {
+        if category.ownership() == LedgerOwnership::Request {
+            assert_eq!(
+                ledger.category(category).used(),
+                0,
+                "{category} ownership survived final reap"
+            );
+        }
+    }
+}
+
+#[test]
+fn cancellation_during_adapter_validation_suppresses_commit_and_recovers_ring_credit() {
+    let gate = Arc::new(CommitGate::default());
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let mut engine = new_engine(Arc::clone(&gate), Arc::clone(&apply_count), 2);
+    let pristine = engine.ledger_snapshot();
+
+    let cancelled = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted cancellable request");
+    let sibling = engine
+        .try_submit(RequestSpec::new(&[1], 2, SamplingPolicy::Greedy, None))
+        .expect("accepted sibling request");
+    let control = engine
+        .control_binding(cancelled)
+        .expect("cancellable control binding");
+
+    let worker = thread::spawn(move || {
+        let report = engine
+            .step_with_clock(&|| 0)
+            .expect("gated cancellation step");
+        (engine, report)
+    });
+    gate.wait_until_arrived();
+    assert_eq!(
+        control.cancel().expect("boundary cancellation"),
+        CancelDisposition::Requested
+    );
+    gate.release();
+    let (mut engine, report) = worker.join().expect("scheduler worker");
+
+    assert_eq!(report.selected_positions, 2);
+    assert_eq!(report.committed_positions, 1);
+    assert_eq!(report.terminal_decisions, 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        engine.request_phase(cancelled).expect("cancelled phase"),
+        RequestPhase::Terminal
+    );
+    assert_eq!(
+        engine.request_phase(sibling).expect("sibling phase"),
+        RequestPhase::Ready
+    );
+
+    let recovery = engine.step().expect("ring service after suppression");
+    assert_eq!(recovery.selected_positions, 1);
+    assert_eq!(recovery.committed_positions, 1);
+    assert_eq!(recovery.terminal_decisions, 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 2);
+    assert_no_active_request_ownership(&engine);
+
+    assert!(
+        engine
+            .drain_events(cancelled, usize::MAX)
+            .expect("cancelled output query")
+            .is_empty()
+    );
+    let cancelled_terminal = engine
+        .take_terminal(cancelled)
+        .expect("cancelled terminal query")
+        .expect("cancelled terminal result");
+    assert_eq!(cancelled_terminal.outcome(), TerminalOutcome::Cancelled);
+    assert_eq!(cancelled_terminal.committed_positions(), 0);
+    assert_eq!(cancelled_terminal.emitted_tokens(), 0);
+
+    let sibling_events = engine
+        .drain_events(sibling, usize::MAX)
+        .expect("sibling output drain");
+    assert_eq!(sibling_events.len(), 2);
+    assert_eq!(
+        sibling_events
+            .iter()
+            .map(|event| event.output_index())
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    let sibling_terminal = engine
+        .take_terminal(sibling)
+        .expect("sibling terminal query")
+        .expect("sibling terminal result");
+    assert_eq!(sibling_terminal.outcome(), TerminalOutcome::Completed);
+    assert_eq!(sibling_terminal.committed_positions(), 2);
+    assert_eq!(sibling_terminal.emitted_tokens(), 2);
+    assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn inclusive_deadline_crossing_during_adapter_validation_suppresses_commit() {
+    let gate = Arc::new(CommitGate::default());
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let clock = Arc::new(AtomicU64::new(9));
+    let mut engine = new_engine(Arc::clone(&gate), Arc::clone(&apply_count), 1);
+    let pristine = engine.ledger_snapshot();
+    let request = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, Some(10)))
+        .expect("accepted deadline request");
+
+    let worker_clock = Arc::clone(&clock);
+    let worker = thread::spawn(move || {
+        let report = engine
+            .step_with_clock(&|| worker_clock.load(Ordering::Acquire))
+            .expect("gated deadline step");
+        (engine, report)
+    });
+    gate.wait_until_arrived();
+    clock.store(10, Ordering::Release);
+    gate.release();
+    let (mut engine, report) = worker.join().expect("scheduler worker");
+
+    assert_eq!(report.selected_positions, 1);
+    assert_eq!(report.committed_positions, 0);
+    assert_eq!(report.terminal_decisions, 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 0);
+    assert_eq!(engine.snapshot().monotonic_ns, 10);
+    assert_no_active_request_ownership(&engine);
+    assert!(
+        engine
+            .drain_events(request, usize::MAX)
+            .expect("deadline output query")
+            .is_empty()
+    );
+    let terminal = engine
+        .take_terminal(request)
+        .expect("deadline terminal query")
+        .expect("deadline terminal result");
+    assert_eq!(terminal.outcome(), TerminalOutcome::DeadlineExceeded);
+    assert_eq!(terminal.committed_positions(), 0);
+    assert_eq!(terminal.emitted_tokens(), 0);
+    assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn cancellation_precedes_an_inclusive_deadline_at_the_final_boundary() {
+    let gate = Arc::new(CommitGate::default());
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let clock = Arc::new(AtomicU64::new(9));
+    let mut engine = new_engine(Arc::clone(&gate), Arc::clone(&apply_count), 1);
+    let pristine = engine.ledger_snapshot();
+    let request = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, Some(10)))
+        .expect("accepted precedence request");
+    let control = engine
+        .control_binding(request)
+        .expect("precedence control binding");
+
+    let worker_clock = Arc::clone(&clock);
+    let worker = thread::spawn(move || {
+        let report = engine
+            .step_with_clock(&|| worker_clock.load(Ordering::Acquire))
+            .expect("gated precedence step");
+        (engine, report)
+    });
+    gate.wait_until_arrived();
+    assert_eq!(
+        control.cancel().expect("boundary cancellation"),
+        CancelDisposition::Requested
+    );
+    clock.store(10, Ordering::Release);
+    gate.release();
+    let (mut engine, report) = worker.join().expect("scheduler worker");
+
+    assert_eq!(report.selected_positions, 1);
+    assert_eq!(report.committed_positions, 0);
+    assert_eq!(report.terminal_decisions, 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 0);
+    assert_eq!(engine.snapshot().monotonic_ns, 10);
+    assert_no_active_request_ownership(&engine);
+    assert!(
+        engine
+            .drain_events(request, usize::MAX)
+            .expect("precedence output query")
+            .is_empty()
+    );
+    let terminal = engine
+        .take_terminal(request)
+        .expect("precedence terminal query")
+        .expect("precedence terminal result");
+    assert_eq!(terminal.outcome(), TerminalOutcome::Cancelled);
+    assert_eq!(terminal.committed_positions(), 0);
+    assert_eq!(terminal.emitted_tokens(), 0);
+    assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn cancellation_after_the_final_snapshot_loses_to_the_committed_position() {
+    let gate = Arc::new(CommitGate::passthrough());
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let apply_cancel = Arc::new(ApplyCancelHook::default());
+    let adapter =
+        GatedAdapter::with_apply_cancel(gate, Arc::clone(&apply_count), Arc::clone(&apply_cancel));
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 1;
+    limits.waves_per_step = 1;
+    let config = SchedulerConfig::new(&adapter, limits).expect("late-cancel scheduler config");
+    let mut engine = SchedulerEngine::new(adapter, config).expect("late-cancel scheduler engine");
+    let pristine = engine.ledger_snapshot();
+    let request = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted late-cancel request");
+    apply_cancel.install(
+        engine
+            .control_binding(request)
+            .expect("late-cancel control binding"),
+    );
+
+    let report = engine.step().expect("late-cancel step");
+    assert_eq!(
+        report,
+        StepReport {
+            promoted_requests: 1,
+            waves: 1,
+            selected_positions: 1,
+            expert_tasks: 1,
+            expert_groups: 1,
+            committed_positions: 1,
+            terminal_decisions: 1,
+        }
+    );
+    assert_eq!(
+        apply_cancel.disposition(),
+        Some(Ok(CancelDisposition::Requested))
+    );
+    assert_eq!(apply_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        engine.request_phase(request).expect("late-cancel phase"),
+        RequestPhase::Terminal
+    );
+    assert_eq!(
+        engine
+            .cancel(request)
+            .expect("late-cancel terminal control"),
+        CancelDisposition::AlreadyTerminal
+    );
+    assert_no_active_request_ownership(&engine);
+
+    let events = engine
+        .drain_events(request, usize::MAX)
+        .expect("late-cancel output drain");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].request_id(), request);
+    assert_eq!(events[0].output_index(), 0);
+    assert_eq!(events[0].token(), 1);
+    let terminal = engine
+        .take_terminal(request)
+        .expect("late-cancel terminal query")
+        .expect("late-cancel terminal result");
+    assert_eq!(terminal.outcome(), TerminalOutcome::Completed);
+    assert_eq!(terminal.committed_positions(), 1);
+    assert_eq!(terminal.emitted_tokens(), 1);
+    assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn recycled_engine_slot_rejects_stale_control_without_affecting_its_new_request() {
+    let gate = Arc::new(CommitGate::default());
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let adapter = GatedAdapter::new(Arc::clone(&gate), Arc::clone(&apply_count));
+    let mut limits = SchedulerLimits::tiny();
+    limits.max_outstanding_requests = 1;
+    limits.max_active_requests = 1;
+    limits.max_queued_requests = 1;
+    limits.max_retained_terminal_results = 1;
+    limits.batch_width = 1;
+    limits.waves_per_step = 1;
+    let config = SchedulerConfig::new(&adapter, limits).expect("single-slot scheduler config");
+    let mut engine = SchedulerEngine::new(adapter, config).expect("single-slot scheduler engine");
+    let pristine = engine.ledger_snapshot();
+
+    let first = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted first slot generation");
+    let stale = engine
+        .control_binding(first)
+        .expect("first-generation control binding");
+    let worker = thread::spawn(move || {
+        let report = engine.step().expect("first-generation step");
+        (engine, report)
+    });
+    gate.wait_until_arrived();
+    gate.release();
+    let (mut engine, first_report) = worker.join().expect("scheduler worker");
+    assert_eq!(first_report.committed_positions, 1);
+    assert_eq!(first_report.terminal_decisions, 1);
+    assert_eq!(
+        engine
+            .drain_events(first, usize::MAX)
+            .expect("first-generation output")
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .take_terminal(first)
+            .expect("first-generation terminal query")
+            .expect("first-generation terminal")
+            .outcome(),
+        TerminalOutcome::Completed
+    );
+
+    let current = engine
+        .try_submit(RequestSpec::new(&[1], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted recycled slot generation");
+    assert_ne!(first, current);
+    let stale_error = stale
+        .cancel()
+        .expect_err("stale generation must not cancel");
+    assert_eq!(stale_error.category(), ErrorCategory::InvalidRequest);
+
+    let current_report = engine.step().expect("current-generation step");
+    assert_eq!(current_report.committed_positions, 1);
+    assert_eq!(current_report.terminal_decisions, 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 2);
+    assert_eq!(
+        engine
+            .drain_events(current, usize::MAX)
+            .expect("current-generation output")
+            .len(),
+        1
+    );
+    let terminal = engine
+        .take_terminal(current)
+        .expect("current-generation terminal query")
+        .expect("current-generation terminal");
+    assert_eq!(terminal.outcome(), TerminalOutcome::Completed);
+    assert_eq!(terminal.committed_positions(), 1);
+    assert_eq!(terminal.emitted_tokens(), 1);
+    assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}

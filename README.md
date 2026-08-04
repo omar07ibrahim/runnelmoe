@@ -18,8 +18,11 @@ M5 is in progress. Its published synchronous slice now includes paged
 transactional decoder state, deterministic sampling, bounded FIFO admission,
 equal-weight token-quantum DRR, expert-sorted continuous batches, exact logical
 ownership accounting, output backpressure, deadlines, cancellation, and
-failure-atomic cleanup. The concurrent actor, full stress/differential matrix,
-and preregistered evidence are not complete, so this is not an M5 closure or
+failure-atomic cleanup. Generation-bound atomic controls and a live
+cancel/deadline check inside the adapter's validated commit callback prevent a
+late signal from partially publishing model state, RNG, output, or service
+credit. The concurrent actor, full stress/differential matrix, and
+preregistered evidence are not complete, so this is not an M5 closure or
 performance claim.
 
 The runtime's central contract is simple: a configured

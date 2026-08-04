@@ -525,8 +525,8 @@ one as the other.
 
 Implementation-wide configuration ceilings are 64 workers, 65,536 ordinary
 command slots, 65,536 total outstanding request slots, 4,096 active requests,
-65,536 retained terminal results, 4,096 sequences per batch, 1,024 waves per
-step, 65,536 output events per request, 1,048,576 trace events, 65,536 tokens
+65,536 retained terminal results, 8 sequences per batch, 4 waves per step,
+65,536 output events per request, 1,048,576 trace events, 65,536 tokens
 per state page, 262,144 expert tasks per wave, and 1 TiB of logical ledger
 capacity. Adapter context and vocabulary limits remain independently enforced.
 Zero, exact-ceiling, ceiling-plus-one, multiplication overflow, and host-`usize`
@@ -835,10 +835,12 @@ shuts down, and must match one independently generated event/terminal digest.
 For the race test, the two producers receive their even/odd script subsequences
 behind one start barrier and then run without ordering gates for 32 repetitions;
 it has no fixed event digest or accepted set. Each API operation records
-invocation, an actor/atomic linearization index, and response. An independent
-state machine verifies that every index lies within its operation interval,
-replays the observed total linearization order, and matches all accepts,
-resource-exhausted rejections, cancellations, drains, and terminal outcomes.
+invocation, response, and its operation-specific actor-commit or atomic-CAS
+witness. An independent state machine constructs and verifies a valid
+linearization that is consistent with operation intervals, witnesses, and
+observed outcomes, then matches all accepts, resource-exhausted rejections,
+cancellations, drains, and terminal outcomes. The race harness does not infer
+a total order from an adjacent global counter.
 Every race repetition must resolve each accepted request exactly once, preserve
 committed-token semantics, finish within 4,096 pump turns after producers join,
 resolve every receiver, and end with zero request and shared ledger use. The

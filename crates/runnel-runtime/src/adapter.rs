@@ -334,6 +334,9 @@ pub trait DecoderAdapter: Send + Sync {
     /// Callers must complete every fallible scheduler check and reservation
     /// before this callback. Once it applies the permit, only infallible,
     /// non-panicking publication of already validated control state may follow.
+    /// Dropping an unapplied permit must leave the state unchanged. Schedulers
+    /// rely on that trusted-adapter obligation when a cancellation,
+    /// disconnection, or deadline becomes visible at the final commit boundary.
     fn with_validated_state_commit<R, F>(
         &self,
         state: &mut Self::State,

@@ -7,6 +7,7 @@ use crate::{
         ChargePlan, active_plan, admission_base_plan, map_ledger_error, shared_static_plan,
     },
     config::{MAX_BATCH_WIDTH, SchedulerConfig},
+    control::{ControlBinding, ControlRegistry, ControlSnapshot},
     error::{ErrorCategory, SchedulerError, SchedulerResult},
     id::{
         EngineTransactionIdIssuer, IdentityExhausted, RequestIdIssuer, SlotGenerationIssuer,
@@ -31,6 +32,7 @@ pub struct SchedulerEngine<A: DecoderAdapter> {
     shared_reservation: Option<LedgerReservation>,
     slots: Vec<RequestSlot<A>>,
     free_slots: Vec<usize>,
+    controls: Option<ControlRegistry>,
     queued: VecDeque<SlotKey>,
     ring: Option<DrrRing>,
     request_ids: RequestIdIssuer,
@@ -92,7 +94,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .map_err(map_ledger_error)?;
 
         let allocation = Self::try_allocate_shared(&adapter, &config);
-        let (slots, free_slots, queued, ring, workspace, sampling, wave, service_trace) =
+        let (slots, free_slots, controls, queued, ring, workspace, sampling, wave, service_trace) =
             match allocation {
                 Ok(parts) => parts,
                 Err(error) => {
@@ -113,6 +115,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             shared_reservation: Some(shared_reservation),
             slots,
             free_slots,
+            controls: Some(controls),
             queued,
             ring: Some(ring),
             request_ids: RequestIdIssuer::new(),
@@ -152,6 +155,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             free_slots.push(index);
         }
 
+        let controls = ControlRegistry::try_with_capacity(config.max_outstanding_requests())?;
+
         let mut queued = VecDeque::new();
         try_reserve_deque(
             &mut queued,
@@ -177,6 +182,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         Ok((
             slots,
             free_slots,
+            controls,
             queued,
             ring,
             workspace,
@@ -285,6 +291,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         self.ledger
             .can_acquire(admission_plan.as_slice())
             .map_err(map_ledger_error)?;
+        let prepared_control = self
+            .controls
+            .as_ref()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
+            .prepare()?;
 
         let provisional = self
             .ledger
@@ -330,6 +341,22 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 return Err(map_identity_error(error));
             }
         };
+        let control = match self
+            .controls
+            .as_mut()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
+            .bind(prepared_control)
+        {
+            Ok(control) => control,
+            Err(error) => {
+                let release = self
+                    .ledger
+                    .prepare_release([&prompt_reservation, &retained_reservation])
+                    .map_err(map_ledger_error)?;
+                release.apply();
+                return Err(error);
+            }
+        };
         let key = SlotKey::new(slot_index, generation);
         let record = RequestRecord {
             request_id,
@@ -340,7 +367,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             total_positions,
             sampling: request.sampling(),
             deadline_ns: request.deadline_ns(),
-            cancelled: false,
+            control,
             state_layout,
             state: None,
             active_plan: active_charge_plan,
@@ -374,16 +401,13 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         Ok((owned_prompt, output))
     }
 
-    pub fn cancel(&mut self, id: crate::RequestId) -> SchedulerResult<CancelDisposition> {
-        let record = self.record_mut_by_id(id)?;
-        if record.phase == RequestPhase::Terminal {
-            return Ok(CancelDisposition::AlreadyTerminal);
-        }
-        if record.cancelled {
-            return Ok(CancelDisposition::AlreadyRequested);
-        }
-        record.cancelled = true;
-        Ok(CancelDisposition::Requested)
+    pub fn cancel(&self, id: crate::RequestId) -> SchedulerResult<CancelDisposition> {
+        self.record_by_id(id)?.control.cancel()
+    }
+
+    #[allow(dead_code, reason = "used by the staged Tokio actor integration")]
+    pub(crate) fn control_binding(&self, id: crate::RequestId) -> SchedulerResult<ControlBinding> {
+        Ok(self.record_by_id(id)?.control.clone())
     }
 
     pub fn advance_clock(&mut self, monotonic_ns: u64) -> SchedulerResult<()> {
@@ -395,6 +419,10 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         }
         self.monotonic_ns = monotonic_ns;
         Ok(())
+    }
+
+    fn observe_clock(&mut self, clock: &impl Fn() -> u64) -> u64 {
+        observe_clock_value(&mut self.monotonic_ns, clock)
     }
 
     pub fn request_phase(&self, id: crate::RequestId) -> SchedulerResult<RequestPhase> {
@@ -443,6 +471,18 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     /// Advances bounded admission and executes up to the configured number of
     /// deterministic token waves.
     pub fn step(&mut self) -> SchedulerResult<StepReport> {
+        let fixed_ns = self.monotonic_ns;
+        self.step_with_clock(&|| fixed_ns)
+    }
+
+    /// Runs one step while resampling an origin-relative monotonic clock at
+    /// every control boundary. The actor supplies a live source; the public
+    /// synchronous path above intentionally observes its manually advanced
+    /// value for deterministic tests and embedding.
+    pub(crate) fn step_with_clock<F>(&mut self, clock: &F) -> SchedulerResult<StepReport>
+    where
+        F: Fn() -> u64,
+    {
         self.ensure_open()?;
         if self.adapter.is_none()
             || self.ring.is_none()
@@ -487,6 +527,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             &mut sampling,
             &mut wave,
             &mut trace,
+            clock,
         );
         if result.is_err()
             && let Err(cleanup) = self.recover_wave(&mut ring, &mut wave)
@@ -503,6 +544,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn step_with_resources(
         &mut self,
         adapter: &A,
@@ -511,22 +553,31 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         sampling: &mut SamplingWorkspace,
         wave: &mut WaveScratch<A::PreparedToken, A::ExpertTask, A::ExpertContribution>,
         trace: &mut Vec<ServiceTraceEvent>,
+        clock: &impl Fn() -> u64,
     ) -> SchedulerResult<StepReport> {
         let mut report = StepReport::default();
-        self.resolve_visible_controls(ring, &mut report)?;
+        self.resolve_visible_controls(ring, &mut report, clock)?;
 
         for _ in 0..self.config.waves_per_step() {
-            self.promote_fifo(adapter, ring, &mut report)?;
+            self.promote_fifo(adapter, ring, &mut report, clock)?;
             if ring.is_empty() {
                 break;
             }
-            let selected =
-                self.execute_wave(adapter, ring, workspace, sampling, wave, trace, &mut report)?;
+            let selected = self.execute_wave(
+                adapter,
+                ring,
+                workspace,
+                sampling,
+                wave,
+                trace,
+                &mut report,
+                clock,
+            )?;
             if selected == 0 {
                 break;
             }
             report.waves += 1;
-            self.resolve_visible_controls(ring, &mut report)?;
+            self.resolve_visible_controls(ring, &mut report, clock)?;
         }
         Ok(report)
     }
@@ -535,14 +586,19 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         &mut self,
         ring: &mut DrrRing,
         report: &mut StepReport,
+        clock: &impl Fn() -> u64,
     ) -> SchedulerResult<()> {
         for index in 0..self.slots.len() {
-            let decision = self.slots[index].record.as_ref().and_then(|record| {
-                (record.phase != RequestPhase::Terminal)
-                    .then(|| visible_control_outcome(record, self.monotonic_ns))
-                    .flatten()
-                    .map(|outcome| (record.key, outcome))
-            });
+            let now = self.observe_clock(clock);
+            let decision = if let Some(record) = self.slots[index]
+                .record
+                .as_ref()
+                .filter(|record| record.phase != RequestPhase::Terminal)
+            {
+                visible_control_outcome(record, now)?.map(|outcome| (record.key, outcome))
+            } else {
+                None
+            };
             if let Some((key, outcome)) = decision {
                 self.terminalize_key(ring, key, outcome)?;
                 report.terminal_decisions += 1;
@@ -556,12 +612,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         adapter: &A,
         ring: &mut DrrRing,
         report: &mut StepReport,
+        clock: &impl Fn() -> u64,
     ) -> SchedulerResult<()> {
         while ring.len() < self.config.max_active_requests() {
             let Some(key) = self.queued.front().copied() else {
                 break;
             };
-            let outcome = visible_control_outcome(self.record_for_key(key)?, self.monotonic_ns);
+            let now = self.observe_clock(clock);
+            let outcome = visible_control_outcome(self.record_for_key(key)?, now)?;
             if let Some(outcome) = outcome {
                 self.terminalize_key(ring, key, outcome)?;
                 report.terminal_decisions += 1;
@@ -631,6 +689,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         wave: &mut WaveScratch<A::PreparedToken, A::ExpertTask, A::ExpertContribution>,
         trace: &mut Vec<ServiceTraceEvent>,
         report: &mut StepReport,
+        clock: &impl Fn() -> u64,
     ) -> SchedulerResult<usize> {
         wave.reset().map_err(map_wave_error)?;
         if ring.current_epoch().is_none() && ring.open_round().map_err(map_ring_error)?.is_none() {
@@ -647,7 +706,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 ));
             }
 
-            let control = visible_control_outcome(self.record_for_key(key)?, self.monotonic_ns);
+            let now = self.observe_clock(clock);
+            let control = visible_control_outcome(self.record_for_key(key)?, now)?;
             if control.is_none()
                 && self.record_for_key(key)?.phase == RequestPhase::Ready
                 && self.record_for_key(key)?.output.len()
@@ -895,7 +955,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 let selection = &wave.selections()[selection_index];
                 (selection.slot, selection.adapter_identity)
             };
-            let control = visible_control_outcome(self.record_for_key(key)?, self.monotonic_ns);
+            let now = self.observe_clock(clock);
+            let control = visible_control_outcome(self.record_for_key(key)?, now)?;
             if let Some(category) = failure {
                 self.release_wave_selection(ring, wave, selection_index)?;
                 self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
@@ -944,9 +1005,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 continue;
             }
             self.record_mut_for_key(key)?.phase = RequestPhase::ReadyToCommit;
-            if let Some(outcome) =
-                visible_control_outcome(self.record_for_key(key)?, self.monotonic_ns)
-            {
+            let now = self.observe_clock(clock);
+            if let Some(outcome) = visible_control_outcome(self.record_for_key(key)?, now)? {
                 self.release_wave_selection(ring, wave, selection_index)?;
                 self.terminalize_key(ring, key, outcome)?;
                 report.terminal_decisions += 1;
@@ -963,9 +1023,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                         continue;
                     }
                 };
-            if let Some(outcome) =
-                visible_control_outcome(self.record_for_key(key)?, self.monotonic_ns)
-            {
+            let now = self.observe_clock(clock);
+            if let Some(outcome) = visible_control_outcome(self.record_for_key(key)?, now)? {
                 self.release_wave_selection(ring, wave, selection_index)?;
                 self.terminalize_key(ring, key, outcome)?;
                 report.terminal_decisions += 1;
@@ -983,13 +1042,20 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 reservation,
                 &pending,
                 publication,
+                clock,
             );
             match committed {
-                Ok(post_commit_failure) => {
+                Ok(CommitDisposition::Applied {
+                    post_commit_failure,
+                }) => {
                     report.committed_positions += 1;
                     if post_commit_failure.is_some() || publication.completed {
                         report.terminal_decisions += 1;
                     }
+                }
+                Ok(CommitDisposition::Suppressed(outcome)) => {
+                    self.terminalize_key(ring, key, outcome)?;
+                    report.terminal_decisions += 1;
                 }
                 Err(error) => {
                     let category = error.category();
@@ -1100,7 +1166,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         reservation: crate::ring::ServiceReservation,
         pending: &A::PendingStateCommit,
         publication: TokenPublication,
-    ) -> SchedulerResult<Option<ErrorCategory>> {
+        clock: &impl Fn() -> u64,
+    ) -> SchedulerResult<CommitDisposition> {
         if self.queued.contains(&key) {
             return Err(SchedulerError::internal(
                 "committing request is still present in the admission FIFO",
@@ -1108,10 +1175,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         }
         let slot_index = key.index();
         let trace_capacity = self.config.trace_capacity();
-        let (ledger, slots, trace_overflowed) = (
+        let (ledger, slots, trace_overflowed, monotonic_ns) = (
             &mut self.ledger,
             &mut self.slots,
             &mut self.trace_overflowed,
+            &mut self.monotonic_ns,
         );
         let slot = slots
             .get_mut(slot_index)
@@ -1130,6 +1198,24 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 "commit request phase or position changed",
             ));
         }
+        let control_snapshot = record.control.fresh_snapshot()?;
+        if control_snapshot.terminal() {
+            return Err(SchedulerError::internal(
+                "active request control is already terminal",
+            ));
+        }
+        if trace.capacity() < trace_capacity {
+            return Err(SchedulerError::internal(
+                "service trace capacity changed before commit",
+            ));
+        }
+        if publication.event.is_some()
+            && record.output.capacity() < self.config.output_capacity_per_request()
+        {
+            return Err(SchedulerError::internal(
+                "output queue capacity changed before commit",
+            ));
+        }
         let release = ledger
             .prepare_release(
                 record
@@ -1143,12 +1229,22 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .as_mut()
             .ok_or_else(|| SchedulerError::internal("commit adapter state is missing"))?;
         let request_id = record.request_id;
-        let mut applied = false;
+        let deadline_ns = record.deadline_ns;
+        let control = &record.control;
         let mut terminal_outcome = None;
-        let result = ring
+        let (callback, adapter_result) = ring
             .with_validated_credit_commit(reservation, |mut service_permit| {
+                let mut callback = None;
                 let adapter_result =
                     adapter.with_validated_state_commit(state, pending, |adapter_permit| {
+                        let now = observe_clock_value(monotonic_ns, clock);
+                        let snapshot = control.fresh_snapshot_prevalidated();
+                        if let Some(outcome) = visible_snapshot_outcome(snapshot, deadline_ns, now)
+                        {
+                            drop(adapter_permit);
+                            callback = Some(CommitCallback::Suppressed(outcome));
+                            return;
+                        }
                         A::apply_state_commit(adapter_permit);
                         service_permit.apply();
                         record.committed_positions = publication.next_position;
@@ -1170,18 +1266,19 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                         } else {
                             *trace_overflowed = true;
                         }
-                        applied = true;
+                        callback = Some(CommitCallback::Applied);
                     });
 
-                terminal_outcome = if applied && adapter_result.is_err() {
-                    Some(TerminalOutcome::Failed {
-                        category: ErrorCategory::Internal,
-                    })
-                } else if applied && publication.completed {
-                    Some(TerminalOutcome::Completed)
-                } else {
-                    None
-                };
+                terminal_outcome =
+                    if callback == Some(CommitCallback::Applied) && adapter_result.is_err() {
+                        Some(TerminalOutcome::Failed {
+                            category: ErrorCategory::Internal,
+                        })
+                    } else if callback == Some(CommitCallback::Applied) && publication.completed {
+                        Some(TerminalOutcome::Completed)
+                    } else {
+                        None
+                    };
                 if let Some(outcome) = terminal_outcome {
                     service_permit.remove_member();
                     record.phase = RequestPhase::Terminal;
@@ -1191,8 +1288,9 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                         record.committed_positions,
                         record.emitted_tokens,
                     ));
+                    control.mark_terminal_prevalidated();
                 }
-                adapter_result
+                (callback, adapter_result)
             })
             .map_err(map_ring_error)?;
         if terminal_outcome.is_some() {
@@ -1202,13 +1300,20 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             let _ = record.prompt_reservation.take();
             release.apply();
         }
-        match (applied, result) {
-            (true, Ok(())) => Ok(None),
-            (true, Err(_)) => Ok(Some(ErrorCategory::Internal)),
-            (false, Ok(())) => Err(SchedulerError::internal(
+        match (callback, adapter_result) {
+            (Some(CommitCallback::Suppressed(outcome)), _) => {
+                Ok(CommitDisposition::Suppressed(outcome))
+            }
+            (Some(CommitCallback::Applied), Ok(())) => Ok(CommitDisposition::Applied {
+                post_commit_failure: None,
+            }),
+            (Some(CommitCallback::Applied), Err(_)) => Ok(CommitDisposition::Applied {
+                post_commit_failure: Some(ErrorCategory::Internal),
+            }),
+            (None, Ok(())) => Err(SchedulerError::internal(
                 "adapter returned success without invoking the commit callback",
             )),
-            (false, Err(source)) => Err(SchedulerError::adapter("committing token", source)),
+            (None, Err(source)) => Err(SchedulerError::adapter("committing token", source)),
         }
     }
 
@@ -1274,6 +1379,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 "terminal DRR member has a foreign request identity",
             ));
         }
+        let _ = record.control.fresh_snapshot()?;
         let release = self
             .ledger
             .prepare_release(
@@ -1287,6 +1393,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             let _ = ring.remove(key).map_err(map_ring_error)?;
         }
         self.queued.retain(|queued| *queued != key);
+        record.control.mark_terminal_prevalidated();
         let _ = record.state.take();
         let _ = record.prompt.take();
         let _ = record.active_reservation.take();
@@ -1343,6 +1450,10 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 .ledger
                 .prepare_release([retained])
                 .map_err(map_ledger_error)?;
+            self.controls
+                .as_mut()
+                .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
+                .recycle(&record.control)?;
             let mut record = slot.record.take().ok_or_else(|| {
                 SchedulerError::internal("prevalidated final drain record disappeared")
             })?;
@@ -1424,6 +1535,10 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .ledger
             .prepare_release([reservation])
             .map_err(map_ledger_error)?;
+        self.controls
+            .as_mut()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
+            .recycle(&record.control)?;
         let record = slot
             .record
             .take()
@@ -1459,6 +1574,10 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .ledger
             .prepare_release([retained])
             .map_err(map_ledger_error)?;
+        self.controls
+            .as_mut()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
+            .recycle(&record.control)?;
         let record = slot
             .record
             .take()
@@ -1481,6 +1600,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 && self.sampling.is_none()
                 && self.wave.is_none()
                 && self.service_trace.is_none()
+                && self.controls.is_none()
             {
                 return Ok(ShutdownReport::default());
             }
@@ -1552,6 +1672,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let _ = self.sampling.take();
         let _ = self.service_trace.take();
         let _ = self.adapter.take();
+        let _ = self.controls.take();
         self.slots = Vec::new();
         self.free_slots = Vec::new();
         self.queued = VecDeque::new();
@@ -1607,19 +1728,12 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .find(|record| record.request_id == id)
             .ok_or_else(SchedulerError::request_not_found)
     }
-
-    fn record_mut_by_id(&mut self, id: crate::RequestId) -> SchedulerResult<&mut RequestRecord<A>> {
-        self.slots
-            .iter_mut()
-            .filter_map(|slot| slot.record.as_mut())
-            .find(|record| record.request_id == id)
-            .ok_or_else(SchedulerError::request_not_found)
-    }
 }
 
 type SharedAllocation<A> = (
     Vec<RequestSlot<A>>,
     Vec<usize>,
+    ControlRegistry,
     VecDeque<SlotKey>,
     DrrRing,
     <A as DecoderAdapter>::Workspace,
@@ -1657,7 +1771,7 @@ struct RequestRecord<A: DecoderAdapter> {
     total_positions: usize,
     sampling: runnel_runtime::SamplingPolicy,
     deadline_ns: Option<u64>,
-    cancelled: bool,
+    control: ControlBinding,
     state_layout: A::StateLayout,
     state: Option<A::State>,
     active_plan: ChargePlan<ACTIVE_PLAN_LEN>,
@@ -1684,6 +1798,20 @@ struct TokenPublication {
     next_phase: RequestPhase,
     next_adapter_revision: u64,
     completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitCallback {
+    Applied,
+    Suppressed(TerminalOutcome),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitDisposition {
+    Applied {
+        post_commit_failure: Option<ErrorCategory>,
+    },
+    Suppressed(TerminalOutcome),
 }
 
 impl<A: DecoderAdapter> fmt::Debug for RequestRecord<A> {
@@ -1717,17 +1845,32 @@ struct ServiceTraceEvent {
 fn visible_control_outcome<A: DecoderAdapter>(
     record: &RequestRecord<A>,
     monotonic_ns: u64,
+) -> SchedulerResult<Option<TerminalOutcome>> {
+    let snapshot = record.control.fresh_snapshot()?;
+    Ok(visible_snapshot_outcome(
+        snapshot,
+        record.deadline_ns,
+        monotonic_ns,
+    ))
+}
+
+fn visible_snapshot_outcome(
+    snapshot: ControlSnapshot,
+    deadline_ns: Option<u64>,
+    monotonic_ns: u64,
 ) -> Option<TerminalOutcome> {
-    if record.cancelled {
+    if snapshot.cancelled() || snapshot.disconnected() {
         Some(TerminalOutcome::Cancelled)
-    } else if record
-        .deadline_ns
-        .is_some_and(|deadline| monotonic_ns >= deadline)
-    {
+    } else if deadline_ns.is_some_and(|deadline| monotonic_ns >= deadline) {
         Some(TerminalOutcome::DeadlineExceeded)
     } else {
         None
     }
+}
+
+fn observe_clock_value(last_seen_ns: &mut u64, clock: &impl Fn() -> u64) -> u64 {
+    *last_seen_ns = (*last_seen_ns).max(clock());
+    *last_seen_ns
 }
 
 fn ensure_request_lifecycle_feasible<const BASE: usize, const ACTIVE: usize>(
