@@ -2282,8 +2282,8 @@ mod tests {
     use super::*;
     use crate::common::{
         DropWitnessContext, authenticated_workload, drop_receiver_with_preallocated_witness,
-        finish_receiver, receive_once_with_witness, request_spec, spawn_fresh_actor,
-        validate_shutdown,
+        finish_receiver, finish_receiver_with_preallocated_witness, receive_once_with_witness,
+        request_spec, spawn_fresh_actor, validate_shutdown,
     };
 
     fn valid_identity() -> AcceptedIdentity {
@@ -3478,6 +3478,61 @@ mod tests {
         })
         .await
         .expect("live witness normalization test timed out");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preallocated_cleanup_receiver_never_grows_its_output_buffer() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let workload = authenticated_workload().expect("authenticated workload");
+            let descriptor = &workload.descriptors[0];
+            let capacity = usize::try_from(descriptor.max_new_tokens).expect("output capacity");
+            let fresh = spawn_fresh_actor(&workload.actor_config)
+                .await
+                .expect("fresh actor");
+            let actor = fresh.actor;
+            let probe = fresh.probe;
+            let client = actor.client();
+            let request = request_spec(descriptor).expect("request spec");
+            let (submission, command) = client.try_submit_with_witness(request);
+            CommandWitnessCapture::normalize(command, true).expect("command witness");
+            let handle = submission
+                .expect("submit command")
+                .wait()
+                .await
+                .expect("engine admission");
+            let request_id = handle.request_id();
+            handle.cancel().expect("cleanup cancellation");
+            let cleanup = finish_receiver_with_preallocated_witness(
+                0,
+                handle,
+                Vec::with_capacity(capacity),
+                ActorRequestDropWitnessSink::new(),
+            )
+            .await
+            .expect("preallocated cleanup");
+            assert_eq!(cleanup.terminal.request_id(), request_id);
+            assert_eq!(cleanup.outputs.capacity(), capacity);
+            assert!(cleanup.outputs.len() <= capacity);
+
+            drop(client);
+            let pre_shutdown = probe
+                .wait_quiescent()
+                .await
+                .expect("pre-shutdown quiescence");
+            assert_eq!(pre_shutdown.outstanding_requests, 0);
+            let report = actor.shutdown().await.expect("shutdown");
+            let post_shutdown = probe.snapshot().expect("post-shutdown snapshot");
+            validate_shutdown(
+                report,
+                1,
+                0,
+                post_shutdown.request_bytes,
+                post_shutdown.shared_bytes,
+            )
+            .expect("zero-effect shutdown");
+        })
+        .await
+        .expect("preallocated cleanup test timed out");
     }
 
     #[test]

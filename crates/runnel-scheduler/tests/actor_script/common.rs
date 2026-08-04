@@ -352,10 +352,77 @@ pub(super) async fn finish_receiver(
             return Err("terminal-plus-EOF cleanup disconnect remained generation-live".to_owned());
         }
     };
+    if !matches!(&error, SchedulerError::RequestNotFound) {
+        return Err(format!(
+            "cleanup destructor returned an unexpected error: {error}"
+        ));
+    }
+    Ok(CleanupResult { terminal, outputs })
+}
+
+/// Consumes one cleanup receiver without growing its caller-provided output
+/// storage or allocating a destructor witness after the cleanup interval has
+/// begun. The caller preallocates both values before entering that interval.
+pub(super) async fn finish_receiver_with_preallocated_witness(
+    _client_index: usize,
+    mut handle: RequestHandle,
+    mut outputs: Vec<OutputEvent>,
+    sink: ActorRequestDropWitnessSink,
+) -> HarnessResult<CleanupResult> {
     require(
-        matches!(&error, SchedulerError::RequestNotFound),
-        format!("cleanup destructor returned an unexpected error: {error}"),
+        outputs.is_empty(),
+        "preallocated cleanup output buffer was not empty",
     )?;
+    let output_capacity = outputs.capacity();
+    let request_id = handle.request_id();
+    let terminal = handle
+        .terminal()
+        .await
+        .map_err(|error| format!("cleanup terminal receive failed: {error}"))?;
+    require(
+        terminal.request_id() == request_id,
+        "cleanup terminal identity changed",
+    )?;
+    loop {
+        match handle
+            .recv_output()
+            .await
+            .map_err(|error| format!("cleanup output receive failed: {error}"))?
+        {
+            TryRecvOutput::Output(event) => {
+                require(
+                    event.request_id() == request_id,
+                    "cleanup output identity changed",
+                )?;
+                require(
+                    outputs.len() < output_capacity,
+                    "preallocated cleanup output capacity was exhausted",
+                )?;
+                outputs.push(event);
+            }
+            TryRecvOutput::Eof => break,
+            TryRecvOutput::Empty => {
+                return Err("awaited cleanup receive returned empty".to_owned());
+            }
+        }
+    }
+    let (disconnect, control) =
+        drop_receiver_with_preallocated_witness(handle, sink, DropWitnessContext::Cleanup)?;
+    require(
+        control.is_none(),
+        "terminal-plus-EOF cleanup destructor performed a second control mutation",
+    )?;
+    let error = match disconnect {
+        Err(error) => error,
+        Ok(_) => {
+            return Err("terminal-plus-EOF cleanup disconnect remained generation-live".to_owned());
+        }
+    };
+    if !matches!(&error, SchedulerError::RequestNotFound) {
+        return Err(format!(
+            "cleanup destructor returned an unexpected error: {error}"
+        ));
+    }
     Ok(CleanupResult { terminal, outputs })
 }
 
