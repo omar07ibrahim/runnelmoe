@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Independent bounded semantic primitives for actor race-history captures.
 
-This first layer owns two deliberately narrow responsibilities:
+This layer owns three deliberately narrow responsibilities:
 
 * a deterministic, reason-labelled partial-order DAG with bitset reachability;
 * authentication and exact comparison of the frozen scheduler action program.
+* exact action invocation/response custody and its witnessed partial order.
 
-It does not interpret control words, endpoint witnesses, or terminal outcomes.
-In particular, action ordinals and interval counters are not promoted into a
-global execution order.  The only program order helper in this module adds
-consecutive actions from the same producer.
+It does not interpret command, control-word, object-boundary, or terminal
+witnesses.  Action interval counters are mapped to explicit Invoke and Respond
+nodes; they are never promoted into a counter-derived global execution order.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Any, NoReturn
 from oracle import scheduler
 
 
-MAX_DAG_NODES = 4_096
+MAX_DAG_NODES = 8_192
 MAX_DAG_EDGES = 65_536
 MAX_EDGE_INPUTS = 262_144
 MAX_REASONS_PER_EDGE = 8
@@ -48,6 +48,8 @@ EXPECTED_FIXTURE_FILE_SHA256 = (
 EXPECTED_KIND_COUNTS = (206, 220, 222, 237, 139)
 EXPECTED_PRODUCER_COUNTS = (518, 506)
 EXPECTED_REPETITION_COUNT = 32
+EXPECTED_ACTION_COUNT = 1_024
+EXPECTED_ACTION_COUNTER_FINAL = 2_048
 _SCHEDULER_TO_CAPTURE_KIND = {
     "submit": "submit",
     "cancel": "cancel",
@@ -133,7 +135,9 @@ class ReasonedDAG:
 
         node_count = _plain_int(node_count, "graph node count")
         if node_count < 0 or node_count > MAX_DAG_NODES:
-            _fail("graph node count exceeds the 4096-node limit")
+            _fail(
+                f"graph node count exceeds the {MAX_DAG_NODES}-node limit"
+            )
 
         reason_sets: dict[tuple[int, int], set[str]] = {}
         for input_index, constraint in enumerate(constraints):
@@ -314,6 +318,44 @@ class ActionProgram:
     fixture_file_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class ActionEndpoint:
+    """One explicitly typed action boundary and its graph-node identity."""
+
+    counter: int
+    node: int
+    action_ordinal: int
+    producer: int
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActionEndpoints:
+    """The immutable Invoke/Respond node pair for one action."""
+
+    ordinal: int
+    producer: int
+    invocation: ActionEndpoint
+    response: ActionEndpoint
+
+
+@dataclass(frozen=True, slots=True)
+class ActionEndpointMapping:
+    """Exact endpoint lookup by action, counter, and graph node."""
+
+    by_action: tuple[ActionEndpoints, ...]
+    by_counter: tuple[ActionEndpoint, ...]
+    by_node: tuple[ActionEndpoint, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ActionIntervalOrder:
+    """Validated endpoint custody and its reason-labelled partial order."""
+
+    endpoints: ActionEndpointMapping
+    graph: ReasonedDAG
+
+
 def _normalize_generated_action(raw: Any, expected_ordinal: int) -> StaticAction:
     if not isinstance(raw, dict):
         _fail(f"regenerated action {expected_ordinal} is not an object")
@@ -430,7 +472,10 @@ def regenerate_authenticated_action_program() -> ActionProgram:
 
     if scheduler.ACTION_KINDS != ("submit", "cancel", "drop", "drain", "wake"):
         _fail("scheduler action kind codebook differs from the frozen codebook")
-    if len(generated) != scheduler.ACTION_COUNT or scheduler.ACTION_COUNT != 1_024:
+    if (
+        len(generated) != scheduler.ACTION_COUNT
+        or scheduler.ACTION_COUNT != EXPECTED_ACTION_COUNT
+    ):
         _fail("regenerated scheduler action count is not 1024")
     generated_identity = scheduler.sequence_identity(generated)
     if generated_identity != fixture["action_vectors"]["digest"]:
@@ -571,6 +616,199 @@ def verify_capture_static_actions(capture: Any) -> ActionProgram:
     for repetition in repetitions:
         _verify_repetition_static_actions(repetition, program)
     return program
+
+
+def _build_action_interval_order(
+    actions: Sequence[Any],
+    action_counter_final: Any,
+    *,
+    expected_action_count: int,
+) -> ActionIntervalOrder:
+    """Build the exact endpoint graph for one bounded action sequence.
+
+    The configurable count exists so tests can differentially exercise this
+    production construction on small histories.  The public entry point below
+    always supplies the frozen 1,024-action corpus gate.
+    """
+
+    expected_action_count = _plain_int(
+        expected_action_count,
+        "expected action count",
+    )
+    if (
+        expected_action_count < 1
+        or expected_action_count * 2 > MAX_DAG_NODES
+    ):
+        _fail("expected action count exceeds the bounded endpoint graph")
+    if not isinstance(actions, tuple):
+        _fail("decoded actions must be an immutable tuple")
+    if len(actions) != expected_action_count:
+        _fail(
+            "observed action count differs: "
+            f"expected {expected_action_count}, observed {len(actions)}"
+        )
+
+    expected_counter_final = expected_action_count * 2
+    action_counter_final = _plain_int(
+        action_counter_final,
+        "action_counter_final",
+    )
+    if action_counter_final != expected_counter_final:
+        _fail(f"action_counter_final must be exactly {expected_counter_final}")
+
+    endpoint_slots: list[ActionEndpoint | None] = [
+        None
+    ] * action_counter_final
+    by_action: list[ActionEndpoints] = []
+    by_node: list[ActionEndpoint] = []
+    constraints: list[EdgeConstraint] = []
+    last_response_by_producer: list[ActionEndpoint | None] = [None, None]
+
+    for position, action in enumerate(actions):
+        try:
+            ordinal = _plain_int(action.ordinal, f"action {position} ordinal")
+            producer = _plain_int(
+                action.producer,
+                f"action {position} producer",
+            )
+            invocation_counter = _plain_int(
+                action.invocation,
+                f"action {position} invocation",
+            )
+            response_counter = _plain_int(
+                action.response,
+                f"action {position} response",
+            )
+        except AttributeError:
+            _fail(f"action {position} lacks interval fields")
+
+        if ordinal != position:
+            _fail(f"action {position} is out of ordinal order")
+        if producer not in (0, 1):
+            _fail(f"action {position} has an invalid producer")
+        if not 1 <= invocation_counter <= action_counter_final:
+            _fail(f"action {position} invocation is outside the exact counter range")
+        if not 1 <= response_counter <= action_counter_final:
+            _fail(f"action {position} response is outside the exact counter range")
+        if invocation_counter >= response_counter:
+            _fail(f"action {position} response must follow its invocation")
+
+        invocation = ActionEndpoint(
+            invocation_counter,
+            position * 2,
+            ordinal,
+            producer,
+            "invoke",
+        )
+        response = ActionEndpoint(
+            response_counter,
+            position * 2 + 1,
+            ordinal,
+            producer,
+            "respond",
+        )
+        for endpoint in (invocation, response):
+            slot = endpoint.counter - 1
+            previous_endpoint = endpoint_slots[slot]
+            if previous_endpoint is not None:
+                _fail(
+                    f"action endpoint counter {endpoint.counter} is duplicated"
+                )
+            endpoint_slots[slot] = endpoint
+
+        previous_response = last_response_by_producer[producer]
+        if (
+            previous_response is not None
+            and previous_response.counter >= invocation.counter
+        ):
+            _fail(
+                f"producer {producer} action intervals violate program order"
+            )
+
+        interval = ActionEndpoints(ordinal, producer, invocation, response)
+        by_action.append(interval)
+        by_node.extend((invocation, response))
+        constraints.append(
+            EdgeConstraint(
+                invocation.node,
+                response.node,
+                "action-invocation-before-response",
+            )
+        )
+        if previous_response is not None:
+            constraints.append(
+                EdgeConstraint(
+                    previous_response.node,
+                    invocation.node,
+                    f"producer-{producer}-program-order",
+                )
+            )
+        last_response_by_producer[producer] = response
+
+    missing_counter = next(
+        (
+            counter
+            for counter, endpoint in enumerate(endpoint_slots, start=1)
+            if endpoint is None
+        ),
+        None,
+    )
+    if missing_counter is not None:
+        _fail(f"action endpoint counter {missing_counter} is missing")
+    by_counter = tuple(
+        endpoint for endpoint in endpoint_slots if endpoint is not None
+    )
+
+    # Scan the exact counter sequence once.  For each invocation, only the
+    # latest earlier response from the other producer is needed: producer
+    # program order makes every earlier response from that producer reach it.
+    # This is O(actions * producer_count), not O(actions^2).
+    latest_response_by_producer: list[ActionEndpoint | None] = [None, None]
+    for endpoint in by_counter:
+        if endpoint.kind == "respond":
+            latest_response_by_producer[endpoint.producer] = endpoint
+            continue
+        for producer, latest_response in enumerate(
+            latest_response_by_producer
+        ):
+            if producer == endpoint.producer or latest_response is None:
+                continue
+            constraints.append(
+                EdgeConstraint(
+                    latest_response.node,
+                    endpoint.node,
+                    f"producer-{producer}-latest-response-before-invocation",
+                )
+            )
+
+    mapping = ActionEndpointMapping(
+        tuple(by_action),
+        by_counter,
+        tuple(by_node),
+    )
+    graph = ReasonedDAG.build(action_counter_final, constraints)
+    return ActionIntervalOrder(mapping, graph)
+
+
+def build_action_interval_order(repetition: Any) -> ActionIntervalOrder:
+    """Authenticate, validate, and order one exact action counter history."""
+
+    program = regenerate_authenticated_action_program()
+    _verify_repetition_static_actions(repetition, program)
+    try:
+        actions = repetition.actions
+        diagnostics = repetition.diagnostics
+    except AttributeError:
+        _fail("decoded repetition lacks action interval custody fields")
+    try:
+        action_counter_final = diagnostics.action_counter_final
+    except AttributeError:
+        _fail("decoded repetition lacks action_counter_final")
+    return _build_action_interval_order(
+        actions,
+        action_counter_final,
+        expected_action_count=EXPECTED_ACTION_COUNT,
+    )
 
 
 def producer_action_interval_edges(
