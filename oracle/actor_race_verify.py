@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """Independent bounded semantic primitives for actor race-history captures.
 
-This layer owns four deliberately narrow responsibilities:
+This layer owns five deliberately narrow responsibilities:
 
 * a deterministic, reason-labelled partial-order DAG with bitset reachability;
 * authentication and exact comparison of the frozen scheduler action program;
 * exact action invocation/response custody and its witnessed partial order;
-* submission-command custody and an explicit event graph for admission results.
+* submission-command custody and an explicit event graph for admission results;
+* immutable accepted-identity projection and target lookup/access custody.
 
-It does not yet interpret later control operations, output-pop boundaries, or
-terminal witnesses.  Action interval counters are mapped to explicit Invoke
-and Respond nodes; they are never promoted into a counter-derived global
-execution order.  In particular, consuming an actor command response is a
-separate CommandRelease event, never an alias for either ActorCommandRespond
-publication or the action's final Respond counter.
+It does not yet interpret packed control-word transitions, output drain-count
+chains, terminal witnesses, or observation conservation.  Action interval
+counters are mapped to explicit Invoke and Respond nodes; they are never
+promoted into a counter-derived global execution order.  In particular,
+consuming an actor command response is a separate CommandRelease event, never
+an alias for either ActorCommandRespond publication or the action's final
+Respond counter.
 """
 
 from __future__ import annotations
@@ -60,6 +62,7 @@ EXPECTED_ACTION_COUNTER_FINAL = 2_048
 EXPECTED_SUBMIT_COUNT = 206
 EXPECTED_IN_RANGE_SUBMIT_COUNT = 64
 EXPECTED_EXHAUSTED_SUBMIT_COUNT = 142
+EXPECTED_TARGET_ACTION_COUNT = sum(EXPECTED_KIND_COUNTS[1:4])
 
 # Exact schema maximum for the finished event model.  Several classes are not
 # allocated by the submission-only layer yet, but reserving and checking their
@@ -113,7 +116,7 @@ def _fail(message: str) -> NoReturn:
 
 
 def _plain_int(value: Any, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         _fail(f"{label} must be an integer")
     return value
 
@@ -456,6 +459,61 @@ class SubmissionProtocolOrder:
     rejected_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class AcceptedIdentityProjection:
+    """One accepted client and its complete immutable published identity."""
+
+    client_index: int
+    request_id: int
+    control_slot: int
+    control_generation: int
+    endpoint_slot: int
+    endpoint_generation: int
+    submission: SubmitEventNodes
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedIdentityMapping:
+    """Exact accepted-identity lookup without exposing mutable dictionaries."""
+
+    by_client_index: tuple[AcceptedIdentityProjection | None, ...]
+    by_request_id: tuple[AcceptedIdentityProjection, ...]
+    by_control_slot: tuple[tuple[AcceptedIdentityProjection, ...], ...]
+    by_endpoint_slot: tuple[tuple[AcceptedIdentityProjection, ...], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TargetActionEvent:
+    """The one concrete main event reconstructed for a targeted action."""
+
+    action_ordinal: int
+    client_index: int
+    action_kind: str
+    resolution: str
+    identity: AcceptedIdentityProjection | None
+    prior_receiver_drop_action: int | None
+    event: ProtocolEvent
+
+
+@dataclass(frozen=True, slots=True)
+class TargetAccessMapping:
+    """Immutable target-event lookup by action and accepted client."""
+
+    identities: AcceptedIdentityMapping
+    by_action: tuple[TargetActionEvent | None, ...]
+    by_client_index: tuple[tuple[TargetActionEvent, ...], ...]
+    target_events: tuple[ProtocolEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TargetAccessOrder:
+    """Submission custody extended through target lookup or object access."""
+
+    submission_order: SubmissionProtocolOrder
+    targets: TargetAccessMapping
+    graph: ReasonedDAG
+
+
 class _ProtocolGraphPlanner:
     """Bound protocol node and edge allocation before retaining each input."""
 
@@ -511,6 +569,11 @@ class _ProtocolGraphPlanner:
             "ControlBind",
             "EndpointBind",
             "RegistryPublish",
+            "TargetLookup",
+            "ControlCancel",
+            "ControlDisconnect",
+            "PrimaryEndpointPop",
+            "CachedEofRead",
         }:
             _fail("protocol event kind is unsupported")
         if self._next_node >= MAX_PROTOCOL_NODES:
@@ -1019,8 +1082,6 @@ def _build_action_interval_order(
 def build_action_interval_order(repetition: Any) -> ActionIntervalOrder:
     """Authenticate, validate, and order one exact action counter history."""
 
-    program = regenerate_authenticated_action_program()
-    _verify_repetition_static_actions(repetition, program)
     try:
         actions = repetition.actions
         diagnostics = repetition.diagnostics
@@ -1030,6 +1091,9 @@ def build_action_interval_order(repetition: Any) -> ActionIntervalOrder:
         action_counter_final = diagnostics.action_counter_final
     except AttributeError:
         _fail("decoded repetition lacks action_counter_final")
+    _require_exact_decoded_actions(actions)
+    program = regenerate_authenticated_action_program()
+    _verify_static_actions(actions, program)
     return _build_action_interval_order(
         actions,
         action_counter_final,
@@ -1081,6 +1145,13 @@ _SATURATED_SUBMIT_ERROR = actor_race_history.CapturedError(
     16,
     16,
 )
+_STALE_TARGET_ERROR = actor_race_history.CapturedError(
+    "request_not_found",
+    "invalid_request",
+    None,
+    None,
+    None,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1093,11 +1164,35 @@ class _ValidatedSubmit:
     accepted: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedTarget:
+    action_ordinal: int
+    client_index: int
+    action_kind: str
+    resolution: str
+    event_kind: str
+    identity: AcceptedIdentityProjection | None
+    prior_receiver_drop_action: int | None
+
+
 def _field(value: Any, name: str, label: str) -> Any:
     try:
         return getattr(value, name)
     except AttributeError:
         _fail(f"{label} lacks field {name}")
+
+
+def _require_exact_decoded_actions(actions: Any) -> tuple[Any, ...]:
+    """Seal full-history entry points against sequence/action TOCTOU values."""
+
+    if type(actions) is not tuple:
+        _fail("decoded actions must be an exact immutable tuple")
+    if len(actions) != EXPECTED_ACTION_COUNT:
+        _fail("decoded action corpus must contain exactly 1024 entries")
+    for ordinal, action in enumerate(actions):
+        if type(action) is not actor_race_history.Action:
+            _fail(f"decoded action {ordinal} has an invalid exact type")
+    return actions
 
 
 def _exact_typed_value(value: Any, expected: Any, label: str) -> None:
@@ -1233,14 +1328,10 @@ def _validate_accepted_witness(
 
 
 def _validate_shutdown(
-    repetition: Any,
+    shutdown: Any,
     accepted_count: int,
     rejected_count: int,
 ) -> None:
-    try:
-        shutdown = repetition.shutdown
-    except AttributeError:
-        _fail("decoded repetition lacks shutdown accounting")
     if type(shutdown) is not actor_race_history.Shutdown:
         _fail("shutdown accounting has an invalid decoded type")
 
@@ -1275,17 +1366,13 @@ def _validate_shutdown(
 
 
 def _validate_submission_custody(
-    repetition: Any,
+    actions: tuple[Any, ...],
+    shutdown: Any,
     program: ActionProgram,
 ) -> tuple[tuple[_ValidatedSubmit, ...], int, int]:
     """Validate exact command coverage and admission-result identities."""
 
-    try:
-        actions = repetition.actions
-    except AttributeError:
-        _fail("decoded repetition lacks its action sequence")
-    if not isinstance(actions, tuple):
-        _fail("decoded actions must be an immutable tuple")
+    _require_exact_decoded_actions(actions)
 
     expected_in_range = {
         action.ordinal
@@ -1449,17 +1536,19 @@ def _validate_submission_custody(
 
     accepted_count = next_request_id - 1
     rejected_count = EXPECTED_IN_RANGE_SUBMIT_COUNT - accepted_count
-    _validate_shutdown(repetition, accepted_count, rejected_count)
+    _validate_shutdown(shutdown, accepted_count, rejected_count)
     return tuple(records), accepted_count, rejected_count
 
 
 def _build_submission_protocol_order(
-    repetition: Any,
+    actions: tuple[Any, ...],
+    shutdown: Any,
     program: ActionProgram,
     interval_order: ActionIntervalOrder,
 ) -> SubmissionProtocolOrder:
     records, accepted_count, rejected_count = _validate_submission_custody(
-        repetition,
+        actions,
+        shutdown,
         program,
     )
     planner = _ProtocolGraphPlanner(interval_order.graph.node_count)
@@ -1649,19 +1738,751 @@ def build_submission_protocol_order(repetition: Any) -> SubmissionProtocolOrder:
     program or bypass frozen fixture and count gates.
     """
 
-    program = regenerate_authenticated_action_program()
-    _verify_repetition_static_actions(repetition, program)
     try:
         actions = repetition.actions
-        action_counter_final = repetition.diagnostics.action_counter_final
+        diagnostics = repetition.diagnostics
+        shutdown = repetition.shutdown
+        action_counter_final = diagnostics.action_counter_final
     except AttributeError:
         _fail("decoded repetition lacks submission protocol custody fields")
+    _require_exact_decoded_actions(actions)
+    program = regenerate_authenticated_action_program()
+    _verify_static_actions(actions, program)
     interval_order = _build_action_interval_order(
         actions,
         action_counter_final,
         expected_action_count=EXPECTED_ACTION_COUNT,
     )
-    return _build_submission_protocol_order(repetition, program, interval_order)
+    return _build_submission_protocol_order(
+        actions,
+        shutdown,
+        program,
+        interval_order,
+    )
+
+
+def _build_accepted_identity_mapping(
+    actions: tuple[Any, ...],
+    submission_order: SubmissionProtocolOrder,
+) -> AcceptedIdentityMapping:
+    """Project every accepted submit onto immutable client/object indexes."""
+
+    _require_exact_decoded_actions(actions)
+
+    by_client: list[AcceptedIdentityProjection | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    projections: list[AcceptedIdentityProjection] = []
+    control_slots: list[list[AcceptedIdentityProjection]] = [
+        [] for _ in range(16)
+    ]
+    endpoint_slots: list[list[AcceptedIdentityProjection]] = [
+        [] for _ in range(16)
+    ]
+
+    for submission in submission_order.submissions.by_ready_sequence:
+        if not submission.accepted:
+            continue
+        action = actions[submission.action_ordinal]
+        label = f"accepted submit action {submission.action_ordinal}"
+        client_index = _plain_int(
+            _field(action, "client_index", label),
+            f"{label} client_index",
+        )
+        if client_index != submission.submit_attempt:
+            _fail(f"{label} client identity differs from its submit attempt")
+        if client_index < 0 or client_index >= EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail(f"{label} client_index is outside 0..63")
+        witness = _field(action, "accepted", label)
+        if type(witness) is not actor_race_history.AcceptedWitness:
+            _fail(f"{label} accepted witness has an invalid decoded type")
+        if (
+            submission.control_bind is None
+            or submission.endpoint_bind is None
+            or submission.registry_publish is None
+        ):
+            _fail(f"{label} submission event projection is incomplete")
+        projection = AcceptedIdentityProjection(
+            client_index,
+            _plain_int(witness.request_id, f"{label} request_id"),
+            _plain_int(witness.control_slot, f"{label} control_slot"),
+            _plain_int(
+                witness.control_generation,
+                f"{label} control_generation",
+            ),
+            _plain_int(witness.endpoint_slot, f"{label} endpoint_slot"),
+            _plain_int(
+                witness.endpoint_generation,
+                f"{label} endpoint_generation",
+            ),
+            submission,
+        )
+        if by_client[client_index] is not None:
+            _fail(f"accepted client {client_index} is duplicated")
+        by_client[client_index] = projection
+        projections.append(projection)
+        control_slots[projection.control_slot].append(projection)
+        endpoint_slots[projection.endpoint_slot].append(projection)
+
+    by_request_id = tuple(sorted(projections, key=lambda item: item.request_id))
+    if tuple(item.request_id for item in by_request_id) != tuple(
+        range(1, submission_order.accepted_count + 1)
+    ):
+        _fail("accepted identity projection is not exactly indexed by request ID")
+    if len(by_request_id) != submission_order.accepted_count:
+        _fail("accepted identity projection count differs from submissions")
+
+    by_control_slot = tuple(
+        tuple(sorted(slot, key=lambda item: item.control_generation))
+        for slot in control_slots
+    )
+    by_endpoint_slot = tuple(
+        tuple(sorted(slot, key=lambda item: item.endpoint_generation))
+        for slot in endpoint_slots
+    )
+    for slot_index, slot in enumerate(by_control_slot):
+        if tuple(item.control_generation for item in slot) != tuple(
+            range(1, len(slot) + 1)
+        ):
+            _fail(
+                f"accepted control slot {slot_index} projection is not contiguous"
+            )
+    for slot_index, slot in enumerate(by_endpoint_slot):
+        if tuple(item.endpoint_generation for item in slot) != tuple(
+            range(1, len(slot) + 1)
+        ):
+            _fail(
+                f"accepted endpoint slot {slot_index} projection is not contiguous"
+            )
+
+    return AcceptedIdentityMapping(
+        tuple(by_client),
+        by_request_id,
+        by_control_slot,
+        by_endpoint_slot,
+    )
+
+
+def _validate_hex64_word(value: Any, label: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 16
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        _fail(f"{label} must be exactly 16 lowercase hexadecimal digits")
+    return value
+
+
+def _validate_output_identity(
+    output: Any,
+    identity: AcceptedIdentityProjection,
+    label: str,
+) -> actor_race_history.Output:
+    if type(output) is not actor_race_history.Output:
+        _fail(f"{label} has an invalid decoded type")
+    request_id = _plain_int(output.request_id, f"{label} request_id")
+    output_index = _plain_int(output.output_index, f"{label} output_index")
+    token_id = _plain_int(output.token_id, f"{label} token_id")
+    if request_id != identity.request_id:
+        _fail(f"{label} differs from its accepted request identity")
+    if output_index < 0:
+        _fail(f"{label} output_index must be nonnegative")
+    if token_id < 0 or token_id > actor_race_history.UINT32_MAX:
+        _fail(f"{label} token_id is outside the u32 range")
+    return output
+
+
+def _validate_control_target(
+    action: Any,
+    ordinal: int,
+    identity: AcceptedIdentityProjection,
+    operation: str,
+) -> actor_race_history.ControlWitness:
+    label = f"{operation} action {ordinal} control witness"
+    control = _field(action, "control", label)
+    if type(control) is not actor_race_history.ControlWitness:
+        _fail(f"{label} has an invalid decoded type")
+    if type(control.operation) is not str or control.operation != operation:
+        _fail(f"{label} has the wrong operation")
+    if not _plain_bool(control.boundary, f"{label} boundary"):
+        _fail(f"{label} omitted its reached boundary")
+    slot = _plain_int(control.slot, f"{label} slot")
+    generation = _plain_int(
+        control.expected_generation,
+        f"{label} expected_generation",
+    )
+    if (slot, generation) != (
+        identity.control_slot,
+        identity.control_generation,
+    ):
+        _fail(f"{label} differs from its accepted control identity")
+    _validate_hex64_word(control.loaded_word, f"{label} loaded_word")
+    _validate_hex64_word(control.resulting_word, f"{label} resulting_word")
+    if control.disposition is not None and type(control.disposition) is not str:
+        _fail(f"{label} disposition must be a string or null")
+    return control
+
+
+def _validate_pop_target(
+    pop: Any,
+    identity: AcceptedIdentityProjection,
+    expected_kind: str,
+    label: str,
+) -> actor_race_history.PopWitness:
+    if type(pop) is not actor_race_history.PopWitness:
+        _fail(f"{label} has an invalid decoded type")
+    if type(pop.kind) is not str or pop.kind != expected_kind:
+        _fail(f"{label} has the wrong endpoint-pop kind")
+    if not _plain_bool(pop.boundary, f"{label} boundary"):
+        _fail(f"{label} omitted its reached boundary")
+    slot = _plain_int(pop.slot, f"{label} slot")
+    generation = _plain_int(pop.generation, f"{label} generation")
+    if (slot, generation) != (
+        identity.endpoint_slot,
+        identity.endpoint_generation,
+    ):
+        _fail(f"{label} differs from its accepted endpoint identity")
+    drained_before = _plain_int(
+        pop.drained_before,
+        f"{label} drained_before",
+    )
+    drained_after = _plain_int(
+        pop.drained_after,
+        f"{label} drained_after",
+    )
+    if drained_before < 0 or drained_after < 0:
+        _fail(f"{label} drain counts must be nonnegative")
+    if pop.output is not None:
+        _validate_output_identity(pop.output, identity, f"{label} output")
+    return pop
+
+
+def _validate_target_common_sentinels(action: Any, ordinal: int) -> None:
+    label = f"target action {ordinal}"
+    _exact_typed_value(
+        _field(action, "command", label),
+        _COMMAND_SENTINEL,
+        f"{label} command witness",
+    )
+    _exact_typed_value(
+        _field(action, "accepted", label),
+        _ACCEPTED_SENTINEL,
+        f"{label} accepted witness",
+    )
+    _exact_typed_value(
+        _field(action, "wake", label),
+        _WAKE_SENTINEL,
+        f"{label} wake witness",
+    )
+
+
+def _require_target_request_id(
+    action: Any,
+    ordinal: int,
+    identity: AcceptedIdentityProjection,
+) -> int:
+    request_id = _plain_int(
+        _field(action, "request_id", f"target action {ordinal}"),
+        f"target action {ordinal} request_id",
+    )
+    if request_id != identity.request_id:
+        _fail(
+            f"target action {ordinal} request ID differs from its accepted client"
+        )
+    return request_id
+
+
+def _validate_cancel_target(
+    action: Any,
+    ordinal: int,
+    client_index: int,
+    identity: AcceptedIdentityProjection | None,
+) -> _ValidatedTarget:
+    label = f"cancel action {ordinal}"
+    _validate_target_common_sentinels(action, ordinal)
+    if _field(action, "output", label) is not None:
+        _fail(f"{label} retained an output")
+    _exact_typed_value(
+        _field(action, "primary_pop", label),
+        _PRIMARY_POP_SENTINEL,
+        f"{label} primary-pop witness",
+    )
+    _exact_typed_value(
+        _field(action, "opportunistic_eof_pop", label),
+        _OPPORTUNISTIC_POP_SENTINEL,
+        f"{label} opportunistic-pop witness",
+    )
+    if _plain_bool(_field(action, "cached_eof", label), f"{label} cached_eof"):
+        _fail(f"{label} retained cached EOF state")
+
+    result = _field(action, "result", label)
+    if type(result) is not str:
+        _fail(f"{label} result must be a string")
+    error = _field(action, "error", label)
+    if result == "target_unavailable":
+        if error is not None or _field(action, "request_id", label) is not None:
+            _fail(f"{label} unavailable spelling retained target state")
+        _exact_typed_value(
+            _field(action, "control", label),
+            _CONTROL_SENTINEL,
+            f"{label} control witness",
+        )
+        return _ValidatedTarget(
+            ordinal,
+            client_index,
+            "cancel",
+            "absent",
+            "TargetLookup",
+            identity,
+            None,
+        )
+
+    if identity is None:
+        _fail(f"{label} called an unaccepted client")
+    _require_target_request_id(action, ordinal, identity)
+    control = _validate_control_target(action, ordinal, identity, "cancel")
+    dispositions = {
+        "cancel_requested": "requested",
+        "cancel_already_requested": "already_requested",
+        "cancel_already_terminal": "already_terminal",
+    }
+    if result == "error":
+        _exact_typed_value(error, _STALE_TARGET_ERROR, f"{label} stale error")
+        if control.disposition is not None:
+            _fail(f"{label} stale control retained a disposition")
+    else:
+        expected_disposition = dispositions.get(result)
+        if expected_disposition is None:
+            _fail(f"{label} has an invalid found-target result")
+        if error is not None or control.disposition != expected_disposition:
+            _fail(f"{label} result and control disposition disagree")
+    return _ValidatedTarget(
+        ordinal,
+        client_index,
+        "cancel",
+        "cancel_authority",
+        "ControlCancel",
+        identity,
+        None,
+    )
+
+
+def _validate_receiver_drop_target(
+    action: Any,
+    ordinal: int,
+    client_index: int,
+    state: str,
+    identity: AcceptedIdentityProjection | None,
+    prior_drop: int | None,
+) -> _ValidatedTarget:
+    label = f"receiver-drop action {ordinal}"
+    _validate_target_common_sentinels(action, ordinal)
+    if _field(action, "error", label) is not None:
+        _fail(f"{label} retained an error")
+    if _field(action, "output", label) is not None:
+        _fail(f"{label} retained an output")
+    _exact_typed_value(
+        _field(action, "primary_pop", label),
+        _PRIMARY_POP_SENTINEL,
+        f"{label} primary-pop witness",
+    )
+    _exact_typed_value(
+        _field(action, "opportunistic_eof_pop", label),
+        _OPPORTUNISTIC_POP_SENTINEL,
+        f"{label} opportunistic-pop witness",
+    )
+    if _plain_bool(_field(action, "cached_eof", label), f"{label} cached_eof"):
+        _fail(f"{label} retained cached EOF state")
+    result = _field(action, "result", label)
+    if type(result) is not str:
+        _fail(f"{label} result must be a string")
+
+    if state in ("absent", "consumed"):
+        if result != "target_unavailable":
+            _fail(f"{label} called a receiver that is {state}")
+        _exact_typed_value(
+            _field(action, "control", label),
+            _CONTROL_SENTINEL,
+            f"{label} control witness",
+        )
+        if state == "absent":
+            if _field(action, "request_id", label) is not None:
+                _fail(f"{label} absent lookup retained a request ID")
+            resolution = "absent"
+            resolved_identity = identity
+            consumed_by = None
+        else:
+            if identity is None or prior_drop is None:
+                _fail(f"{label} consumed receiver lacks its prior ownership proof")
+            _require_target_request_id(action, ordinal, identity)
+            resolution = "receiver_consumed"
+            resolved_identity = identity
+            consumed_by = prior_drop
+        return _ValidatedTarget(
+            ordinal,
+            client_index,
+            "receiver_drop",
+            resolution,
+            "TargetLookup",
+            resolved_identity,
+            consumed_by,
+        )
+
+    if state != "owned" or identity is None:
+        _fail(f"{label} has an invalid receiver state")
+    if result != "receiver_dropped":
+        _fail(f"{label} did not consume its owned receiver")
+    _require_target_request_id(action, ordinal, identity)
+    control = _validate_control_target(action, ordinal, identity, "disconnect")
+    if control.disposition not in {
+        "requested",
+        "already_requested",
+        "already_terminal",
+    }:
+        _fail(f"{label} omitted its disconnect disposition")
+    return _ValidatedTarget(
+        ordinal,
+        client_index,
+        "receiver_drop",
+        "receiver_owned",
+        "ControlDisconnect",
+        identity,
+        None,
+    )
+
+
+def _validate_drain_target(
+    action: Any,
+    ordinal: int,
+    client_index: int,
+    state: str,
+    identity: AcceptedIdentityProjection | None,
+    prior_drop: int | None,
+) -> _ValidatedTarget:
+    label = f"drain action {ordinal}"
+    _validate_target_common_sentinels(action, ordinal)
+    if _field(action, "error", label) is not None:
+        _fail(f"{label} retained an error")
+    _exact_typed_value(
+        _field(action, "control", label),
+        _CONTROL_SENTINEL,
+        f"{label} control witness",
+    )
+    result = _field(action, "result", label)
+    if type(result) is not str:
+        _fail(f"{label} result must be a string")
+
+    if state in ("absent", "consumed"):
+        if result != "target_unavailable":
+            _fail(f"{label} called a receiver that is {state}")
+        if _field(action, "output", label) is not None:
+            _fail(f"{label} unavailable lookup retained an output")
+        _exact_typed_value(
+            _field(action, "primary_pop", label),
+            _PRIMARY_POP_SENTINEL,
+            f"{label} primary-pop witness",
+        )
+        _exact_typed_value(
+            _field(action, "opportunistic_eof_pop", label),
+            _OPPORTUNISTIC_POP_SENTINEL,
+            f"{label} opportunistic-pop witness",
+        )
+        if _plain_bool(
+            _field(action, "cached_eof", label),
+            f"{label} cached_eof",
+        ):
+            _fail(f"{label} unavailable lookup retained cached EOF")
+        if state == "absent":
+            if _field(action, "request_id", label) is not None:
+                _fail(f"{label} absent lookup retained a request ID")
+            resolution = "absent"
+            resolved_identity = identity
+            consumed_by = None
+        else:
+            if identity is None or prior_drop is None:
+                _fail(f"{label} consumed receiver lacks its prior ownership proof")
+            _require_target_request_id(action, ordinal, identity)
+            resolution = "receiver_consumed"
+            resolved_identity = identity
+            consumed_by = prior_drop
+        return _ValidatedTarget(
+            ordinal,
+            client_index,
+            "drain",
+            resolution,
+            "TargetLookup",
+            resolved_identity,
+            consumed_by,
+        )
+
+    if state != "owned" or identity is None:
+        _fail(f"{label} has an invalid receiver state")
+    _require_target_request_id(action, ordinal, identity)
+    cached_eof = _plain_bool(
+        _field(action, "cached_eof", label),
+        f"{label} cached_eof",
+    )
+    primary = _field(action, "primary_pop", label)
+    opportunistic = _field(action, "opportunistic_eof_pop", label)
+    output = _field(action, "output", label)
+
+    if result == "drain_eof" and cached_eof:
+        if output is not None:
+            _fail(f"{label} cached EOF retained an output")
+        _exact_typed_value(
+            primary,
+            _PRIMARY_POP_SENTINEL,
+            f"{label} primary-pop witness",
+        )
+        _exact_typed_value(
+            opportunistic,
+            _OPPORTUNISTIC_POP_SENTINEL,
+            f"{label} opportunistic-pop witness",
+        )
+        event_kind = "CachedEofRead"
+    else:
+        if cached_eof:
+            _fail(f"{label} non-cached result retained cached EOF")
+        primary = _validate_pop_target(
+            primary,
+            identity,
+            "primary",
+            f"{label} primary-pop witness",
+        )
+        if result == "drain_output":
+            output = _validate_output_identity(output, identity, f"{label} output")
+            if not _same_exact_value(primary.output, output):
+                _fail(f"{label} output differs from its primary-pop witness")
+            if getattr(opportunistic, "boundary", None) is True:
+                opportunistic = _validate_pop_target(
+                    opportunistic,
+                    identity,
+                    "opportunistic_eof",
+                    f"{label} opportunistic-pop witness",
+                )
+                if opportunistic.output is not None:
+                    _fail(f"{label} opportunistic EOF retained an output")
+            else:
+                _exact_typed_value(
+                    opportunistic,
+                    _OPPORTUNISTIC_POP_SENTINEL,
+                    f"{label} opportunistic-pop witness",
+                )
+        elif result in ("drain_empty", "drain_eof"):
+            if output is not None or primary.output is not None:
+                _fail(f"{label} non-output result retained an output")
+            _exact_typed_value(
+                opportunistic,
+                _OPPORTUNISTIC_POP_SENTINEL,
+                f"{label} opportunistic-pop witness",
+            )
+        else:
+            _fail(f"{label} has an invalid owned-receiver result")
+        event_kind = "PrimaryEndpointPop"
+
+    return _ValidatedTarget(
+        ordinal,
+        client_index,
+        "drain",
+        "receiver_owned",
+        event_kind,
+        identity,
+        None,
+    )
+
+
+def _validate_target_custody(
+    actions: tuple[Any, ...],
+    program: ActionProgram,
+    identities: AcceptedIdentityMapping,
+) -> tuple[_ValidatedTarget, ...]:
+    """Validate exact target resolution without total-ordering the race."""
+
+    _require_exact_decoded_actions(actions)
+
+    receiver_drop_by_client: list[int | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    records: list[_ValidatedTarget] = []
+    for ordinal, (action, expected) in enumerate(
+        zip(actions, program.actions, strict=True)
+    ):
+        if expected.kind not in ("cancel", "receiver_drop", "drain"):
+            continue
+        client_index = _plain_int(
+            _field(action, "client_index", f"target action {ordinal}"),
+            f"target action {ordinal} client_index",
+        )
+        if client_index != expected.client_index:
+            _fail(f"target action {ordinal} client index changed")
+        if client_index < 0 or client_index >= EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail(f"target action {ordinal} client_index is outside 0..63")
+        identity = identities.by_client_index[client_index]
+
+        if expected.kind == "cancel":
+            record = _validate_cancel_target(
+                action,
+                ordinal,
+                client_index,
+                identity,
+            )
+        else:
+            if identity is None or identity.submission.action_ordinal > ordinal:
+                receiver_state = "absent"
+            elif receiver_drop_by_client[client_index] is None:
+                receiver_state = "owned"
+            else:
+                receiver_state = "consumed"
+            prior_drop = receiver_drop_by_client[client_index]
+            if expected.kind == "receiver_drop":
+                record = _validate_receiver_drop_target(
+                    action,
+                    ordinal,
+                    client_index,
+                    receiver_state,
+                    identity,
+                    prior_drop,
+                )
+                if record.event_kind == "ControlDisconnect":
+                    if prior_drop is not None:
+                        _fail(f"receiver-drop action {ordinal} consumed twice")
+                    receiver_drop_by_client[client_index] = ordinal
+            else:
+                record = _validate_drain_target(
+                    action,
+                    ordinal,
+                    client_index,
+                    receiver_state,
+                    identity,
+                    prior_drop,
+                )
+        records.append(record)
+
+    if len(records) != EXPECTED_TARGET_ACTION_COUNT:
+        _fail(
+            "target action custody does not cover exactly "
+            f"{EXPECTED_TARGET_ACTION_COUNT} operations"
+        )
+    return tuple(records)
+
+
+def _build_target_access_order(
+    actions: tuple[Any, ...],
+    program: ActionProgram,
+    submission_order: SubmissionProtocolOrder,
+) -> TargetAccessOrder:
+    identities = _build_accepted_identity_mapping(actions, submission_order)
+    records = _validate_target_custody(actions, program, identities)
+    planner = _ProtocolGraphPlanner(submission_order.graph.node_count)
+    planner.layer(submission_order.graph)
+
+    by_action: list[TargetActionEvent | None] = [None] * EXPECTED_ACTION_COUNT
+    by_client: list[list[TargetActionEvent]] = [
+        [] for _ in range(EXPECTED_IN_RANGE_SUBMIT_COUNT)
+    ]
+    for record in records:
+        event = planner.allocate(record.action_ordinal, record.event_kind)
+        endpoints = submission_order.interval_order.endpoints.by_action[
+            record.action_ordinal
+        ]
+        planner.edge(
+            endpoints.invocation.node,
+            event.node,
+            "target-action-invocation-before-main-event",
+        )
+        planner.edge(
+            event.node,
+            endpoints.response.node,
+            "target-main-event-before-action-response",
+        )
+
+        identity = record.identity
+        if record.resolution == "absent":
+            if identity is not None:
+                registry_publish = identity.submission.registry_publish
+                if registry_publish is None:
+                    _fail("accepted identity omitted its registry publication")
+                planner.edge(
+                    event.node,
+                    registry_publish.node,
+                    "absent-target-lookup-before-registry-publication",
+                )
+        else:
+            if identity is None:
+                _fail("found target omitted its accepted identity")
+            registry_publish = identity.submission.registry_publish
+            if registry_publish is None:
+                _fail("accepted identity omitted its registry publication")
+            planner.edge(
+                registry_publish.node,
+                event.node,
+                "accepted-registry-publication-before-target-main-event",
+            )
+        if record.resolution == "receiver_consumed":
+            prior_drop = record.prior_receiver_drop_action
+            if prior_drop is None:
+                _fail("consumed receiver lookup omitted its prior drop")
+            prior_response = submission_order.interval_order.endpoints.by_action[
+                prior_drop
+            ].response
+            planner.edge(
+                prior_response.node,
+                event.node,
+                "receiver-consumption-before-unavailable-lookup",
+            )
+
+        target = TargetActionEvent(
+            record.action_ordinal,
+            record.client_index,
+            record.action_kind,
+            record.resolution,
+            identity,
+            record.prior_receiver_drop_action,
+            event,
+        )
+        if by_action[record.action_ordinal] is not None:
+            _fail(f"target action {record.action_ordinal} was allocated twice")
+        by_action[record.action_ordinal] = target
+        by_client[record.client_index].append(target)
+
+    graph = planner.build()
+    return TargetAccessOrder(
+        submission_order,
+        TargetAccessMapping(
+            identities,
+            tuple(by_action),
+            tuple(tuple(client) for client in by_client),
+            planner.protocol_events,
+        ),
+        graph,
+    )
+
+
+def build_target_access_order(repetition: Any) -> TargetAccessOrder:
+    """Authenticate and reconstruct accepted identities and target access."""
+
+    try:
+        actions = repetition.actions
+        diagnostics = repetition.diagnostics
+        shutdown = repetition.shutdown
+        action_counter_final = diagnostics.action_counter_final
+    except AttributeError:
+        _fail("decoded repetition lacks target protocol custody fields")
+    _require_exact_decoded_actions(actions)
+    program = regenerate_authenticated_action_program()
+    _verify_static_actions(actions, program)
+    interval_order = _build_action_interval_order(
+        actions,
+        action_counter_final,
+        expected_action_count=EXPECTED_ACTION_COUNT,
+    )
+    submission_order = _build_submission_protocol_order(
+        actions,
+        shutdown,
+        program,
+        interval_order,
+    )
+    return _build_target_access_order(actions, program, submission_order)
 
 
 def producer_action_interval_edges(

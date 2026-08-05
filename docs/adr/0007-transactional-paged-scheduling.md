@@ -1149,6 +1149,22 @@ allocator. Their complete identities are respectively `(slot, ticket)`,
 its request ID plus the exact control and endpoint identities returned by the
 accepted handle; a response-order observer cannot reconstruct these values.
 
+The checker projects each complete accepted identity into immutable indexes by
+client, request ID, control slot/generation, and endpoint slot/generation. For
+each cancel, receiver-drop, or drain action it then allocates exactly one main
+event between that action's `Invoke` and `Respond`. A found target uses the
+captured object boundary: `ControlCancel`, `ControlDisconnect`,
+`PrimaryEndpointPop`, or `CachedEofRead`. The earlier mutex lookup is omitted,
+not aliased to that boundary, and `RegistryPublish` precedes the captured event.
+For `target_unavailable`, the main event is instead the actual `TargetLookup`.
+For an absent lookup whose client is eventually accepted, `TargetLookup`
+precedes its `RegistryPublish`; the resulting cycle check rejects a claimed
+absence when publication was already forced before invocation. An unavailable
+receiver lookup retaining a request ID must instead match the accepted identity
+and follow both its `RegistryPublish` and the unique prior successful
+home-producer drop response. These constraints preserve the exact one-main-event
+budget without inventing an unobserved API boundary.
+
 The packed control word is frozen as bit 0 cancellation, bit 1 receiver
 disconnection, bit 2 terminal, and bits 3 through 63 generation. Valid live
 generations are `1..=2^61-1`. Flags are monotone within one generation; a bind

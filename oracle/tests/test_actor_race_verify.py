@@ -308,27 +308,7 @@ def _exhaustive_interval_graph(
 
 
 def _exact_interval_repetition() -> SimpleNamespace:
-    program = actor_race_verify.regenerate_authenticated_action_program()
-    actions = tuple(
-        _ObservedAction(
-            action.ordinal,
-            action.producer,
-            action.kind,
-            action.submit_attempt,
-            action.client_index,
-            action.ordinal * 2 + 1,
-            action.ordinal * 2 + 2,
-        )
-        for action in program.actions
-    )
-    return SimpleNamespace(
-        actions=actions,
-        diagnostics=SimpleNamespace(
-            action_counter_final=(
-                actor_race_verify.EXPECTED_ACTION_COUNTER_FINAL
-            )
-        ),
-    )
+    return _exact_submission_repetition()
 
 
 _COMMAND_SENTINEL = actor_race_history.CommandWitness(False, 0, 0, 0)
@@ -448,6 +428,128 @@ def _exact_submission_repetition() -> SimpleNamespace:
     )
 
 
+def _exact_target_repetition() -> SimpleNamespace:
+    repetition = _exact_submission_repetition()
+    actions = list(repetition.actions)
+    accepted: dict[int, actor_race_history.AcceptedWitness] = {}
+    receiver_state = ["absent"] * actor_race_verify.EXPECTED_IN_RANGE_SUBMIT_COUNT
+    cancel_requested: set[int] = set()
+    cached_eof_added = False
+
+    for ordinal, action in enumerate(actions):
+        if action.kind == "submit" and action.result == "submit_accepted":
+            assert action.client_index is not None
+            accepted[action.client_index] = action.accepted
+            receiver_state[action.client_index] = "owned"
+            continue
+        if action.kind not in ("cancel", "receiver_drop", "drain"):
+            continue
+
+        assert action.client_index is not None
+        client_index = action.client_index
+        witness = accepted.get(client_index)
+        if action.kind == "cancel":
+            if witness is None:
+                actions[ordinal] = replace(
+                    action,
+                    result="target_unavailable",
+                )
+                continue
+            base_word = witness.control_generation << 3
+            if client_index in cancel_requested:
+                result = "cancel_already_requested"
+                loaded_word = base_word | 1
+                resulting_word = loaded_word
+                disposition = "already_requested"
+            else:
+                result = "cancel_requested"
+                loaded_word = base_word
+                resulting_word = base_word | 1
+                disposition = "requested"
+                cancel_requested.add(client_index)
+            actions[ordinal] = replace(
+                action,
+                result=result,
+                request_id=witness.request_id,
+                control=actor_race_history.ControlWitness(
+                    "cancel",
+                    True,
+                    witness.control_slot,
+                    witness.control_generation,
+                    f"{loaded_word:016x}",
+                    f"{resulting_word:016x}",
+                    disposition,
+                ),
+            )
+            continue
+
+        state = receiver_state[client_index]
+        if state == "absent":
+            actions[ordinal] = replace(
+                action,
+                result="target_unavailable",
+            )
+            continue
+        assert witness is not None
+        if state == "consumed":
+            actions[ordinal] = replace(
+                action,
+                result="target_unavailable",
+                request_id=witness.request_id,
+            )
+            continue
+
+        if action.kind == "receiver_drop":
+            base_word = witness.control_generation << 3
+            actions[ordinal] = replace(
+                action,
+                result="receiver_dropped",
+                request_id=witness.request_id,
+                control=actor_race_history.ControlWitness(
+                    "disconnect",
+                    True,
+                    witness.control_slot,
+                    witness.control_generation,
+                    f"{base_word:016x}",
+                    f"{base_word | 3:016x}",
+                    "requested",
+                ),
+            )
+            receiver_state[client_index] = "consumed"
+            continue
+
+        if not cached_eof_added:
+            actions[ordinal] = replace(
+                action,
+                result="drain_eof",
+                request_id=witness.request_id,
+                cached_eof=True,
+            )
+            cached_eof_added = True
+        else:
+            actions[ordinal] = replace(
+                action,
+                result="drain_empty",
+                request_id=witness.request_id,
+                primary_pop=actor_race_history.PopWitness(
+                    "primary",
+                    True,
+                    witness.endpoint_slot,
+                    witness.endpoint_generation,
+                    0,
+                    0,
+                    None,
+                ),
+            )
+
+    assert cached_eof_added
+    return SimpleNamespace(
+        actions=tuple(actions),
+        diagnostics=repetition.diagnostics,
+        shutdown=repetition.shutdown,
+    )
+
+
 def _submit_by_attempt(repetition: SimpleNamespace, attempt: int) -> int:
     return next(
         action.ordinal
@@ -468,6 +570,486 @@ def _replace_repetition_action(
         diagnostics=repetition.diagnostics,
         shutdown=repetition.shutdown,
     )
+
+
+class TargetAccessOrderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repetition = _exact_target_repetition()
+        cls.order = actor_race_verify.build_target_access_order(cls.repetition)
+
+    def _replace_target(
+        self,
+        target: actor_race_verify.TargetActionEvent,
+        **changes: object,
+    ) -> SimpleNamespace:
+        action = self.repetition.actions[target.action_ordinal]
+        return _replace_repetition_action(
+            self.repetition,
+            target.action_ordinal,
+            replace(action, **changes),
+        )
+
+    def _one_target(
+        self,
+        *,
+        kind: str | None = None,
+        resolution: str | None = None,
+        event_kind: str | None = None,
+        identity: bool | None = None,
+    ) -> actor_race_verify.TargetActionEvent:
+        return next(
+            target
+            for target in self.order.targets.by_action
+            if target is not None
+            and (kind is None or target.action_kind == kind)
+            and (resolution is None or target.resolution == resolution)
+            and (event_kind is None or target.event.kind == event_kind)
+            and (identity is None or (target.identity is not None) == identity)
+        )
+
+    def test_exact_immutable_identity_projection_and_event_budget(self) -> None:
+        order = self.order
+        identities = order.targets.identities
+        self.assertEqual(
+            len(order.targets.target_events),
+            actor_race_verify.EXPECTED_TARGET_ACTION_COUNT,
+        )
+        self.assertEqual(actor_race_verify.EXPECTED_TARGET_ACTION_COUNT, 679)
+        self.assertEqual(
+            order.graph.node_count,
+            order.submission_order.graph.node_count
+            + actor_race_verify.EXPECTED_TARGET_ACTION_COUNT,
+        )
+        self.assertLessEqual(
+            order.graph.node_count,
+            actor_race_verify.MAX_PROTOCOL_NODES,
+        )
+        self.assertEqual(
+            len({event.node for event in order.targets.target_events}),
+            actor_race_verify.EXPECTED_TARGET_ACTION_COUNT,
+        )
+        self.assertEqual(
+            sum(target is not None for target in order.targets.by_action),
+            actor_race_verify.EXPECTED_TARGET_ACTION_COUNT,
+        )
+        self.assertEqual(len(identities.by_client_index), 64)
+        self.assertEqual(len(identities.by_request_id), 32)
+        self.assertEqual(
+            tuple(identity.request_id for identity in identities.by_request_id),
+            tuple(range(1, 33)),
+        )
+        for identity in identities.by_request_id:
+            self.assertIs(
+                identities.by_client_index[identity.client_index],
+                identity,
+            )
+            self.assertIs(
+                identities.by_control_slot[identity.control_slot][
+                    identity.control_generation - 1
+                ],
+                identity,
+            )
+            self.assertIs(
+                identities.by_endpoint_slot[identity.endpoint_slot][
+                    identity.endpoint_generation - 1
+                ],
+                identity,
+            )
+        for client_index, targets in enumerate(
+            order.targets.by_client_index
+        ):
+            self.assertEqual(
+                tuple(target.action_ordinal for target in targets),
+                tuple(
+                    target.action_ordinal
+                    for target in order.targets.by_action
+                    if target is not None and target.client_index == client_index
+                ),
+            )
+
+        event_kinds = {event.kind for event in order.targets.target_events}
+        self.assertEqual(
+            event_kinds,
+            {
+                "TargetLookup",
+                "ControlCancel",
+                "ControlDisconnect",
+                "PrimaryEndpointPop",
+                "CachedEofRead",
+            },
+        )
+
+    def test_main_event_is_distinct_and_has_only_sound_publication_edges(self) -> None:
+        order = self.order
+        absent = self._one_target(resolution="absent", identity=True)
+        found = self._one_target(resolution="cancel_authority")
+        consumed = self._one_target(resolution="receiver_consumed")
+        for target in (absent, found, consumed):
+            endpoints = order.submission_order.interval_order.endpoints.by_action[
+                target.action_ordinal
+            ]
+            self.assertNotIn(
+                target.event.node,
+                (endpoints.invocation.node, endpoints.response.node),
+            )
+            self.assertEqual(
+                order.graph.reasons(endpoints.invocation.node, target.event.node),
+                ("target-action-invocation-before-main-event",),
+            )
+            self.assertEqual(
+                order.graph.reasons(target.event.node, endpoints.response.node),
+                ("target-main-event-before-action-response",),
+            )
+
+        assert absent.identity is not None
+        absent_publish = absent.identity.submission.registry_publish
+        assert absent_publish is not None
+        self.assertEqual(absent.event.kind, "TargetLookup")
+        self.assertEqual(
+            order.graph.reasons(absent.event.node, absent_publish.node),
+            ("absent-target-lookup-before-registry-publication",),
+        )
+
+        assert found.identity is not None
+        found_publish = found.identity.submission.registry_publish
+        assert found_publish is not None
+        self.assertEqual(found.event.kind, "ControlCancel")
+        self.assertEqual(
+            order.graph.reasons(found_publish.node, found.event.node),
+            ("accepted-registry-publication-before-target-main-event",),
+        )
+        # A found lookup does not add the stronger publication-before-Invoke
+        # edge; the object boundary may follow a publication that raced after
+        # the action invocation.
+        found_invoke = order.submission_order.interval_order.endpoints.by_action[
+            found.action_ordinal
+        ].invocation
+        self.assertEqual(order.graph.reasons(found_publish.node, found_invoke.node), ())
+
+        assert consumed.prior_receiver_drop_action is not None
+        prior_response = order.submission_order.interval_order.endpoints.by_action[
+            consumed.prior_receiver_drop_action
+        ].response
+        self.assertEqual(
+            order.graph.reasons(prior_response.node, consumed.event.node),
+            ("receiver-consumption-before-unavailable-lookup",),
+        )
+
+    def test_absent_and_found_results_choose_opposite_publication_order(self) -> None:
+        absent = self._one_target(
+            kind="cancel",
+            resolution="absent",
+            identity=True,
+        )
+        assert absent.identity is not None
+        witness = absent.identity
+        base_word = witness.control_generation << 3
+        forged_found = self._replace_target(
+            absent,
+            result="cancel_requested",
+            request_id=witness.request_id,
+            control=actor_race_history.ControlWitness(
+                "cancel",
+                True,
+                witness.control_slot,
+                witness.control_generation,
+                f"{base_word:016x}",
+                f"{base_word | 1:016x}",
+                "requested",
+            ),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "cycle detected",
+        ):
+            actor_race_verify.build_target_access_order(forged_found)
+
+        found = self._one_target(kind="cancel", resolution="cancel_authority")
+        forged_absent = self._replace_target(
+            found,
+            result="target_unavailable",
+            request_id=None,
+            error=None,
+            control=_CONTROL_SENTINEL,
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "cycle detected",
+        ):
+            actor_race_verify.build_target_access_order(forged_absent)
+
+    def test_receiver_ownership_and_retained_identity_fail_closed(self) -> None:
+        consumed = self._one_target(
+            kind="drain",
+            resolution="receiver_consumed",
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "request_id must be an integer",
+        ):
+            actor_race_verify.build_target_access_order(
+                self._replace_target(consumed, request_id=None)
+            )
+
+        owned_drop = next(
+            target
+            for target in self.order.targets.by_action
+            if target is not None
+            and target.action_kind == "receiver_drop"
+            and target.resolution == "receiver_owned"
+            and any(
+                later.action_ordinal > target.action_ordinal
+                and later.action_kind == "receiver_drop"
+                and later.resolution == "receiver_consumed"
+                for later in self.order.targets.by_client_index[
+                    target.client_index
+                ]
+            )
+        )
+        assert owned_drop.identity is not None
+        later_consumed = next(
+            target
+            for target in self.order.targets.by_client_index[
+                owned_drop.client_index
+            ]
+            if target.action_ordinal > owned_drop.action_ordinal
+            and target.action_kind == "receiver_drop"
+            and target.resolution == "receiver_consumed"
+        )
+        identity = owned_drop.identity
+        base_word = identity.control_generation << 3
+        forged_second_drop = self._replace_target(
+            later_consumed,
+            result="receiver_dropped",
+            control=actor_race_history.ControlWitness(
+                "disconnect",
+                True,
+                identity.control_slot,
+                identity.control_generation,
+                f"{base_word:016x}",
+                f"{base_word | 3:016x}",
+                "requested",
+            ),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "called a receiver that is consumed",
+        ):
+            actor_race_verify.build_target_access_order(forged_second_drop)
+
+        absent_receiver = self._one_target(
+            kind="drain",
+            resolution="absent",
+            identity=True,
+        )
+        assert absent_receiver.identity is not None
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "absent lookup retained a request ID",
+        ):
+            actor_race_verify.build_target_access_order(
+                self._replace_target(
+                    absent_receiver,
+                    request_id=absent_receiver.identity.request_id,
+                )
+            )
+
+    def test_target_identity_and_exact_types_fail_closed(self) -> None:
+        class IntSubclass(int):
+            pass
+
+        found = self._one_target(kind="cancel", resolution="cancel_authority")
+        action = self.repetition.actions[found.action_ordinal]
+        assert found.identity is not None
+        cases = (
+            (
+                "request_id must be an integer",
+                replace(action, request_id=False),
+            ),
+            (
+                "request_id must be an integer",
+                replace(action, request_id=IntSubclass(action.request_id)),
+            ),
+            (
+                "must be a boolean",
+                replace(
+                    action,
+                    control=replace(action.control, boundary=1),
+                ),
+            ),
+            (
+                "accepted control identity",
+                replace(
+                    action,
+                    control=replace(
+                        action.control,
+                        slot=(found.identity.control_slot + 1) % 16,
+                    ),
+                ),
+            ),
+            (
+                "slot must be an integer",
+                replace(
+                    action,
+                    control=replace(
+                        action.control,
+                        slot=IntSubclass(found.identity.control_slot),
+                    ),
+                ),
+            ),
+            (
+                "16 lowercase hexadecimal",
+                replace(
+                    action,
+                    control=replace(action.control, loaded_word="0" * 15),
+                ),
+            ),
+        )
+        for diagnostic, forged_action in cases:
+            with self.subTest(diagnostic=diagnostic):
+                forged = _replace_repetition_action(
+                    self.repetition,
+                    found.action_ordinal,
+                    forged_action,
+                )
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    diagnostic,
+                ):
+                    actor_race_verify.build_target_access_order(forged)
+
+        absent = self._one_target(resolution="absent")
+        absent_action = self.repetition.actions[absent.action_ordinal]
+        forged_sentinel = _replace_repetition_action(
+            self.repetition,
+            absent.action_ordinal,
+            replace(
+                absent_action,
+                accepted=replace(_ACCEPTED_SENTINEL, boundary=0),
+            ),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "exact typed sentinel",
+        ):
+            actor_race_verify.build_target_access_order(forged_sentinel)
+
+    def test_full_entry_point_rejects_tuple_and_action_subclasses_before_graph(
+        self,
+    ) -> None:
+        class TupleSubclass(tuple):
+            pass
+
+        class ActionSubclass(actor_race_history.Action):
+            pass
+
+        tuple_forged = SimpleNamespace(
+            actions=TupleSubclass(self.repetition.actions),
+            diagnostics=self.repetition.diagnostics,
+            shutdown=self.repetition.shutdown,
+        )
+        action_values = tuple(
+            getattr(self.repetition.actions[0], field)
+            for field in self.repetition.actions[0].__dataclass_fields__
+        )
+        subclass_action = ActionSubclass(*action_values)
+        subclass_actions = list(self.repetition.actions)
+        subclass_actions[0] = subclass_action
+        action_forged = SimpleNamespace(
+            actions=tuple(subclass_actions),
+            diagnostics=self.repetition.diagnostics,
+            shutdown=self.repetition.shutdown,
+        )
+        for diagnostic, forged in (
+            ("exact immutable tuple", tuple_forged),
+            ("invalid exact type", action_forged),
+        ):
+            for builder in (
+                actor_race_verify.build_action_interval_order,
+                actor_race_verify.build_submission_protocol_order,
+                actor_race_verify.build_target_access_order,
+            ):
+                with self.subTest(diagnostic=diagnostic, builder=builder.__name__):
+                    with mock.patch.object(
+                        actor_race_verify.ReasonedDAG,
+                        "build",
+                    ) as graph_build:
+                        with self.assertRaisesRegex(
+                            actor_race_verify.ActorRaceVerificationError,
+                            diagnostic,
+                        ):
+                            builder(forged)
+                    graph_build.assert_not_called()
+
+    def test_public_builders_snapshot_repetition_properties_exactly_once(self) -> None:
+        clean_actions = self.repetition.actions
+        forged_actions = list(clean_actions)
+        forged_actions[0] = replace(
+            forged_actions[0],
+            producer=1 - forged_actions[0].producer,
+        )
+
+        class TogglingRepetition:
+            def __init__(self) -> None:
+                self.action_reads = 0
+                self.diagnostic_reads = 0
+                self.shutdown_reads = 0
+
+            @property
+            def actions(self) -> tuple[actor_race_history.Action, ...]:
+                self.action_reads += 1
+                if self.action_reads == 1:
+                    return clean_actions
+                return tuple(forged_actions)
+
+            @property
+            def diagnostics(self) -> object:
+                self.diagnostic_reads += 1
+                if self.diagnostic_reads == 1:
+                    return self_outer.repetition.diagnostics
+                return SimpleNamespace(action_counter_final=0)
+
+            @property
+            def shutdown(self) -> object:
+                self.shutdown_reads += 1
+                if self.shutdown_reads == 1:
+                    return self_outer.repetition.shutdown
+                return replace(
+                    self_outer.repetition.shutdown,
+                    accepted_submissions=0,
+                )
+
+        self_outer = self
+        for builder, expected_shutdown_reads in (
+            (actor_race_verify.build_action_interval_order, 0),
+            (actor_race_verify.build_submission_protocol_order, 1),
+            (actor_race_verify.build_target_access_order, 1),
+        ):
+            with self.subTest(builder=builder.__name__):
+                toggling = TogglingRepetition()
+                builder(toggling)
+                self.assertEqual(toggling.action_reads, 1)
+                self.assertEqual(toggling.diagnostic_reads, 1)
+                self.assertEqual(
+                    toggling.shutdown_reads,
+                    expected_shutdown_reads,
+                )
+
+    def test_public_entry_point_authenticates_locally_and_is_not_injectable(self) -> None:
+        authenticate = actor_race_verify.regenerate_authenticated_action_program
+        with mock.patch.object(
+            actor_race_verify,
+            "regenerate_authenticated_action_program",
+            wraps=authenticate,
+        ) as authenticate_once:
+            actor_race_verify.build_target_access_order(self.repetition)
+        authenticate_once.assert_called_once_with()
+        with self.assertRaises(TypeError):
+            actor_race_verify.build_target_access_order(
+                self.repetition,
+                program=authenticate(),
+            )
 
 
 class SubmissionProtocolOrderTests(unittest.TestCase):
