@@ -210,6 +210,24 @@ pub(super) fn authenticated_workload() -> HarnessResult<AuthenticatedWorkload> {
 }
 
 pub(super) async fn spawn_fresh_actor(config: &ActorConfig) -> HarnessResult<FreshActor> {
+    spawn_fresh_actor_with_deadline(config, None).await
+}
+
+pub(super) async fn spawn_fresh_actor_before(
+    config: &ActorConfig,
+    deadline: tokio::time::Instant,
+) -> HarnessResult<FreshActor> {
+    spawn_fresh_actor_with_deadline(config, Some(deadline)).await
+}
+
+async fn spawn_fresh_actor_with_deadline(
+    config: &ActorConfig,
+    deadline: Option<tokio::time::Instant>,
+) -> HarnessResult<FreshActor> {
+    require(
+        deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline),
+        "actor construction deadline expired before authentication",
+    )?;
     let fixture_artifact = FixtureArtifact::build_v3();
     let artifact = Artifact::from_bytes(fixture_artifact.to_parts(), Limits::default())
         .map_err(|error| format!("tiny-v3 artifact authentication failed: {error}"))?;
@@ -221,46 +239,66 @@ pub(super) async fn spawn_fresh_actor(config: &ActorConfig) -> HarnessResult<Fre
         .map_err(|_| "output capacity does not fit this host".to_owned())?;
     let scheduler_config = runnel_scheduler::SchedulerConfig::new(&model, limits)
         .map_err(|error| format!("actor configuration failed: {error}"))?;
+    require(
+        deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline),
+        "actor construction deadline expired before spawn",
+    )?;
     let (actor, probe) = SchedulerActor::spawn_instrumented_with_capacity(
         model,
         scheduler_config,
         OBSERVATION_LIMIT,
     )
     .map_err(|error| format!("instrumented actor construction failed: {error}"))?;
-    let recorder = probe
-        .recorder()
-        .map_err(|error| format!("semantic recorder unavailable: {error}"))?;
-    let initial_recorder = recorder.status();
-    require(
-        initial_recorder.observation_count() == 0,
-        "recorder was not empty",
-    )?;
-    require(
-        initial_recorder.observation_limit() == OBSERVATION_LIMIT,
-        "recorder logical limit changed",
-    )?;
-    require(
-        initial_recorder.allocated_capacity() >= OBSERVATION_LIMIT,
-        "recorder did not preallocate its logical limit",
-    )?;
-    require(initial_recorder.healthy(), "recorder began unhealthy")?;
-    let initial_probe = probe
-        .wait_quiescent()
-        .await
+    let initialization: HarnessResult<_> = async {
+        let recorder = probe
+            .recorder()
+            .map_err(|error| format!("semantic recorder unavailable: {error}"))?;
+        let initial_recorder = recorder.status();
+        require(
+            initial_recorder.observation_count() == 0,
+            "recorder was not empty",
+        )?;
+        require(
+            initial_recorder.observation_limit() == OBSERVATION_LIMIT,
+            "recorder logical limit changed",
+        )?;
+        require(
+            initial_recorder.allocated_capacity() >= OBSERVATION_LIMIT,
+            "recorder did not preallocate its logical limit",
+        )?;
+        require(initial_recorder.healthy(), "recorder began unhealthy")?;
+        let initial_probe = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, probe.wait_quiescent())
+                .await
+                .map_err(|_| "initial actor quiescence timed out".to_owned())?,
+            None => probe.wait_quiescent().await,
+        }
         .map_err(|error| format!("initial quiescence failed: {error}"))?;
-    require(
-        initial_probe.quiescent(),
-        "initial actor state was not quiescent",
-    )?;
-    Ok(FreshActor {
-        actor,
-        probe,
-        recorder,
-        initial_probe,
-        initial_recorder,
-        max_outstanding_requests,
-        output_capacity_per_request,
-    })
+        require(
+            initial_probe.quiescent(),
+            "initial actor state was not quiescent",
+        )?;
+        Ok((recorder, initial_recorder, initial_probe))
+    }
+    .await;
+
+    match initialization {
+        Ok((recorder, initial_recorder, initial_probe)) => Ok(FreshActor {
+            actor,
+            probe,
+            recorder,
+            initial_probe,
+            initial_recorder,
+            max_outstanding_requests,
+            output_capacity_per_request,
+        }),
+        Err(error) => match actor.shutdown().await {
+            Ok(_) => Err(error),
+            Err(shutdown_error) => Err(format!(
+                "{error}; failed to join actor after initialization failure: {shutdown_error}"
+            )),
+        },
+    }
 }
 
 pub(super) fn request_spec(descriptor: &Descriptor) -> HarnessResult<RequestSpec<'_>> {

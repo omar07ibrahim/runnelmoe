@@ -27,6 +27,11 @@ const CANCELLED_FLAG: u64 = 1 << 0;
 const DISCONNECTED_FLAG: u64 = 1 << 1;
 const TERMINAL_FLAG: u64 = 1 << 2;
 
+#[path = "race/cleanup.rs"]
+mod cleanup;
+#[path = "race/execution.rs"]
+mod execution;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RaceKind {
@@ -2277,13 +2282,19 @@ impl RaceRegistrySnapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use runnel_scheduler::{ActorRequestDropWitnessSink, RequestHandle};
+    use tokio::sync::Barrier;
+    use tokio::task::JoinSet;
 
     use super::*;
+    use crate::Descriptor;
     use crate::common::{
-        DropWitnessContext, authenticated_workload, drop_receiver_with_preallocated_witness,
-        finish_receiver, finish_receiver_with_preallocated_witness, receive_once_with_witness,
-        request_spec, spawn_fresh_actor, validate_shutdown,
+        DropWitnessContext, PUMP_ENTRY_LIMIT, authenticated_workload,
+        drop_receiver_with_preallocated_witness, finish_receiver,
+        finish_receiver_with_preallocated_witness, receive_once_with_witness, request_spec,
+        spawn_fresh_actor, spawn_fresh_actor_before, validate_shutdown,
     };
 
     fn valid_identity() -> AcceptedIdentity {
@@ -3478,6 +3489,338 @@ mod tests {
         })
         .await
         .expect("live witness normalization test timed out");
+    }
+
+    async fn abort_and_drain_race_producers(
+        tasks: &mut JoinSet<(usize, HarnessResult<execution::RaceProducerExit>)>,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        tasks.abort_all();
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((index, Ok(exit))) => {
+                    if index >= PRODUCER_COUNT || usize::from(exit.index) != index {
+                        failures.push(format!(
+                            "drained producer index mismatch: task={index}, exit={}",
+                            exit.index
+                        ));
+                    }
+                }
+                Ok((index, Err(error))) => {
+                    failures.push(format!("drained producer {index} failure: {error}"));
+                }
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => failures.push(format!("drained producer join failure: {error}")),
+            }
+        }
+        failures
+    }
+
+    fn append_drain_failures(primary: impl Into<String>, failures: Vec<String>) -> String {
+        let primary = primary.into();
+        if failures.is_empty() {
+            primary
+        } else {
+            format!("{primary}; {}", failures.join("; "))
+        }
+    }
+
+    async fn join_race_producers(
+        tasks: &mut JoinSet<(usize, HarnessResult<execution::RaceProducerExit>)>,
+        deadline: tokio::time::Instant,
+    ) -> HarnessResult<[execution::RaceProducerExit; PRODUCER_COUNT]> {
+        let mut exits = [None, None];
+        let mut joined = 0_usize;
+        while !tasks.is_empty() {
+            let joined_task = match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+                Ok(Some(joined_task)) => joined_task,
+                Ok(None) => break,
+                Err(_) => {
+                    let failures = abort_and_drain_race_producers(tasks).await;
+                    return Err(append_drain_failures(
+                        "producer execution timed out",
+                        failures,
+                    ));
+                }
+            };
+            let Some(next_joined) = joined.checked_add(1) else {
+                let failures = abort_and_drain_race_producers(tasks).await;
+                return Err(append_drain_failures(
+                    "producer join count overflowed",
+                    failures,
+                ));
+            };
+            joined = next_joined;
+            let failure = match joined_task {
+                Ok((index, Ok(exit))) => {
+                    if index >= PRODUCER_COUNT {
+                        Some(format!("producer task returned out-of-range index {index}"))
+                    } else if usize::from(exit.index) != index {
+                        Some(format!(
+                            "producer task index {index} differs from exit index {}",
+                            exit.index
+                        ))
+                    } else if exits[index].is_some() {
+                        Some(format!("producer task index {index} was duplicated"))
+                    } else {
+                        exits[index] = Some(exit);
+                        None
+                    }
+                }
+                Ok((index, Err(error))) => {
+                    Some(format!("producer {index} execution failed: {error}"))
+                }
+                Err(error) => Some(format!("producer task failed to join: {error}")),
+            };
+            if let Some(failure) = failure {
+                let failures = abort_and_drain_race_producers(tasks).await;
+                return Err(append_drain_failures(failure, failures));
+            }
+        }
+        require(
+            joined == PRODUCER_COUNT,
+            "producer task set completed with the wrong join count",
+        )?;
+        let [exit_zero, exit_one] = exits;
+        Ok([
+            exit_zero.ok_or_else(|| "producer zero exit is missing".to_owned())?,
+            exit_one.ok_or_else(|| "producer one exit is missing".to_owned())?,
+        ])
+    }
+
+    async fn run_genuine_two_producer_race_once() -> HarnessResult<()> {
+        const REPETITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+        let deadline = tokio::time::Instant::now() + REPETITION_TIMEOUT;
+        let workload = authenticated_workload()?;
+        let fresh = spawn_fresh_actor_before(&workload.actor_config, deadline).await?;
+        let actor = fresh.actor;
+        let probe = fresh.probe;
+        let recorder = fresh.recorder;
+        let initial = fresh.initial_probe;
+
+        let race_result: HarnessResult<(usize, usize)> = async {
+            let descriptors: Arc<[Descriptor]> = workload.descriptors.into();
+            let actions = workload.actions;
+            let registry = Arc::new(RaceRegistry::new());
+            let history = Arc::new(RaceHistory::new(&actions)?);
+            let producers = execution::prepare_race_producers(
+                actor.client(),
+                probe.clone(),
+                Arc::clone(&descriptors),
+                &actions,
+                Arc::clone(&registry),
+                Arc::clone(&history),
+            )?;
+            let start = Arc::new(Barrier::new(3));
+            let [producer_zero, producer_one] = producers;
+            let mut tasks = JoinSet::new();
+            tasks.spawn({
+                let start = Arc::clone(&start);
+                async move { (0_usize, producer_zero.run(start).await) }
+            });
+            tasks.spawn({
+                let start = Arc::clone(&start);
+                async move { (1_usize, producer_one.run(start).await) }
+            });
+            if tokio::time::timeout_at(deadline, start.wait())
+                .await
+                .is_err()
+            {
+                let failures = abort_and_drain_race_producers(&mut tasks).await;
+                return Err(append_drain_failures(
+                    "producer start barrier timed out",
+                    failures,
+                ));
+            }
+            let exits = join_race_producers(&mut tasks, deadline).await?;
+            require(tasks.is_empty(), "producer task set was not fully drained")?;
+            let [exit_zero, exit_one] = exits;
+
+            let registry_after_race = registry.snapshot()?;
+            registry_after_race.require_all_authorities_present()?;
+            let producer_live = exit_zero
+                .live_receiver_count()
+                .checked_add(exit_one.live_receiver_count())
+                .ok_or_else(|| "producer live-receiver count overflowed".to_owned())?;
+            require(
+                producer_live == registry_after_race.live_receiver_count(),
+                "producer custody differs from the live registry",
+            )?;
+
+            let history = Arc::try_unwrap(history)
+                .map_err(|_| "producer retained the race history".to_owned())?;
+            let complete = history.into_complete()?;
+            require(
+                complete.actions().len() == ACTION_COUNT,
+                "complete race history has the wrong action count",
+            )?;
+            let accepted = complete
+                .actions()
+                .filter(|action| action.7 == RaceResult::SubmitAccepted)
+                .count();
+            let rejected = complete
+                .actions()
+                .filter(|action| action.2 == RaceKind::Submit && action.7 == RaceResult::Error)
+                .count();
+            require(
+                accepted
+                    .checked_add(rejected)
+                    .is_some_and(|count| count == REQUEST_COUNT),
+                "accepted and rejected submissions do not conserve the request corpus",
+            )?;
+
+            let cleanup = tokio::time::timeout_at(
+                deadline,
+                cleanup::run_ordered_cleanup(
+                    [exit_zero, exit_one],
+                    &registry,
+                    &probe,
+                    &descriptors,
+                ),
+            )
+            .await
+            .map_err(|_| "ordered race cleanup timed out".to_owned())??;
+            require(
+                cleanup.authority_count() == accepted,
+                "cleanup authority count differs from accepted submissions",
+            )?;
+            let cleanup_records = cleanup
+                .authority_count()
+                .checked_add(cleanup.receiver_count())
+                .ok_or_else(|| "cleanup record count overflowed".to_owned())?;
+            let expected_cleanup_counter = to_u64(cleanup_records, "cleanup record count")?
+                .checked_mul(2)
+                .ok_or_else(|| "cleanup counter expectation overflowed".to_owned())?;
+            require(
+                cleanup.counter_final() == expected_cleanup_counter,
+                "cleanup final counter differs from its records",
+            )?;
+            require(
+                cleanup.pre_shutdown().outstanding_requests == 0
+                    && cleanup.pre_shutdown().request_bytes == 0,
+                "cleanup retained pre-shutdown request state",
+            )?;
+            require(
+                cleanup.pre_cleanup().parked,
+                "cleanup precondition was not quiescent",
+            )?;
+            Ok((accepted, rejected))
+        }
+        .await;
+
+        let shutdown_result = actor.shutdown().await;
+        let (accepted, rejected) = match race_result {
+            Ok(counts) => counts,
+            Err(error) => {
+                return match shutdown_result {
+                    Ok(_) => Err(error),
+                    Err(shutdown_error) => Err(format!(
+                        "{error}; cooperative shutdown also failed: {shutdown_error}"
+                    )),
+                };
+            }
+        };
+        let report = shutdown_result
+            .map_err(|error| format!("cooperative race shutdown failed: {error}"))?;
+        let post_shutdown = probe
+            .snapshot()
+            .map_err(|error| format!("post-shutdown snapshot failed: {error}"))?;
+        validate_shutdown(
+            report,
+            accepted,
+            rejected,
+            post_shutdown.request_bytes,
+            post_shutdown.shared_bytes,
+        )?;
+        require(post_shutdown.owner_done, "race actor did not stop")?;
+        require(
+            post_shutdown
+                .pump_entries
+                .checked_sub(initial.pump_entries)
+                .is_some_and(|delta| delta <= PUMP_ENTRY_LIMIT),
+            "race actor exceeded its pump-entry limit",
+        )?;
+        require(
+            recorder.status().healthy(),
+            "race recorder became unhealthy",
+        )?;
+        let recording = recorder
+            .recording()
+            .map_err(|error| format!("semantic recording failed: {error}"))?;
+        let output_count = recording
+            .observations()
+            .iter()
+            .filter(|observation| observation.output_event().is_some())
+            .count();
+        let expected_observations = accepted
+            .checked_mul(2)
+            .and_then(|base| base.checked_add(output_count))
+            .ok_or_else(|| "semantic observation count overflowed".to_owned())?;
+        require(
+            recording.observations().len() == expected_observations,
+            "semantic observation count differs from output/terminal/EOF conservation",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_failure_paths_drain_every_task() {
+        let mut failed = JoinSet::new();
+        failed.spawn(async {
+            (
+                0_usize,
+                Err::<execution::RaceProducerExit, String>("synthetic producer error".to_owned()),
+            )
+        });
+        failed.spawn(async {
+            panic!("synthetic producer panic");
+            #[allow(unreachable_code)]
+            (
+                1_usize,
+                Ok::<execution::RaceProducerExit, String>(execution::RaceProducerExit {
+                    index: 1,
+                    handles: Vec::new(),
+                }),
+            )
+        });
+        assert!(
+            join_race_producers(
+                &mut failed,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+        );
+        assert!(failed.is_empty());
+
+        let mut stalled = JoinSet::new();
+        for index in 0..PRODUCER_COUNT {
+            stalled.spawn(async move {
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                (
+                    index,
+                    Ok::<execution::RaceProducerExit, String>(execution::RaceProducerExit {
+                        index: u8::try_from(index).expect("synthetic producer index"),
+                        handles: Vec::new(),
+                    }),
+                )
+            });
+        }
+        assert!(
+            abort_and_drain_race_producers(&mut stalled)
+                .await
+                .is_empty()
+        );
+        assert!(stalled.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn genuine_two_producer_race_completes_and_cleans_up_one_repetition() {
+        run_genuine_two_producer_race_once()
+            .await
+            .expect("genuine race repetition");
     }
 
     #[tokio::test(flavor = "current_thread")]
