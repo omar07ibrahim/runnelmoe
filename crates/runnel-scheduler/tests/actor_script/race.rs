@@ -3647,6 +3647,7 @@ mod tests {
         let recorder = fresh.recorder;
         let initial_probe = fresh.initial_probe;
         let initial_recorder = fresh.initial_recorder;
+        let output_capacity_per_request = fresh.output_capacity_per_request;
 
         let race_result: HarnessResult<capture::RepetitionDraft> = async {
             // Producer construction and the pre-barrier portion of `run` make
@@ -3731,6 +3732,7 @@ mod tests {
                     &registry,
                     &probe,
                     &descriptors,
+                    output_capacity_per_request,
                 ),
             )
             .await
@@ -3762,6 +3764,7 @@ mod tests {
             capture::RepetitionDraft::new(
                 repetition,
                 descriptors,
+                output_capacity_per_request,
                 complete,
                 cleanup,
                 accepted_ids,
@@ -4007,10 +4010,10 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let workload = authenticated_workload().expect("authenticated workload");
             let descriptor = &workload.descriptors[0];
-            let capacity = usize::try_from(descriptor.max_new_tokens).expect("output capacity");
             let fresh = spawn_fresh_actor(&workload.actor_config)
                 .await
                 .expect("fresh actor");
+            let capacity = fresh.output_capacity_per_request;
             let actor = fresh.actor;
             let probe = fresh.probe;
             let client = actor.client();
@@ -4024,16 +4027,19 @@ mod tests {
                 .expect("engine admission");
             let request_id = handle.request_id();
             handle.cancel().expect("cleanup cancellation");
+            let output_buffer = Vec::with_capacity(capacity);
+            let allocated_capacity = output_buffer.capacity();
             let cleanup = finish_receiver_with_preallocated_witness(
                 0,
                 handle,
-                Vec::with_capacity(capacity),
+                output_buffer,
+                capacity,
                 ActorRequestDropWitnessSink::new(),
             )
             .await
             .expect("preallocated cleanup");
             assert_eq!(cleanup.terminal.request_id(), request_id);
-            assert_eq!(cleanup.outputs.capacity(), capacity);
+            assert_eq!(cleanup.outputs.capacity(), allocated_capacity);
             assert!(cleanup.outputs.len() <= capacity);
 
             drop(client);

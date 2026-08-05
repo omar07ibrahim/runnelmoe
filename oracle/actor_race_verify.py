@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """Independent bounded semantic primitives for actor race-history captures.
 
-This layer owns six deliberately narrow responsibilities:
+This layer owns seven deliberately narrow responsibilities:
 
 * a deterministic, reason-labelled partial-order DAG with bitset reachability;
 * authentication and exact comparison of the frozen scheduler action program;
 * exact action invocation/response custody and its witnessed partial order;
 * submission-command custody and an explicit event graph for admission results;
 * immutable accepted-identity projection and target lookup/access custody;
-* packed control-word algebra and request/control lifecycle custody.
+* packed control-word algebra and request/control lifecycle custody;
+* endpoint terminal/EOF, FIFO output, cleanup-receiver, and recorder custody.
 
-It does not yet interpret output drain-count chains, endpoint terminal/EOF
-witnesses, publication observations, or observation conservation.  Action
-interval counters are mapped to explicit Invoke and Respond nodes; they are
-never promoted into a counter-derived global execution order.  In particular,
-consuming an actor command response is a separate CommandRelease event, never
-an alias for either ActorCommandRespond publication or the action's final
-Respond counter.
+It does not interpret model or wake semantics beyond their frozen structural
+witnesses, and recorder append positions are not promoted into causal order.
+Action interval counters are mapped to explicit Invoke and Respond nodes; they
+are never promoted into a counter-derived global execution order.  In
+particular, consuming an actor command response is a separate CommandRelease
+event, never an alias for either ActorCommandRespond publication or the
+action's final Respond counter.
 """
 
 from __future__ import annotations
@@ -49,6 +50,9 @@ CAPTURE_ACTION_KINDS = (
 EXPECTED_ACTION_VECTOR_ID = (
     "sha256:430810784f31659367ecc4fecb5cf8693b4758176debe4a4769dc7cc62611b73"
 )
+EXPECTED_DESCRIPTOR_VECTOR_ID = (
+    "sha256:d902ecf3377310de99471f41287f62730671263b8e339ac03b87ee5d6edef42b"
+)
 EXPECTED_FIXTURE_ID = (
     "sha256:5010492fb74eda207511b26811992ed4779814185b9f184663b37a37747bd051"
 )
@@ -64,6 +68,7 @@ EXPECTED_SUBMIT_COUNT = 206
 EXPECTED_IN_RANGE_SUBMIT_COUNT = 64
 EXPECTED_EXHAUSTED_SUBMIT_COUNT = 142
 EXPECTED_TARGET_ACTION_COUNT = sum(EXPECTED_KIND_COUNTS[1:4])
+EXPECTED_OUTPUT_CAPACITY_PER_REQUEST = 2
 
 # Exact schema maximum for the finished event model.  Several classes are not
 # allocated by the submission-only layer yet, but reserving and checking their
@@ -140,7 +145,10 @@ _CONTROL_LIFECYCLE_EDGE_INPUT_BUDGET = (
     ("action interval custody", 3 * EXPECTED_ACTION_COUNT),
     ("submission custody", 15 * EXPECTED_IN_RANGE_SUBMIT_COUNT),
     ("target access custody", 4 * EXPECTED_TARGET_ACTION_COUNT),
-    ("request lifecycle and cleanup partition", 6 * EXPECTED_IN_RANGE_SUBMIT_COUNT + 2),
+    (
+        "request lifecycle and cleanup partition",
+        6 * EXPECTED_IN_RANGE_SUBMIT_COUNT + 2,
+    ),
     ("cleanup authority sequencing", 4 * EXPECTED_IN_RANGE_SUBMIT_COUNT),
     (
         "control word generation and flag lattice",
@@ -163,6 +171,46 @@ if MAX_CONTROL_LIFECYCLE_EDGE_INPUTS != 10_048:
     raise RuntimeError("control lifecycle edge-input budget does not total 10048")
 if MAX_CONTROL_LIFECYCLE_EDGE_INPUTS > MAX_PROTOCOL_EDGE_INPUTS:
     raise RuntimeError("control lifecycle edge bound exceeds the protocol edge cap")
+
+# Endpoint/output custody adds two request-owned events per accepted request,
+# three receiver-cleanup-owned events per live receiver, one node for every
+# reached opportunistic EOF probe, and the pre-shutdown phase gate.  Semantic
+# output publications remain bounded immutable data: ADR-0007 deliberately
+# gives them no graph nodes because recorder append order is not causal.
+_ENDPOINT_OBSERVATION_NODE_BUDGET = (
+    ("control lifecycle", MAX_CONTROL_LIFECYCLE_NODES),
+    ("endpoint terminal and first EOF events", 2 * EXPECTED_IN_RANGE_SUBMIT_COUNT),
+    ("cleanup receiver events", 3 * EXPECTED_IN_RANGE_SUBMIT_COUNT),
+    ("opportunistic endpoint pops", EXPECTED_KIND_COUNTS[3]),
+    ("pre-shutdown phase gate", 1),
+)
+MAX_ENDPOINT_OBSERVATION_NODES = 4_118
+if (
+    sum(count for _, count in _ENDPOINT_OBSERVATION_NODE_BUDGET)
+    != MAX_ENDPOINT_OBSERVATION_NODES
+):
+    raise RuntimeError("endpoint observation node budget does not total 4118")
+if MAX_ENDPOINT_OBSERVATION_NODES > MAX_PROTOCOL_NODES:
+    raise RuntimeError("endpoint observation node budget exceeds the protocol cap")
+
+# This bound intentionally counts inputs before edge deduplication.  Sixteen
+# relations per possible request cover lifecycle, reuse, cleanup, phase, and
+# pump-hold brackets; eight per drain cover the primary/opportunistic/cached
+# specializations.  Eight fixed phase endpoints leave generous explicit
+# headroom without approaching the frozen 32,768-input protocol cap.
+_ENDPOINT_OBSERVATION_EDGE_INPUT_BUDGET = (
+    ("control lifecycle", MAX_CONTROL_LIFECYCLE_EDGE_INPUTS),
+    ("request and cleanup endpoint custody", 16 * EXPECTED_IN_RANGE_SUBMIT_COUNT),
+    ("drain and opportunistic EOF custody", 8 * EXPECTED_KIND_COUNTS[3]),
+    ("phase endpoints", 8),
+)
+MAX_ENDPOINT_OBSERVATION_EDGE_INPUTS = sum(
+    count for _, count in _ENDPOINT_OBSERVATION_EDGE_INPUT_BUDGET
+)
+if MAX_ENDPOINT_OBSERVATION_EDGE_INPUTS != 12_976:
+    raise RuntimeError("endpoint observation edge-input budget does not total 12976")
+if MAX_ENDPOINT_OBSERVATION_EDGE_INPUTS > MAX_PROTOCOL_EDGE_INPUTS:
+    raise RuntimeError("endpoint observation edge bound exceeds the protocol cap")
 _SCHEDULER_TO_CAPTURE_KIND = {
     "submit": "submit",
     "cancel": "cancel",
@@ -686,12 +734,113 @@ class ControlLifecycleOrder:
     graph: ReasonedDAG
 
 
+@dataclass(frozen=True, slots=True)
+class CleanupReceiverEvent:
+    """One event owned by a receiver cleanup record, never an authority."""
+
+    node: int
+    receiver_ordinal: int
+    cleanup_sequence_ordinal: int
+    client_index: int
+    request_id: int
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupReceiverEvents:
+    """Invocation, terminal acknowledgement, and response for one receiver."""
+
+    receiver_ordinal: int
+    cleanup_sequence_ordinal: int
+    identity: AcceptedIdentityProjection
+    invocation: CleanupReceiverEvent
+    terminal_acknowledgement: CleanupReceiverEvent
+    response: CleanupReceiverEvent
+
+
+@dataclass(frozen=True, slots=True)
+class RequestPublicationProjection:
+    """Identity-keyed semantic publication records for one accepted request."""
+
+    identity: AcceptedIdentityProjection
+    outputs: tuple[actor_race_history.Output, ...]
+    terminal: actor_race_history.Terminal
+    eof: actor_race_history.Observation
+
+
+@dataclass(frozen=True, slots=True)
+class EndpointRequestLifecycle:
+    """Endpoint publication, first EOF, drain frontier, and reap custody."""
+
+    identity: AcceptedIdentityProjection
+    request: RequestLifecycleEvents
+    endpoint_terminal_publish: RequestEvent
+    first_eof_acknowledgement: RequestEvent
+    first_eof_source: str
+    drained_output_count: int
+    publications: RequestPublicationProjection
+
+
+@dataclass(frozen=True, slots=True)
+class EndpointObservationMapping:
+    """Immutable endpoint, cleanup receiver, and publication indexes."""
+
+    identities: AcceptedIdentityMapping
+    requests_by_client_index: tuple[EndpointRequestLifecycle | None, ...]
+    requests_by_request_id: tuple[EndpointRequestLifecycle, ...]
+    opportunistic_by_action: tuple[ProtocolEvent | None, ...]
+    cleanup_by_client_index: tuple[CleanupReceiverEvents | None, ...]
+    cleanup_in_order: tuple[CleanupReceiverEvents, ...]
+    publications_by_client_index: tuple[RequestPublicationProjection | None, ...]
+    pre_shutdown: PhaseEvent
+    request_events: tuple[RequestEvent, ...]
+    cleanup_receiver_events: tuple[CleanupReceiverEvent, ...]
+    phase_events: tuple[PhaseEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EndpointObservationOrder:
+    """Control custody extended through endpoint and semantic conservation."""
+
+    control_order: ControlLifecycleOrder
+    endpoint: EndpointObservationMapping
+    graph: ReasonedDAG
+
+
+@dataclass(frozen=True, slots=True)
+class _DescriptorProjection:
+    """Closed structural descriptor facts regenerated before graph work."""
+
+    client_index: int
+    prompt_prefix: int
+    max_new_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class _EndpointObservationInputs:
+    """One-read sealed input snapshot for endpoint/output reconstruction."""
+
+    actions: tuple[actor_race_history.Action, ...]
+    cleanup_authorities: tuple[actor_race_history.CleanupAuthority, ...]
+    cleanup_receivers: tuple[actor_race_history.CleanupReceiver, ...]
+    observations: tuple[actor_race_history.Observation, ...]
+    action_counter_final: int
+    cleanup_counter_final: int
+    recorder_initial: actor_race_history.RecorderStatus
+    recorder_final: actor_race_history.RecorderStatus
+    pre_cleanup: actor_race_history.ProbeSnapshot
+    pre_shutdown: actor_race_history.ProbeSnapshot
+    shutdown: actor_race_history.Shutdown
+    descriptors: tuple[_DescriptorProjection, ...]
+
+
 class _ProtocolGraphPlanner:
     """Bound protocol node and edge allocation before retaining each input."""
 
     __slots__ = (
         "_base_node_count",
         "_cleanup_events",
+        "_cleanup_receiver_events",
         "_constraints",
         "_events",
         "_next_node",
@@ -715,6 +864,7 @@ class _ProtocolGraphPlanner:
         self._events: list[ProtocolEvent] = []
         self._request_events: list[RequestEvent] = []
         self._cleanup_events: list[CleanupEvent] = []
+        self._cleanup_receiver_events: list[CleanupReceiverEvent] = []
         self._phase_events: list[PhaseEvent] = []
 
     @property
@@ -736,6 +886,10 @@ class _ProtocolGraphPlanner:
     @property
     def cleanup_events(self) -> tuple[CleanupEvent, ...]:
         return tuple(self._cleanup_events)
+
+    @property
+    def cleanup_receiver_events(self) -> tuple[CleanupReceiverEvent, ...]:
+        return tuple(self._cleanup_receiver_events)
 
     @property
     def phase_events(self) -> tuple[PhaseEvent, ...]:
@@ -774,6 +928,7 @@ class _ProtocolGraphPlanner:
             "ControlCancel",
             "ControlDisconnect",
             "PrimaryEndpointPop",
+            "OpportunisticEndpointPop",
             "CachedEofRead",
         }:
             _fail("protocol event kind is unsupported")
@@ -795,7 +950,12 @@ class _ProtocolGraphPlanner:
             _fail("request event client index is outside 0..63")
         if request_id < 1 or request_id > EXPECTED_IN_RANGE_SUBMIT_COUNT:
             _fail("request event request ID is outside 1..64")
-        if kind not in {"ControlTerminalPublish", "RequestReap"}:
+        if kind not in {
+            "ControlTerminalPublish",
+            "EndpointTerminalPublish",
+            "FirstEofAcknowledge",
+            "RequestReap",
+        }:
             _fail("request event kind is unsupported")
         event = RequestEvent(
             self._reserve_node(),
@@ -839,10 +999,65 @@ class _ProtocolGraphPlanner:
         self._cleanup_events.append(event)
         return event
 
+    def allocate_cleanup_receiver(
+        self,
+        receiver_ordinal: int,
+        cleanup_sequence_ordinal: int,
+        client_index: int,
+        request_id: int,
+        kind: str,
+    ) -> CleanupReceiverEvent:
+        """Allocate one receiver-owned cleanup event with both exact ordinals."""
+
+        receiver_ordinal = _plain_int(
+            receiver_ordinal,
+            "cleanup receiver event ordinal",
+        )
+        cleanup_sequence_ordinal = _plain_int(
+            cleanup_sequence_ordinal,
+            "cleanup receiver sequence ordinal",
+        )
+        client_index = _plain_int(
+            client_index,
+            "cleanup receiver event client index",
+        )
+        request_id = _plain_int(request_id, "cleanup receiver event request ID")
+        if (
+            receiver_ordinal < 0
+            or receiver_ordinal >= EXPECTED_IN_RANGE_SUBMIT_COUNT
+        ):
+            _fail("cleanup receiver event ordinal is outside 0..63")
+        if (
+            cleanup_sequence_ordinal < 0
+            or cleanup_sequence_ordinal
+            >= 2 * EXPECTED_IN_RANGE_SUBMIT_COUNT
+        ):
+            _fail("cleanup receiver sequence ordinal is outside 0..127")
+        if client_index < 0 or client_index >= EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail("cleanup receiver event client index is outside 0..63")
+        if request_id < 1 or request_id > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail("cleanup receiver event request ID is outside 1..64")
+        if kind not in {
+            "CleanupReceiverInvoke",
+            "CleanupTerminalAcknowledge",
+            "CleanupReceiverRespond",
+        }:
+            _fail("cleanup receiver event kind is unsupported")
+        event = CleanupReceiverEvent(
+            self._reserve_node(),
+            receiver_ordinal,
+            cleanup_sequence_ordinal,
+            client_index,
+            request_id,
+            kind,
+        )
+        self._cleanup_receiver_events.append(event)
+        return event
+
     def allocate_phase(self, kind: str) -> PhaseEvent:
         """Allocate one non-action phase gate."""
 
-        if kind != "PreCleanupGate":
+        if kind not in {"PreCleanupGate", "PreShutdownGate"}:
             _fail("phase event kind is unsupported")
         event = PhaseEvent(self._reserve_node(), kind)
         self._phase_events.append(event)
@@ -3552,20 +3767,18 @@ def _build_control_lifecycle_order(
     )
 
 
-def build_control_lifecycle_order(repetition: Any) -> ControlLifecycleOrder:
-    """Authenticate and reconstruct exact control words and request cleanup."""
+def _build_control_lifecycle_order_from_fields(
+    *,
+    actions: tuple[Any, ...],
+    cleanup_authorities: tuple[actor_race_history.CleanupAuthority, ...],
+    cleanup_receivers: tuple[actor_race_history.CleanupReceiver, ...],
+    action_counter_final: Any,
+    cleanup_counter_final: Any,
+    pre_cleanup: actor_race_history.ProbeSnapshot,
+    shutdown: actor_race_history.Shutdown,
+) -> ControlLifecycleOrder:
+    """Build control custody from values already read out of the caller."""
 
-    try:
-        actions = repetition.actions
-        cleanup_authorities = repetition.cleanup_authorities
-        cleanup_receivers = repetition.cleanup_receivers
-        diagnostics = repetition.diagnostics
-        pre_cleanup = repetition.pre_cleanup
-        shutdown = repetition.shutdown
-        action_counter_final = diagnostics.action_counter_final
-        cleanup_counter_final = diagnostics.cleanup_counter_final
-    except AttributeError:
-        _fail("decoded repetition lacks control lifecycle custody fields")
     _require_exact_decoded_actions(actions)
     _require_exact_cleanup_shells(
         cleanup_authorities,
@@ -3599,6 +3812,1170 @@ def build_control_lifecycle_order(repetition: Any) -> ControlLifecycleOrder:
         cleanup_counter_final,
         pre_cleanup,
     )
+
+
+def build_control_lifecycle_order(repetition: Any) -> ControlLifecycleOrder:
+    """Authenticate and reconstruct exact control words and request cleanup."""
+
+    try:
+        actions = repetition.actions
+        cleanup_authorities = repetition.cleanup_authorities
+        cleanup_receivers = repetition.cleanup_receivers
+        diagnostics = repetition.diagnostics
+        pre_cleanup = repetition.pre_cleanup
+        shutdown = repetition.shutdown
+        action_counter_final = diagnostics.action_counter_final
+        cleanup_counter_final = diagnostics.cleanup_counter_final
+    except AttributeError:
+        _fail("decoded repetition lacks control lifecycle custody fields")
+    return _build_control_lifecycle_order_from_fields(
+        actions=actions,
+        cleanup_authorities=cleanup_authorities,
+        cleanup_receivers=cleanup_receivers,
+        action_counter_final=action_counter_final,
+        cleanup_counter_final=cleanup_counter_final,
+        pre_cleanup=pre_cleanup,
+        shutdown=shutdown,
+    )
+
+
+def _preflight_descriptors() -> tuple[_DescriptorProjection, ...]:
+    """Regenerate and seal the closed 64-descriptor structural projection."""
+
+    try:
+        raw_descriptors = scheduler.build_descriptors()
+    except (OverflowError, RuntimeError, TypeError, ValueError) as error:
+        _fail(f"scheduler descriptor regeneration failed: {error}")
+    if (
+        type(raw_descriptors) is not list
+        or len(raw_descriptors) != EXPECTED_IN_RANGE_SUBMIT_COUNT
+    ):
+        _fail("regenerated descriptors must be an exact 64-entry list")
+    try:
+        descriptor_identity = scheduler.sequence_identity(raw_descriptors)
+    except scheduler.SchedulerFixtureError as error:
+        _fail(f"scheduler descriptor authentication failed: {error}")
+    if descriptor_identity != EXPECTED_DESCRIPTOR_VECTOR_ID:
+        _fail(
+            "regenerated scheduler descriptor identity differs from the frozen corpus"
+        )
+    expected_keys = {
+        "deadline_ns",
+        "index",
+        "max_new_tokens",
+        "prompt",
+        "sampling",
+    }
+    projections: list[_DescriptorProjection] = []
+    for client_index, descriptor in enumerate(raw_descriptors):
+        label = f"regenerated descriptor {client_index}"
+        if type(descriptor) is not dict or set(descriptor) != expected_keys:
+            _fail(f"{label} does not use its closed schema")
+        index = _plain_int(descriptor["index"], f"{label} index")
+        maximum = _plain_int(
+            descriptor["max_new_tokens"],
+            f"{label} max_new_tokens",
+        )
+        prompt = descriptor["prompt"]
+        if index != client_index:
+            _fail(f"{label} index is out of order")
+        if (
+            descriptor["deadline_ns"] is not None
+            or type(descriptor["sampling"]) is not str
+            or descriptor["sampling"] != "greedy"
+        ):
+            _fail(f"{label} policy fields differ from the frozen workload")
+        if type(prompt) is not list or not 1 <= len(prompt) <= 4:
+            _fail(f"{label} prompt must be an exact list with 1..4 tokens")
+        for token_index, token in enumerate(prompt):
+            token = _plain_int(token, f"{label} prompt token {token_index}")
+            if token < 1 or token >= 32:
+                _fail(f"{label} prompt token is outside the tiny-v3 vocabulary")
+        if maximum < 1 or maximum > actor_race_history.MAX_NEW_TOKENS:
+            _fail(f"{label} max_new_tokens is outside 1..16")
+        prompt_prefix = len(prompt) - 1
+        if prompt_prefix + maximum > actor_race_history.MAX_NEW_TOKENS:
+            _fail(f"{label} exceeds the frozen 16-position model envelope")
+        projections.append(
+            _DescriptorProjection(client_index, prompt_prefix, maximum)
+        )
+    return tuple(projections)
+
+
+_PROBE_INTEGER_FIELDS = (
+    "command_in_flight",
+    "command_ready",
+    "command_reserved",
+    "command_responded",
+    "engine_steps",
+    "outstanding_requests",
+    "park_epoch",
+    "pump_entries",
+    "pump_hold_observed",
+    "pump_hold_released",
+    "pump_hold_requested",
+    "request_bytes",
+    "shared_bytes",
+)
+_PROBE_BOOLEAN_FIELDS = (
+    "dirty",
+    "owner_done",
+    "parked",
+    "pump_in_flight",
+)
+
+
+def _preflight_quiescent_snapshot(
+    snapshot: Any,
+    label: str,
+) -> actor_race_history.ProbeSnapshot:
+    if type(snapshot) is not actor_race_history.ProbeSnapshot:
+        _fail(f"{label} has an invalid exact type")
+    for field_name in _PROBE_INTEGER_FIELDS:
+        value = _plain_int(getattr(snapshot, field_name), f"{label} {field_name}")
+        if value < 0 or value > actor_race_history.MAX_U64:
+            _fail(f"{label} {field_name} is outside the u64 range")
+    for field_name in _PROBE_BOOLEAN_FIELDS:
+        _plain_bool(getattr(snapshot, field_name), f"{label} {field_name}")
+    if (
+        not snapshot.parked
+        or snapshot.dirty
+        or snapshot.pump_in_flight
+        or snapshot.owner_done
+    ):
+        _fail(f"{label} is not an acknowledged live-owner quiescent snapshot")
+    if any(
+        (
+            snapshot.command_in_flight,
+            snapshot.command_ready,
+            snapshot.command_reserved,
+            snapshot.command_responded,
+        )
+    ):
+        _fail(f"{label} retained command occupancy")
+    if not (
+        snapshot.pump_hold_requested
+        == snapshot.pump_hold_observed
+        == snapshot.pump_hold_released
+    ):
+        _fail(f"{label} retained an incomplete pump hold")
+    if (snapshot.outstanding_requests == 0) != (snapshot.request_bytes == 0):
+        _fail(f"{label} request count and ledger presence disagree")
+    return snapshot
+
+
+def _preflight_snapshot_not_before(
+    snapshot: actor_race_history.ProbeSnapshot,
+    previous: actor_race_history.ProbeSnapshot,
+    label: str,
+) -> None:
+    if not (
+        snapshot.park_epoch >= previous.park_epoch
+        and snapshot.pump_entries >= previous.pump_entries
+        and snapshot.engine_steps >= previous.engine_steps
+        and snapshot.pump_hold_requested >= previous.pump_hold_requested
+        and snapshot.pump_hold_observed >= previous.pump_hold_observed
+        and snapshot.pump_hold_released >= previous.pump_hold_released
+    ):
+        _fail(f"{label} regressed a monotone actor counter")
+
+
+def _preflight_output_shell(
+    output: Any,
+    label: str,
+) -> actor_race_history.Output:
+    if type(output) is not actor_race_history.Output:
+        _fail(f"{label} has an invalid exact type")
+    request_id = _plain_int(output.request_id, f"{label} request_id")
+    output_index = _plain_int(output.output_index, f"{label} output_index")
+    token_id = _plain_int(output.token_id, f"{label} token_id")
+    if request_id < 1 or request_id > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail(f"{label} request_id is outside 1..64")
+    if output_index < 0 or output_index >= actor_race_history.MAX_NEW_TOKENS:
+        _fail(f"{label} output_index is outside 0..15")
+    if token_id < 0 or token_id > actor_race_history.UINT32_MAX:
+        _fail(f"{label} token_id is outside the u32 range")
+    return output
+
+
+def _preflight_terminal_shell(
+    terminal: Any,
+    label: str,
+) -> actor_race_history.Terminal:
+    if type(terminal) is not actor_race_history.Terminal:
+        _fail(f"{label} has an invalid exact type")
+    request_id = _plain_int(terminal.request_id, f"{label} request_id")
+    if request_id < 1 or request_id > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail(f"{label} request_id is outside 1..64")
+    if type(terminal.outcome) is not str or terminal.outcome not in {
+        "completed",
+        "cancelled",
+    }:
+        _fail(f"{label} outcome is invalid")
+    for field_name in ("committed_positions", "emitted_tokens"):
+        value = _plain_int(getattr(terminal, field_name), f"{label} {field_name}")
+        if value < 0 or value > actor_race_history.MAX_U64:
+            _fail(f"{label} {field_name} is outside the u64 range")
+    return terminal
+
+
+def _preflight_observation_shell(
+    observation: Any,
+    ordinal: int,
+) -> actor_race_history.Observation:
+    label = f"observation {ordinal}"
+    if type(observation) is not actor_race_history.Observation:
+        _fail(f"{label} has an invalid exact type")
+    if type(observation.kind) is not str or observation.kind not in {
+        "output",
+        "terminal",
+        "output_eof",
+    }:
+        _fail(f"{label} kind is invalid")
+    request_id = _plain_int(observation.request_id, f"{label} request_id")
+    if request_id < 1 or request_id > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail(f"{label} request_id is outside 1..64")
+    if observation.kind == "output":
+        _preflight_output_shell(
+            actor_race_history.Output(
+                request_id,
+                observation.output_index,
+                observation.token_id,
+            ),
+            label,
+        )
+        if (
+            observation.outcome is not None
+            or observation.committed_positions is not None
+            or observation.emitted_tokens is not None
+        ):
+            _fail(f"{label} output sentinels are invalid")
+    elif observation.kind == "terminal":
+        if observation.output_index is not None or observation.token_id is not None:
+            _fail(f"{label} terminal sentinels are invalid")
+        _preflight_terminal_shell(
+            actor_race_history.Terminal(
+                request_id,
+                observation.outcome,
+                observation.committed_positions,
+                observation.emitted_tokens,
+            ),
+            label,
+        )
+    elif any(
+        value is not None
+        for value in (
+            observation.output_index,
+            observation.token_id,
+            observation.outcome,
+            observation.committed_positions,
+            observation.emitted_tokens,
+        )
+    ):
+        _fail(f"{label} EOF sentinels are invalid")
+    return observation
+
+
+def _preflight_recorder_status(
+    status: Any,
+    label: str,
+) -> actor_race_history.RecorderStatus:
+    if type(status) is not actor_race_history.RecorderStatus:
+        _fail(f"{label} has an invalid exact type")
+    for field_name in (
+        "allocated_capacity",
+        "observation_count",
+        "observation_limit",
+    ):
+        value = _plain_int(getattr(status, field_name), f"{label} {field_name}")
+        if value < 0 or value > actor_race_history.MAX_U64:
+            _fail(f"{label} {field_name} is outside the u64 range")
+    _plain_bool(status.overflowed, f"{label} overflowed")
+    _plain_bool(status.poisoned, f"{label} poisoned")
+    if status.observation_limit != actor_race_history.OBSERVATION_LIMIT:
+        _fail(f"{label} observation_limit is not 675")
+    if status.overflowed or status.poisoned:
+        _fail(f"{label} is unhealthy")
+    return status
+
+
+def _preflight_endpoint_observation_inputs(
+    repetition: Any,
+) -> _EndpointObservationInputs:
+    """Read every endpoint-slice property once and reject before auth/DAG work."""
+
+    try:
+        actions = repetition.actions
+        cleanup_authorities = repetition.cleanup_authorities
+        cleanup_receivers = repetition.cleanup_receivers
+        observations = repetition.observations
+        diagnostics = repetition.diagnostics
+        pre_cleanup = repetition.pre_cleanup
+        pre_shutdown = repetition.pre_shutdown
+        shutdown = repetition.shutdown
+        action_counter_final = diagnostics.action_counter_final
+        cleanup_counter_final = diagnostics.cleanup_counter_final
+        recorder_initial = diagnostics.recorder_initial
+        recorder_final = diagnostics.recorder_final
+    except AttributeError:
+        _fail("decoded repetition lacks endpoint observation custody fields")
+
+    actions = _require_exact_decoded_actions(actions)
+    for ordinal, action in enumerate(actions):
+        label = f"decoded action {ordinal}"
+        if action.output is not None:
+            _preflight_output_shell(action.output, f"{label} output")
+        for pop_name in ("primary_pop", "opportunistic_eof_pop"):
+            pop = getattr(action, pop_name)
+            if type(pop) is not actor_race_history.PopWitness:
+                _fail(f"{label} {pop_name} has an invalid exact type")
+            if type(pop.kind) is not str:
+                _fail(f"{label} {pop_name} kind must be a string")
+            _plain_bool(pop.boundary, f"{label} {pop_name} boundary")
+            for field_name in (
+                "slot",
+                "generation",
+                "drained_before",
+                "drained_after",
+            ):
+                value = _plain_int(
+                    getattr(pop, field_name),
+                    f"{label} {pop_name} {field_name}",
+                )
+                if value < 0 or value > actor_race_history.MAX_U64:
+                    _fail(f"{label} {pop_name} {field_name} is outside u64")
+            if pop.output is not None:
+                _preflight_output_shell(pop.output, f"{label} {pop_name} output")
+        _plain_bool(action.cached_eof, f"{label} cached_eof")
+
+    if type(cleanup_authorities) is not tuple:
+        _fail("cleanup authorities must be an exact immutable tuple")
+    if type(cleanup_receivers) is not tuple:
+        _fail("cleanup receivers must be an exact immutable tuple")
+    if len(cleanup_authorities) > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail("cleanup authorities exceed the 64-record limit")
+    if len(cleanup_receivers) > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail("cleanup receivers exceed the 64-record limit")
+    for ordinal, authority in enumerate(cleanup_authorities):
+        if type(authority) is not actor_race_history.CleanupAuthority:
+            _fail(f"cleanup authority {ordinal} has an invalid exact type")
+    for ordinal, receiver in enumerate(cleanup_receivers):
+        label = f"cleanup receiver {ordinal}"
+        if type(receiver) is not actor_race_history.CleanupReceiver:
+            _fail(f"{label} has an invalid exact type")
+        _plain_int(receiver.invocation, f"{label} invocation")
+        _plain_int(receiver.response, f"{label} response")
+        _plain_int(receiver.client_index, f"{label} client_index")
+        _plain_int(receiver.request_id, f"{label} request_id")
+        _preflight_terminal_shell(receiver.terminal, f"{label} terminal")
+        if type(receiver.outputs) is not tuple:
+            _fail(f"{label} outputs must be an exact immutable tuple")
+        if len(receiver.outputs) > actor_race_history.MAX_NEW_TOKENS:
+            _fail(f"{label} outputs exceed the frozen generation limit")
+        for output_ordinal, output in enumerate(receiver.outputs):
+            _preflight_output_shell(output, f"{label} output {output_ordinal}")
+        if not _plain_bool(receiver.eof_acknowledged, f"{label} eof_acknowledged"):
+            _fail(f"{label} did not acknowledge EOF")
+        _preflight_quiescent_snapshot(
+            receiver.post_drop_quiescent,
+            f"{label} post_drop_quiescent",
+        )
+
+    if type(observations) is not tuple:
+        _fail("observations must be an exact immutable tuple")
+    if len(observations) > actor_race_history.OBSERVATION_LIMIT:
+        _fail("observations exceed the 675-record limit")
+    for ordinal, observation in enumerate(observations):
+        _preflight_observation_shell(observation, ordinal)
+
+    action_counter_final = _plain_int(
+        action_counter_final,
+        "action_counter_final",
+    )
+    cleanup_counter_final = _plain_int(
+        cleanup_counter_final,
+        "cleanup_counter_final",
+    )
+    pre_cleanup = _preflight_quiescent_snapshot(pre_cleanup, "pre_cleanup")
+    pre_shutdown = _preflight_quiescent_snapshot(pre_shutdown, "pre_shutdown")
+    if type(shutdown) is not actor_race_history.Shutdown:
+        _fail("shutdown has an invalid exact type")
+    recorder_initial = _preflight_recorder_status(
+        recorder_initial,
+        "recorder_initial",
+    )
+    recorder_final = _preflight_recorder_status(
+        recorder_final,
+        "recorder_final",
+    )
+    if recorder_initial.allocated_capacity != recorder_final.allocated_capacity:
+        _fail("recorder capacity changed")
+    if recorder_initial.allocated_capacity < actor_race_history.OBSERVATION_LIMIT:
+        _fail("recorder capacity is below its logical limit")
+    if recorder_initial.observation_count != 0:
+        _fail("initial recorder is not empty")
+    if recorder_final.observation_count != len(observations):
+        _fail("final recorder count differs from observations")
+
+    if pre_cleanup.outstanding_requests != len(cleanup_receivers):
+        _fail("pre_cleanup outstanding requests differ from receiver custody")
+    if pre_cleanup.pump_hold_requested >= actor_race_history.MAX_U64:
+        _fail("cleanup pump-hold epoch overflowed")
+    expected_hold_epoch = pre_cleanup.pump_hold_requested + 1
+    preceding = pre_cleanup
+    for ordinal, receiver in enumerate(cleanup_receivers):
+        snapshot = receiver.post_drop_quiescent
+        label = f"cleanup receiver {ordinal} post_drop_quiescent"
+        _preflight_snapshot_not_before(snapshot, preceding, label)
+        if snapshot.request_bytes >= preceding.request_bytes:
+            _fail(f"{label} did not release request ledger bytes")
+        if (
+            snapshot.pump_entries <= preceding.pump_entries
+            or snapshot.park_epoch <= preceding.park_epoch
+            or snapshot.engine_steps <= preceding.engine_steps
+        ):
+            _fail(f"{label} did not advance actor reap progress")
+        if snapshot.shared_bytes != pre_cleanup.shared_bytes:
+            _fail(f"{label} changed static shared ledger bytes")
+        if not (
+            snapshot.pump_hold_requested
+            == snapshot.pump_hold_observed
+            == snapshot.pump_hold_released
+            == expected_hold_epoch
+        ):
+            _fail(f"{label} does not conserve the cleanup pump hold")
+        if snapshot.outstanding_requests != len(cleanup_receivers) - ordinal - 1:
+            _fail(f"{label} did not reap exactly one receiver")
+        preceding = snapshot
+    _preflight_snapshot_not_before(pre_shutdown, preceding, "pre_shutdown")
+    if pre_shutdown.request_bytes > preceding.request_bytes:
+        _fail("pre_shutdown increased request ledger bytes")
+    if pre_shutdown.shared_bytes != pre_cleanup.shared_bytes:
+        _fail("pre_shutdown changed static shared ledger bytes")
+    if not (
+        pre_shutdown.pump_hold_requested
+        == pre_shutdown.pump_hold_observed
+        == pre_shutdown.pump_hold_released
+        == expected_hold_epoch
+    ):
+        _fail("pre_shutdown does not conserve the cleanup pump hold")
+    if pre_shutdown.outstanding_requests != 0 or pre_shutdown.request_bytes != 0:
+        _fail("pre_shutdown retained request-owned state")
+
+    descriptors = _preflight_descriptors()
+    return _EndpointObservationInputs(
+        actions,
+        cleanup_authorities,
+        cleanup_receivers,
+        observations,
+        action_counter_final,
+        cleanup_counter_final,
+        recorder_initial,
+        recorder_final,
+        pre_cleanup,
+        pre_shutdown,
+        shutdown,
+        descriptors,
+    )
+
+
+def _build_publication_projections(
+    inputs: _EndpointObservationInputs,
+    identities: AcceptedIdentityMapping,
+) -> tuple[
+    tuple[RequestPublicationProjection | None, ...],
+    tuple[RequestPublicationProjection, ...],
+]:
+    """Validate semantic conservation without treating recorder order as time."""
+
+    accepted_count = len(identities.by_request_id)
+    outputs_by_request: list[list[actor_race_history.Output]] = [
+        [] for _ in range(accepted_count + 1)
+    ]
+    terminals_by_request: list[actor_race_history.Terminal | None] = [
+        None
+    ] * (accepted_count + 1)
+    eofs_by_request: list[actor_race_history.Observation | None] = [
+        None
+    ] * (accepted_count + 1)
+    phase = 0
+    previous_output: tuple[int, int] | None = None
+    previous_terminal = 0
+    previous_eof = 0
+
+    for ordinal, observation in enumerate(inputs.observations):
+        label = f"observation {ordinal}"
+        request_id = observation.request_id
+        if request_id > accepted_count:
+            _fail(f"{label} refers to an unaccepted request")
+        if observation.kind == "output":
+            if phase != 0:
+                _fail(f"{label} output appears after a later semantic phase")
+            output_index = observation.output_index
+            token_id = observation.token_id
+            if type(output_index) is not int or type(token_id) is not int:
+                _fail(f"{label} output fields are not exact integers")
+            key = (request_id, output_index)
+            if previous_output is not None and key <= previous_output:
+                _fail("semantic output observations are not strictly sorted")
+            previous_output = key
+            if token_id >= 32:
+                _fail(f"{label} token is outside the tiny-v3 vocabulary")
+            outputs_by_request[request_id].append(
+                actor_race_history.Output(request_id, output_index, token_id)
+            )
+        elif observation.kind == "terminal":
+            if phase > 1:
+                _fail(f"{label} terminal appears after the EOF phase")
+            phase = 1
+            if request_id <= previous_terminal:
+                _fail("semantic terminal observations are not strictly sorted")
+            previous_terminal = request_id
+            if terminals_by_request[request_id] is not None:
+                _fail(f"request {request_id} has duplicate terminal observations")
+            terminals_by_request[request_id] = actor_race_history.Terminal(
+                request_id,
+                observation.outcome,
+                observation.committed_positions,
+                observation.emitted_tokens,
+            )
+        else:
+            phase = 2
+            if request_id <= previous_eof:
+                _fail("semantic EOF observations are not strictly sorted")
+            previous_eof = request_id
+            if eofs_by_request[request_id] is not None:
+                _fail(f"request {request_id} has duplicate EOF observations")
+            eofs_by_request[request_id] = observation
+
+    by_client: list[RequestPublicationProjection | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    by_request: list[RequestPublicationProjection] = []
+    for identity in identities.by_request_id:
+        request_id = identity.request_id
+        outputs = tuple(outputs_by_request[request_id])
+        terminal = terminals_by_request[request_id]
+        eof = eofs_by_request[request_id]
+        if terminal is None:
+            _fail(f"request {request_id} has no terminal observation")
+        if eof is None:
+            _fail(f"request {request_id} has no first-EOF observation")
+        if tuple(output.output_index for output in outputs) != tuple(
+            range(len(outputs))
+        ):
+            _fail(f"request {request_id} output publications are not consecutive")
+        descriptor = inputs.descriptors[identity.client_index]
+        if len(outputs) > descriptor.max_new_tokens:
+            _fail(f"request {request_id} exceeds its descriptor output limit")
+        if terminal.emitted_tokens != len(outputs):
+            _fail(f"request {request_id} terminal/output counts differ")
+        maximum_committed = descriptor.prompt_prefix + descriptor.max_new_tokens
+        if terminal.committed_positions > maximum_committed:
+            _fail(f"request {request_id} exceeds its committed-position envelope")
+        expected_emitted = max(
+            0,
+            terminal.committed_positions - descriptor.prompt_prefix,
+        )
+        if terminal.emitted_tokens != expected_emitted:
+            _fail(f"request {request_id} terminal progress is inconsistent")
+        if any(output.token_id == 0 for output in outputs[:-1]):
+            _fail(f"request {request_id} published output after EOS")
+        if terminal.outcome == "completed":
+            if not outputs:
+                _fail(f"request {request_id} completed without an output")
+            if (
+                len(outputs) < descriptor.max_new_tokens
+                and outputs[-1].token_id != 0
+            ):
+                _fail(f"request {request_id} completed early without EOS")
+        else:
+            if len(outputs) >= descriptor.max_new_tokens:
+                _fail(f"request {request_id} cancelled at its generation limit")
+            if outputs and outputs[-1].token_id == 0:
+                _fail(f"request {request_id} cancelled after EOS")
+        projection = RequestPublicationProjection(identity, outputs, terminal, eof)
+        by_client[identity.client_index] = projection
+        by_request.append(projection)
+    return tuple(by_client), tuple(by_request)
+
+
+def _terminal_matches(
+    actual: actor_race_history.Terminal,
+    expected: actor_race_history.Terminal,
+) -> bool:
+    return _same_exact_value(actual, expected)
+
+
+def _build_endpoint_observation_order(
+    inputs: _EndpointObservationInputs,
+    control_order: ControlLifecycleOrder,
+) -> EndpointObservationOrder:
+    """Extend one sealed control graph through endpoint/output conservation."""
+
+    identities = control_order.lifecycle.identities
+    publications_by_client, publications_by_request = (
+        _build_publication_projections(inputs, identities)
+    )
+    for slot in control_order.lifecycle.control_by_slot:
+        for state in slot:
+            publication = publications_by_client[state.identity.client_index]
+            if publication is None:
+                _fail("control generation omitted its request publication")
+            if publication.terminal.outcome != "cancelled":
+                continue
+            cancel_publisher = state.cancel_publisher
+            if (
+                cancel_publisher is None
+                or cancel_publisher.resulting_word & _CONTROL_TERMINAL
+            ):
+                _fail("cancelled terminal lacks a preterminal C publisher")
+    for observation in control_order.lifecycle.observations:
+        if (
+            observation.source_kind != "cleanup"
+            or observation.stale
+            or observation.disposition != "requested"
+        ):
+            continue
+        publication = publications_by_client[observation.owner_client_index]
+        if publication is None:
+            _fail("requested control observation omitted its request publication")
+        if publication.terminal.outcome != "cancelled":
+            _fail("requested control disposition did not reach a cancelled terminal")
+
+    planner = _ProtocolGraphPlanner(control_order.graph.node_count)
+    planner.layer(control_order.graph)
+    endpoint_terminal_by_client: list[RequestEvent | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    first_eof_by_client: list[RequestEvent | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    for identity in identities.by_request_id:
+        request = control_order.lifecycle.requests_by_client_index[
+            identity.client_index
+        ]
+        endpoint_bind = identity.submission.endpoint_bind
+        if request is None or endpoint_bind is None:
+            _fail("accepted request omitted endpoint lifecycle custody")
+        endpoint_terminal = planner.allocate_request(
+            identity.client_index,
+            identity.request_id,
+            "EndpointTerminalPublish",
+        )
+        first_eof = planner.allocate_request(
+            identity.client_index,
+            identity.request_id,
+            "FirstEofAcknowledge",
+        )
+        endpoint_terminal_by_client[identity.client_index] = endpoint_terminal
+        first_eof_by_client[identity.client_index] = first_eof
+        planner.edge(
+            endpoint_bind.node,
+            endpoint_terminal.node,
+            "endpoint-bind-before-terminal-publication",
+        )
+        planner.edge(
+            request.control_terminal_publish.node,
+            endpoint_terminal.node,
+            "control-terminal-before-endpoint-terminal",
+        )
+        planner.edge(
+            endpoint_terminal.node,
+            first_eof.node,
+            "endpoint-terminal-before-first-EOF",
+        )
+        planner.edge(
+            first_eof.node,
+            request.request_reap.node,
+            "first-EOF-before-request-reap",
+        )
+
+    cleanup_authorities = control_order.lifecycle.cleanup_in_order
+    if cleanup_authorities:
+        first_authority = cleanup_authorities[0]
+        for slot in control_order.lifecycle.control_by_slot:
+            for state in slot:
+                cleanup_observations = tuple(
+                    observation
+                    for observation in state.observations
+                    if observation.source_kind == "cleanup"
+                )
+                if cleanup_observations and any(
+                    (observation.loaded_word | observation.resulting_word)
+                    & _CONTROL_TERMINAL
+                    for observation in cleanup_observations
+                ):
+                    endpoint_terminal = endpoint_terminal_by_client[
+                        state.identity.client_index
+                    ]
+                    if endpoint_terminal is None:
+                        _fail("cleanup T observation omitted endpoint terminal custody")
+                    planner.edge(
+                        endpoint_terminal.node,
+                        first_authority.invocation.node,
+                        "endpoint-terminal-before-cleanup-hold",
+                    )
+
+    opportunistic_by_action: list[ProtocolEvent | None] = [
+        None
+    ] * EXPECTED_ACTION_COUNT
+    drained_by_client = [0] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    first_eof_source: list[str | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    cached_seen = [False] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    interval_mapping = control_order.target_order.submission_order.interval_order
+
+    for identity in identities.by_request_id:
+        client_index = identity.client_index
+        request = control_order.lifecycle.requests_by_client_index[client_index]
+        endpoint_terminal = endpoint_terminal_by_client[client_index]
+        first_eof = first_eof_by_client[client_index]
+        publication = publications_by_client[client_index]
+        endpoint_bind = identity.submission.endpoint_bind
+        if (
+            request is None
+            or endpoint_terminal is None
+            or first_eof is None
+            or publication is None
+            or endpoint_bind is None
+        ):
+            _fail("endpoint request projection is incomplete")
+        for target in control_order.target_order.targets.by_client_index[client_index]:
+            if target.event.kind not in {"PrimaryEndpointPop", "CachedEofRead"}:
+                continue
+            if target.identity != identity:
+                _fail("endpoint action differs from its accepted request")
+            action = inputs.actions[target.action_ordinal]
+            endpoints = interval_mapping.endpoints.by_action[target.action_ordinal]
+            planner.edge(
+                endpoint_bind.node,
+                target.event.node,
+                "endpoint-bind-before-drain-event",
+            )
+            planner.edge(
+                target.event.node,
+                request.request_reap.node,
+                "drain-event-before-request-reap",
+            )
+            if target.event.kind == "CachedEofRead":
+                if first_eof_source[client_index] is None:
+                    _fail(
+                        f"drain action {target.action_ordinal} cached EOF before "
+                        "its first acknowledgement"
+                    )
+                cached_seen[client_index] = True
+                planner.edge(
+                    first_eof.node,
+                    target.event.node,
+                    "first-EOF-before-cached-read",
+                )
+                continue
+
+            if cached_seen[client_index] or first_eof_source[client_index] is not None:
+                _fail(
+                    f"drain action {target.action_ordinal} re-entered an "
+                    "endpoint after EOF"
+                )
+            primary = action.primary_pop
+            before = primary.drained_before
+            after = primary.drained_after
+            if before != drained_by_client[client_index]:
+                _fail(
+                    f"drain action {target.action_ordinal} breaks its endpoint "
+                    "drain chain"
+                )
+            if action.result == "drain_output":
+                if primary.output is None or after != before + 1:
+                    _fail(
+                        f"drain action {target.action_ordinal} output pop has "
+                        "invalid count algebra"
+                    )
+                if primary.output.output_index != before:
+                    _fail(
+                        f"drain action {target.action_ordinal} output index "
+                        "differs from its frontier"
+                    )
+                if before >= len(publication.outputs) or not _same_exact_value(
+                    primary.output,
+                    publication.outputs[before],
+                ):
+                    _fail(
+                        f"drain action {target.action_ordinal} output has no "
+                        "exact publication"
+                    )
+                drained_by_client[client_index] = after
+                opportunistic = action.opportunistic_eof_pop
+                if opportunistic.boundary:
+                    if (
+                        opportunistic.drained_before != after
+                        or opportunistic.drained_after != after
+                        or opportunistic.output is not None
+                    ):
+                        _fail(
+                            f"drain action {target.action_ordinal} opportunistic "
+                            "EOF breaks its count chain"
+                        )
+                    event = planner.allocate(
+                        target.action_ordinal,
+                        "OpportunisticEndpointPop",
+                    )
+                    opportunistic_by_action[target.action_ordinal] = event
+                    planner.edge(
+                        target.event.node,
+                        event.node,
+                        "primary-pop-before-opportunistic-EOF",
+                    )
+                    planner.edge(
+                        endpoint_terminal.node,
+                        event.node,
+                        "endpoint-terminal-before-opportunistic-EOF",
+                    )
+                    planner.edge(
+                        event.node,
+                        first_eof.node,
+                        "opportunistic-pop-before-first-EOF",
+                    )
+                    planner.edge(
+                        first_eof.node,
+                        endpoints.response.node,
+                        "first-EOF-before-drain-response",
+                    )
+                    planner.edge(
+                        endpoint_bind.node,
+                        event.node,
+                        "endpoint-bind-before-opportunistic-EOF",
+                    )
+                    planner.edge(
+                        event.node,
+                        request.request_reap.node,
+                        "opportunistic-EOF-before-request-reap",
+                    )
+                    first_eof_source[client_index] = "script_opportunistic"
+            elif action.result == "drain_empty":
+                if primary.output is not None or after != before:
+                    _fail(
+                        f"drain action {target.action_ordinal} empty pop has "
+                        "invalid count algebra"
+                    )
+                planner.edge(
+                    target.event.node,
+                    endpoint_terminal.node,
+                    "empty-pop-before-endpoint-terminal",
+                )
+            elif action.result == "drain_eof":
+                if primary.output is not None or after != before:
+                    _fail(
+                        f"drain action {target.action_ordinal} EOF pop has "
+                        "invalid count algebra"
+                    )
+                planner.edge(
+                    endpoint_terminal.node,
+                    target.event.node,
+                    "endpoint-terminal-before-direct-EOF",
+                )
+                planner.edge(
+                    target.event.node,
+                    first_eof.node,
+                    "direct-pop-before-first-EOF",
+                )
+                planner.edge(
+                    first_eof.node,
+                    endpoints.response.node,
+                    "first-EOF-before-drain-response",
+                )
+                first_eof_source[client_index] = "script_direct"
+            else:
+                _fail(
+                    f"drain action {target.action_ordinal} has an invalid "
+                    "reached result"
+                )
+
+        if drained_by_client[client_index] > len(publication.outputs):
+            _fail(f"request {identity.request_id} drained unpublished output")
+        undrained_output_count = (
+            len(publication.outputs) - drained_by_client[client_index]
+        )
+        if undrained_output_count > EXPECTED_OUTPUT_CAPACITY_PER_REQUEST:
+            _fail(
+                f"request {identity.request_id} retained more than two "
+                "undrained outputs"
+            )
+        if first_eof_source[client_index] in {
+            "script_direct",
+            "script_opportunistic",
+        } and drained_by_client[client_index] != len(publication.outputs):
+            _fail(
+                f"request {identity.request_id} acknowledged EOF before "
+                "conserving publications"
+            )
+        if first_eof_source[client_index] is None:
+            if request.receiver_state == "consumed":
+                drop_ordinal = request.successful_drop_action
+                if drop_ordinal is None:
+                    _fail("consumed request omitted its successful drop")
+                drop = control_order.target_order.targets.by_action[drop_ordinal]
+                if drop is None or drop.event.kind != "ControlDisconnect":
+                    _fail("successful drop omitted its disconnect event")
+                planner.edge(
+                    drop.event.node,
+                    first_eof.node,
+                    "receiver-drop-before-first-EOF",
+                )
+                first_eof_source[client_index] = "receiver_drop"
+            elif request.receiver_state != "live":
+                _fail("request has an unsupported receiver state")
+
+    cleanup_by_client: list[CleanupReceiverEvents | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    cleanup_in_order: list[CleanupReceiverEvents] = []
+    previous_receiver_response: CleanupReceiverEvent | None = None
+    accepted_count = len(identities.by_request_id)
+    for receiver_ordinal, receiver in enumerate(inputs.cleanup_receivers):
+        identity = identities.by_client_index[receiver.client_index]
+        if identity is None or receiver.request_id != identity.request_id:
+            _fail(f"cleanup receiver {receiver_ordinal} lost its accepted identity")
+        request = control_order.lifecycle.requests_by_client_index[
+            identity.client_index
+        ]
+        endpoint_terminal = endpoint_terminal_by_client[identity.client_index]
+        first_eof = first_eof_by_client[identity.client_index]
+        publication = publications_by_client[identity.client_index]
+        if (
+            request is None
+            or endpoint_terminal is None
+            or first_eof is None
+            or publication is None
+            or request.receiver_state != "live"
+        ):
+            _fail(f"cleanup receiver {receiver_ordinal} lacks live request custody")
+        sequence_ordinal = accepted_count + receiver_ordinal
+        invocation = planner.allocate_cleanup_receiver(
+            receiver_ordinal,
+            sequence_ordinal,
+            identity.client_index,
+            identity.request_id,
+            "CleanupReceiverInvoke",
+        )
+        terminal_acknowledgement = planner.allocate_cleanup_receiver(
+            receiver_ordinal,
+            sequence_ordinal,
+            identity.client_index,
+            identity.request_id,
+            "CleanupTerminalAcknowledge",
+        )
+        response = planner.allocate_cleanup_receiver(
+            receiver_ordinal,
+            sequence_ordinal,
+            identity.client_index,
+            identity.request_id,
+            "CleanupReceiverRespond",
+        )
+        events = CleanupReceiverEvents(
+            receiver_ordinal,
+            sequence_ordinal,
+            identity,
+            invocation,
+            terminal_acknowledgement,
+            response,
+        )
+        cleanup_in_order.append(events)
+        cleanup_by_client[identity.client_index] = events
+        if previous_receiver_response is None:
+            if not cleanup_authorities:
+                _fail("cleanup receiver exists without authority custody")
+            planner.edge(
+                cleanup_authorities[-1].response.node,
+                invocation.node,
+                "last-authority-before-first-cleanup-receiver",
+            )
+        else:
+            planner.edge(
+                previous_receiver_response.node,
+                invocation.node,
+                "cleanup-receiver-counter-order",
+            )
+        previous_receiver_response = response
+        planner.edge(
+            invocation.node,
+            terminal_acknowledgement.node,
+            "cleanup-receiver-invocation-before-terminal-ack",
+        )
+        planner.edge(
+            endpoint_terminal.node,
+            terminal_acknowledgement.node,
+            "endpoint-terminal-before-cleanup-terminal-ack",
+        )
+        planner.edge(
+            terminal_acknowledgement.node,
+            request.request_reap.node,
+            "cleanup-terminal-ack-before-request-reap",
+        )
+        planner.edge(
+            request.request_reap.node,
+            response.node,
+            "request-reap-before-cleanup-receiver-response",
+        )
+        if not _terminal_matches(receiver.terminal, publication.terminal):
+            _fail(
+                f"cleanup receiver {receiver_ordinal} terminal differs from "
+                "publication"
+            )
+        drained = drained_by_client[identity.client_index]
+        expected_suffix = publication.outputs[drained:]
+        if not _same_exact_value(receiver.outputs, expected_suffix):
+            _fail(
+                f"cleanup receiver {receiver_ordinal} output is not the exact "
+                "FIFO suffix"
+            )
+        source = first_eof_source[identity.client_index]
+        if source is None:
+            planner.edge(
+                terminal_acknowledgement.node,
+                first_eof.node,
+                "cleanup-terminal-ack-before-first-EOF",
+            )
+            first_eof_source[identity.client_index] = "cleanup_receiver"
+        elif source in {"script_direct", "script_opportunistic"}:
+            planner.edge(
+                first_eof.node,
+                invocation.node,
+                "script-first-EOF-before-cleanup-receiver",
+            )
+        else:
+            _fail(f"cleanup receiver {receiver_ordinal} has foreign EOF custody")
+        previous_receiver_response = response
+
+    for slot_index, slot in enumerate(identities.by_endpoint_slot):
+        for previous, current in zip(slot, slot[1:]):
+            previous_request = control_order.lifecycle.requests_by_client_index[
+                previous.client_index
+            ]
+            next_bind = current.submission.endpoint_bind
+            if previous_request is None or next_bind is None:
+                _fail(f"endpoint slot {slot_index} rebind projection is incomplete")
+            planner.edge(
+                previous_request.request_reap.node,
+                next_bind.node,
+                f"endpoint-slot-{slot_index}-reap-before-rebind",
+            )
+
+    for identity in identities.by_request_id:
+        if first_eof_source[identity.client_index] is None:
+            _fail(f"request {identity.request_id} has no first-EOF source")
+
+    pre_shutdown = planner.allocate_phase("PreShutdownGate")
+    planner.edge(
+        control_order.lifecycle.pre_cleanup.node,
+        pre_shutdown.node,
+        "pre-cleanup-before-pre-shutdown",
+    )
+    if cleanup_in_order:
+        planner.edge(
+            cleanup_in_order[-1].response.node,
+            pre_shutdown.node,
+            "last-cleanup-receiver-before-pre-shutdown",
+        )
+    elif cleanup_authorities:
+        planner.edge(
+            cleanup_authorities[-1].response.node,
+            pre_shutdown.node,
+            "last-cleanup-authority-before-pre-shutdown",
+        )
+    for request in control_order.lifecycle.requests_by_request_id:
+        planner.edge(
+            request.request_reap.node,
+            pre_shutdown.node,
+            "request-reap-before-pre-shutdown",
+        )
+
+    opportunistic_count = sum(event is not None for event in opportunistic_by_action)
+    expected_nodes = (
+        control_order.graph.node_count
+        + 2 * accepted_count
+        + 3 * len(inputs.cleanup_receivers)
+        + opportunistic_count
+        + 1
+    )
+    if planner.node_count != expected_nodes:
+        _fail("endpoint observation node arithmetic changed")
+    if planner.node_count > MAX_ENDPOINT_OBSERVATION_NODES:
+        _fail("endpoint observation graph exceeds its 4118-node slice bound")
+    if planner.edge_input_count > MAX_ENDPOINT_OBSERVATION_EDGE_INPUTS:
+        _fail("endpoint observation graph exceeds its 12976-edge-input bound")
+    graph = planner.build()
+
+    requests_by_client: list[EndpointRequestLifecycle | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    requests_by_request: list[EndpointRequestLifecycle] = []
+    for publication in publications_by_request:
+        identity = publication.identity
+        request = control_order.lifecycle.requests_by_client_index[
+            identity.client_index
+        ]
+        endpoint_terminal = endpoint_terminal_by_client[identity.client_index]
+        first_eof = first_eof_by_client[identity.client_index]
+        source = first_eof_source[identity.client_index]
+        if (
+            request is None
+            or endpoint_terminal is None
+            or first_eof is None
+            or source is None
+        ):
+            _fail("final endpoint request mapping is incomplete")
+        lifecycle = EndpointRequestLifecycle(
+            identity,
+            request,
+            endpoint_terminal,
+            first_eof,
+            source,
+            drained_by_client[identity.client_index],
+            publication,
+        )
+        requests_by_client[identity.client_index] = lifecycle
+        requests_by_request.append(lifecycle)
+
+    return EndpointObservationOrder(
+        control_order,
+        EndpointObservationMapping(
+            identities,
+            tuple(requests_by_client),
+            tuple(requests_by_request),
+            tuple(opportunistic_by_action),
+            tuple(cleanup_by_client),
+            tuple(cleanup_in_order),
+            publications_by_client,
+            pre_shutdown,
+            control_order.lifecycle.request_events + planner.request_events,
+            planner.cleanup_receiver_events,
+            control_order.lifecycle.phase_events + planner.phase_events,
+        ),
+        graph,
+    )
+
+
+def build_endpoint_observation_order(repetition: Any) -> EndpointObservationOrder:
+    """Authenticate one history and prove endpoint/output lifecycle custody.
+
+    This structural gate intentionally does not claim PyTorch token-prefix
+    parity.  Publishable capture validation must layer the separate mandatory
+    model gate over this immutable projection.
+    """
+
+    inputs = _preflight_endpoint_observation_inputs(repetition)
+    control_order = _build_control_lifecycle_order_from_fields(
+        actions=inputs.actions,
+        cleanup_authorities=inputs.cleanup_authorities,
+        cleanup_receivers=inputs.cleanup_receivers,
+        action_counter_final=inputs.action_counter_final,
+        cleanup_counter_final=inputs.cleanup_counter_final,
+        pre_cleanup=inputs.pre_cleanup,
+        shutdown=inputs.shutdown,
+    )
+    return _build_endpoint_observation_order(inputs, control_order)
 
 
 def producer_action_interval_edges(

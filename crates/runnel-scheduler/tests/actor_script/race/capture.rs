@@ -272,6 +272,7 @@ pub(super) struct RepetitionCapture {
 pub(super) struct RepetitionDraft {
     repetition: u64,
     descriptors: Arc<[Descriptor]>,
+    output_capacity_per_request: usize,
     history: CompleteRaceHistory,
     cleanup: RaceCleanupCapture,
     accepted_ids: [u64; REQUEST_COUNT],
@@ -283,6 +284,7 @@ impl RepetitionDraft {
     pub(super) fn new(
         repetition: u64,
         descriptors: Arc<[Descriptor]>,
+        output_capacity_per_request: usize,
         history: CompleteRaceHistory,
         cleanup: RaceCleanupCapture,
         accepted_ids: [u64; REQUEST_COUNT],
@@ -296,6 +298,10 @@ impl RepetitionDraft {
         require(
             descriptors.len() == REQUEST_COUNT,
             "race repetition descriptor table has the wrong length",
+        )?;
+        require(
+            output_capacity_per_request != 0,
+            "race repetition output capacity is zero",
         )?;
         initial_probe.validate_quiescent("initial race")?;
         require(
@@ -318,6 +324,7 @@ impl RepetitionDraft {
         Ok(Self {
             repetition,
             descriptors,
+            output_capacity_per_request,
             history,
             cleanup,
             accepted_ids,
@@ -371,7 +378,13 @@ impl RepetitionDraft {
         validate_recorder_statuses(recorder_initial, recorder_final, &records, accepted)?;
 
         let parts = self.cleanup.into_parts();
-        validate_capture_conservation(&self.history, &parts, &records, &self.accepted_ids)?;
+        validate_capture_conservation(
+            &self.history,
+            &parts,
+            &records,
+            &self.accepted_ids,
+            self.output_capacity_per_request,
+        )?;
         let observations = normalize_observations(records)?;
         require(
             recorder_final.observation_count
@@ -515,11 +528,13 @@ fn validate_capture_conservation(
     parts: &RaceCleanupParts,
     records: &SemanticRecords,
     accepted_ids: &[u64; REQUEST_COUNT],
+    output_capacity_per_request: usize,
 ) -> HarnessResult<()> {
     let mut accepted_from_actions = [0_u64; REQUEST_COUNT];
     let mut accepted_witnesses = [None; REQUEST_COUNT];
     let mut dropped = [false; REQUEST_COUNT];
-    let mut cancellation_forced = [false; REQUEST_COUNT];
+    let mut cancellation_publisher_count = [0_u8; REQUEST_COUNT];
+    let mut cleanup_cancellation_forced = [false; REQUEST_COUNT];
     let mut drained: [Vec<RaceOutput>; REQUEST_COUNT] = std::array::from_fn(|_| Vec::new());
 
     for action in history.actions() {
@@ -571,15 +586,7 @@ fn validate_capture_conservation(
                 action.13.2 == accepted.2 && action.13.3 == accepted.3,
                 "race control witness identity differs from acceptance",
             )?;
-            if matches!(
-                action.13.6,
-                Some(
-                    ControlDispositionCapture::Requested
-                        | ControlDispositionCapture::AlreadyRequested
-                )
-            ) {
-                cancellation_forced[client] = true;
-            }
+            record_preterminal_c_publisher(&mut cancellation_publisher_count[client], action.13)?;
         }
         for endpoint in [action.14, action.15]
             .into_iter()
@@ -636,13 +643,16 @@ fn validate_capture_conservation(
                 && authority.3 == request_id,
             "cleanup authorities are not the exact ascending accepted set",
         )?;
-        if matches!(
-            authority.5.6,
-            Some(
-                ControlDispositionCapture::Requested | ControlDispositionCapture::AlreadyRequested
-            )
-        ) {
-            cancellation_forced[client] = true;
+        let published_c =
+            record_preterminal_c_publisher(&mut cancellation_publisher_count[client], authority.5)?;
+        if authority.5.6 == Some(ControlDispositionCapture::Requested) {
+            // Unlike a producer action, this mutation occurs while the pump
+            // is held and therefore must govern the later terminal decision.
+            require(
+                published_c,
+                "pump-held cleanup request did not publish the cancellation bit",
+            )?;
+            cleanup_cancellation_forced[client] = true;
         }
     }
     require(
@@ -686,11 +696,15 @@ fn validate_capture_conservation(
             u64::from(output.token_id),
         ));
     }
-    for client in 0..REQUEST_COUNT {
-        require(
-            semantic_outputs[client].starts_with(&drained[client]),
-            "script-drained outputs differ from semantic publications",
-        )?;
+    for (client, &request_id) in accepted_ids.iter().enumerate() {
+        if request_id != 0 {
+            validate_undrained_output_capacity(
+                &semantic_outputs[client],
+                &drained[client],
+                output_capacity_per_request,
+                client,
+            )?;
+        }
     }
 
     let mut terminals = [None; REQUEST_COUNT];
@@ -702,12 +716,11 @@ fn validate_capture_conservation(
             "semantic terminal client is out of range or duplicated",
         )?;
         terminals[client] = Some(terminal);
-        if cancellation_forced[client] {
-            require(
-                terminal.outcome == SemanticTerminalOutcome::Cancelled,
-                "witnessed cancellation did not reach a cancelled terminal",
-            )?;
-        }
+        validate_terminal_cancellation(
+            terminal.outcome,
+            cancellation_publisher_count[client],
+            cleanup_cancellation_forced[client],
+        )?;
     }
 
     let mut receiver_cursor = parts.cleanup_receivers.iter();
@@ -750,6 +763,70 @@ fn validate_capture_conservation(
     )
 }
 
+fn validate_undrained_output_capacity(
+    published: &[RaceOutput],
+    drained: &[RaceOutput],
+    output_capacity_per_request: usize,
+    client: usize,
+) -> HarnessResult<()> {
+    require(
+        published.starts_with(drained),
+        "script-drained outputs differ from semantic publications",
+    )?;
+    let undrained = published
+        .len()
+        .checked_sub(drained.len())
+        .ok_or_else(|| format!("client {client} drained more output than was published"))?;
+    require(
+        undrained <= output_capacity_per_request,
+        format!("client {client} undrained output exceeds the actor endpoint capacity"),
+    )
+}
+
+fn validate_terminal_cancellation(
+    outcome: SemanticTerminalOutcome,
+    cancellation_publisher_count: u8,
+    cleanup_cancellation_forced: bool,
+) -> HarnessResult<()> {
+    require(
+        cancellation_publisher_count <= 1,
+        "request retained duplicate preterminal cancellation publishers",
+    )?;
+    require(
+        outcome != SemanticTerminalOutcome::Cancelled || cancellation_publisher_count == 1,
+        "cancelled terminal does not have exactly one preterminal cancellation publisher",
+    )?;
+    require(
+        !cleanup_cancellation_forced || outcome == SemanticTerminalOutcome::Cancelled,
+        "pump-held cleanup cancellation did not reach a cancelled terminal",
+    )
+}
+
+fn record_preterminal_c_publisher(
+    publisher_count: &mut u8,
+    control: ControlWitnessCapture,
+) -> HarnessResult<bool> {
+    control.validate()?;
+    let loaded = control.4.0;
+    let resulting = control.5.0;
+    let publishes_c = control.boundary_reached()
+        && control.6 == Some(ControlDispositionCapture::Requested)
+        && loaded & CANCELLED_FLAG == 0
+        && loaded & TERMINAL_FLAG == 0
+        && resulting & CANCELLED_FLAG != 0;
+    if !publishes_c {
+        return Ok(false);
+    }
+    require(
+        *publisher_count == 0,
+        "request retained duplicate preterminal cancellation publishers",
+    )?;
+    *publisher_count = (*publisher_count)
+        .checked_add(1)
+        .ok_or_else(|| "cancellation publisher count overflowed".to_owned())?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +867,94 @@ mod tests {
                 r#""vector_id":"sha256:5010492fb74eda207511b26811992ed4779814185b9f184663b37a37747bd051","#,
                 r#""vector_schema":"runnel.actor-stress-vectors/2"}"#,
             ),
+        );
+    }
+
+    #[test]
+    fn late_script_cancellation_can_complete_but_cleanup_cancellation_is_forcing() {
+        validate_terminal_cancellation(SemanticTerminalOutcome::Completed, 1, false)
+            .expect("late scripted cancellation may lose to a frozen completion");
+        validate_terminal_cancellation(SemanticTerminalOutcome::Cancelled, 1, false)
+            .expect("witnessed scripted cancellation may cancel");
+        assert!(
+            validate_terminal_cancellation(SemanticTerminalOutcome::Cancelled, 0, false).is_err()
+        );
+        assert!(
+            validate_terminal_cancellation(SemanticTerminalOutcome::Completed, 1, true).is_err()
+        );
+        validate_terminal_cancellation(SemanticTerminalOutcome::Cancelled, 1, true)
+            .expect("pump-held cleanup cancellation must cancel");
+    }
+
+    #[test]
+    fn only_one_exact_preterminal_c_transition_counts_as_the_publisher() {
+        let word = |flags| (1_u64 << 3) | flags;
+        let requested = |operation, loaded, resulting| {
+            ControlWitnessCapture::normalize_parts(
+                operation,
+                true,
+                0,
+                1,
+                word(loaded),
+                word(resulting),
+                ControlOutcome::Disposition(ControlDispositionCapture::Requested),
+            )
+            .expect("valid requested transition")
+        };
+
+        let disconnect_only = requested(
+            ControlOperationCapture::Disconnect,
+            CANCELLED_FLAG,
+            CANCELLED_FLAG | DISCONNECTED_FLAG,
+        );
+        let mut publisher_count = 0;
+        assert!(
+            !record_preterminal_c_publisher(&mut publisher_count, disconnect_only)
+                .expect("D-only transition")
+        );
+        assert_eq!(publisher_count, 0);
+        assert!(
+            validate_terminal_cancellation(
+                SemanticTerminalOutcome::Cancelled,
+                publisher_count,
+                false,
+            )
+            .is_err()
+        );
+
+        let cancel_publisher = requested(ControlOperationCapture::Cancel, 0, CANCELLED_FLAG);
+        assert!(
+            record_preterminal_c_publisher(&mut publisher_count, cancel_publisher)
+                .expect("first C publisher")
+        );
+        assert_eq!(publisher_count, 1);
+
+        let disconnect_publisher = requested(
+            ControlOperationCapture::Disconnect,
+            0,
+            CANCELLED_FLAG | DISCONNECTED_FLAG,
+        );
+        assert!(
+            record_preterminal_c_publisher(&mut publisher_count, disconnect_publisher).is_err()
+        );
+        assert!(
+            validate_terminal_cancellation(SemanticTerminalOutcome::Cancelled, 2, false).is_err()
+        );
+    }
+
+    #[test]
+    fn undrained_output_suffix_is_bounded_by_runtime_capacity() {
+        let published = [
+            RaceOutput(7, 0, 11),
+            RaceOutput(7, 1, 12),
+            RaceOutput(7, 2, 13),
+        ];
+        let drained = [published[0]];
+        validate_undrained_output_capacity(&published, &drained, 2, 0)
+            .expect("two retained outputs fit the endpoint");
+        assert!(validate_undrained_output_capacity(&published, &drained, 1, 0).is_err());
+        assert!(
+            validate_undrained_output_capacity(&published, &[RaceOutput(7, 0, 99)], 2, 0,).is_err()
         );
     }
 }

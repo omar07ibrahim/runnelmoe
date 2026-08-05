@@ -1046,9 +1046,18 @@ permits only `requested` or `already_terminal`; `already_requested` is
 unreachable and invalid in this protocol. A script-dropped and proven-reaped
 record permits only the retained `already_terminal` tombstone or the typed
 stale-generation error after slot reuse. Every probe must witness a nonzero
-generation at its control-word boundary. A `requested` result must correlate
-with a later `cancelled` terminal, as must `requested` from a scripted
-cancellation action. The harness records all cleanup
+generation at its control-word boundary. A `requested` result from this
+pump-held cleanup probe must correlate with a later `cancelled` terminal. A
+scripted cancel or disconnect that returns `requested` proves the control-word
+mutation, but it may race after the actor has irrevocably selected a successful
+completion and therefore may end at `completed`. Conversely, every `cancelled`
+terminal requires exactly one captured preterminal control-word transition from
+`C=0` to `C=1`. A `requested` disposition alone is insufficient: disconnect
+may return `requested` while changing only `D` when `C` was already set.
+Duplicate `C=0 -> C=1` publishers are invalid, `already_requested` is only a
+reader, and an `already_terminal` disconnect that adds `C` is too late. The
+harness does not infer `control-cancel publish < terminal publish` if and only
+if the semantic outcome is `cancelled`. It records all cleanup
 dispositions in the logical cross-language capture but excludes them from the
 semantic transcript bytes.
 
@@ -1057,15 +1066,24 @@ request-index order, each remaining receiver first consumes its terminal result,
 then drains the exact FIFO suffix of committed output through EOF, and is
 dropped; a receiver already dropped by the script is skipped. After each such
 receiver is dropped, the harness waits for acknowledged actor quiescence and
-requires exactly one fewer live request record. The terminal control tombstone
-must remain generation-valid because no new bind occurs during cleanup. The
-harness then drops the stored cancellation authorities, waits for quiescence,
-and requires zero outstanding requests and zero request-owned ledger bytes
-before cooperative actor shutdown. Consequently shutdown itself cancels and
-terminalizes no request, discards no output, and releases no request-owned
-bytes. Terminal and output publication observers retain semantic records even
-when a receiver was previously dropped, so discarded client delivery cannot
-erase a committed event from the golden transcript. Observer-vector order is
+requires exactly one fewer live request record. Relative to the preceding
+authoritative snapshot, that post-drop snapshot must also strictly decrease
+`request_bytes` and strictly increase `pump_entries`, `park_epoch`, and
+`engine_steps`; equality is not accepted as cleanup evidence. The terminal
+control tombstone must remain generation-valid because no new bind occurs
+during cleanup. The remaining semantic output suffix after all scripted drains
+is bounded by the actor's authenticated `output_capacity_per_request` of two
+for every accepted request, whether its receiver was dropped by the script or
+retained for cleanup. Cleanup preallocates its collection for that capacity and
+enforces the same logical limit on every push, instead of using a descriptor's
+lifetime emission bound as queue capacity. The harness then drops the stored
+cancellation authorities, waits for quiescence, and requires zero outstanding
+requests and zero request-owned ledger bytes before cooperative actor shutdown.
+Consequently shutdown itself cancels and terminalizes no request, discards no
+output, and releases no request-owned bytes. Terminal and output publication
+observers retain semantic records even when a receiver was
+previously dropped, so discarded client delivery cannot erase a committed
+event from the golden transcript. Observer-vector order is
 retention order only: endpoint mutation unlocks before recorder append, so the
 golden treats observations as identity-keyed effects and applies the explicit
 sorting rules below rather than interpreting append order as a linearization
@@ -1394,7 +1412,8 @@ CleanupReceiver = [
   client_index        = UInt in 0..63
   request_id          = nonzero UInt
   terminal         = Terminal
-  outputs          = [Output; remaining FIFO suffix length]
+  outputs          = [Output; remaining FIFO suffix length <=
+                      output_capacity_per_request = 2]
   eof_acknowledged = true
   post_drop_quiescent = ProbeSnapshot satisfying quiescence
 
@@ -1410,7 +1429,9 @@ order. Receiver records include exactly the receivers still owned after the
 script, also in ascending client-index order. A receiver interval begins before
 terminal consumption and ends only after FIFO/EOF consumption, handle drop,
 and the acknowledged post-drop snapshot. Its request count is exactly one less
-than the preceding authoritative snapshot.
+than the preceding authoritative snapshot. Its `request_bytes` is strictly
+less, while its `pump_entries`, `park_epoch`, and `engine_steps` are each
+strictly greater, than that preceding snapshot.
 
 Semantic recorder order is discarded. Observations are serialized as all
 outputs sorted by `(request_id, output_index)`, then terminals by request ID,
@@ -1431,6 +1452,12 @@ Observation = [
                "completed" | "cancelled", positions, tokens]
   EOF       = ["output_eof", id, null, null, null, null, null]
 ```
+
+Each accepted request's output indexes are consecutive from zero and its
+terminal emitted count equals that output length. EOS may appear only as the
+last output. A `completed` sequence is nonempty and either reaches its
+descriptor's maximum generation length or ends in EOS; a `cancelled` sequence
+is a strict prefix of that maximum and contains no EOS.
 
 The three lifecycle snapshots are deliberately distinct: `pre_cleanup` is the
 acknowledged quiescent snapshot after producer join; `pre_shutdown` is the
@@ -1518,11 +1545,15 @@ script-dropped records have reaped. While the pump is held, cleanup probes every
 accepted authority in ascending offered-index order and retains each exact
 control witness. After release and re-quiescence, remaining receivers are
 consumed in ascending order: terminal first, then the exact FIFO output suffix
-through EOF. The harness re-quiesces after every drop and requires the live
-count to decrease by one. Authorities are then dropped, pre-shutdown
-quiescence must show zero outstanding requests and zero request-owned ledger
-use. Cooperative shutdown must have zero request effects. The post-shutdown
-owner-done snapshot must show zero request and shared-ledger use.
+through EOF. For every accepted request, including script-dropped receivers,
+the semantic publications not consumed by scripted drains are at most the
+authenticated endpoint capacity of two. The harness re-quiesces after every
+cleanup drop and requires the live count and request ledger bytes to decrease
+strictly while pump entries, park epoch, and engine steps each advance
+strictly. Authorities are then dropped, pre-shutdown quiescence must show zero
+outstanding requests and zero request-owned ledger use. Cooperative shutdown
+must have zero request effects. The post-shutdown owner-done snapshot must show
+zero request and shared-ledger use.
 
 The independent checker regenerates all descriptors and actions and constructs
 a partial-order DAG from producer order and strict response-before-invocation

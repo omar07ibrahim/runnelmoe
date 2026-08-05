@@ -502,13 +502,18 @@ pub(super) async fn finish_receiver_with_preallocated_witness(
     _client_index: usize,
     mut handle: RequestHandle,
     mut outputs: Vec<OutputEvent>,
+    logical_output_capacity: usize,
     sink: ActorRequestDropWitnessSink,
 ) -> HarnessResult<CleanupResult> {
     require(
         outputs.is_empty(),
         "preallocated cleanup output buffer was not empty",
     )?;
-    let output_capacity = outputs.capacity();
+    require(
+        logical_output_capacity != 0 && outputs.capacity() >= logical_output_capacity,
+        "preallocated cleanup output buffer is smaller than its logical capacity",
+    )?;
+    let allocated_capacity = outputs.capacity();
     let request_id = handle.request_id();
     let terminal = handle
         .terminal()
@@ -530,8 +535,8 @@ pub(super) async fn finish_receiver_with_preallocated_witness(
                     "cleanup output identity changed",
                 )?;
                 require(
-                    outputs.len() < output_capacity,
-                    "preallocated cleanup output capacity was exhausted",
+                    outputs.len() < logical_output_capacity,
+                    "logical cleanup output capacity was exhausted",
                 )?;
                 outputs.push(event);
             }
@@ -558,6 +563,10 @@ pub(super) async fn finish_receiver_with_preallocated_witness(
             "cleanup destructor returned an unexpected error: {error}"
         ));
     }
+    require(
+        outputs.capacity() == allocated_capacity,
+        "preallocated cleanup output buffer grew",
+    )?;
     Ok(CleanupResult { terminal, outputs })
 }
 
@@ -747,29 +756,69 @@ pub(super) fn collect_semantic_records(
             output_count == expected_emitted,
             format!("client {client} committed and emitted progress is inconsistent"),
         )?;
-        if terminal.outcome == SemanticTerminalOutcome::Completed {
-            require(
-                output_count > 0,
-                format!("client {client} completed without an output"),
-            )?;
-            if output_count < max_new_tokens {
-                let last = outputs
-                    .iter()
-                    .rev()
-                    .find(|output| output.client_index == client_u32)
-                    .ok_or_else(|| format!("client {client} completed without publication"))?;
-                require(
-                    last.token_id == EOS_TOKEN_ID,
-                    format!("client {client} completed early without EOS"),
-                )?;
-            }
-        }
+        validate_terminal_stop_rules(
+            client,
+            terminal.outcome,
+            output_count,
+            max_new_tokens,
+            outputs
+                .iter()
+                .filter(|output| output.client_index == client_u32)
+                .map(|output| output.token_id),
+        )?;
     }
     Ok(SemanticRecords {
         outputs,
         terminals,
         eofs,
     })
+}
+
+fn validate_terminal_stop_rules(
+    client: usize,
+    outcome: SemanticTerminalOutcome,
+    output_count: usize,
+    max_new_tokens: usize,
+    output_tokens: impl IntoIterator<Item = u32>,
+) -> HarnessResult<()> {
+    let mut observed = 0_usize;
+    let mut last_token = None;
+    for token in output_tokens {
+        require(
+            last_token != Some(EOS_TOKEN_ID),
+            format!("client {client} published output after EOS"),
+        )?;
+        last_token = Some(token);
+        observed = observed
+            .checked_add(1)
+            .ok_or_else(|| "semantic output count overflowed".to_owned())?;
+    }
+    require(
+        observed == output_count,
+        format!("client {client} stop-rule output count changed"),
+    )?;
+    match outcome {
+        SemanticTerminalOutcome::Completed => {
+            require(
+                output_count > 0,
+                format!("client {client} completed without an output"),
+            )?;
+            require(
+                output_count == max_new_tokens || last_token == Some(EOS_TOKEN_ID),
+                format!("client {client} completed early without EOS"),
+            )
+        }
+        SemanticTerminalOutcome::Cancelled => {
+            require(
+                output_count < max_new_tokens,
+                format!("client {client} cancelled at its generation limit"),
+            )?;
+            require(
+                last_token != Some(EOS_TOKEN_ID),
+                format!("client {client} cancelled after EOS"),
+            )
+        }
+    }
 }
 
 fn actor_limits_from_config(config: &ActorConfig) -> HarnessResult<SchedulerLimits> {
@@ -958,4 +1007,54 @@ pub(super) fn to_usize(value: u32, field: &str) -> HarnessResult<usize> {
 pub(super) fn digest_label(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_stop_rules_reject_impossible_output_prefixes() {
+        validate_terminal_stop_rules(
+            0,
+            SemanticTerminalOutcome::Completed,
+            2,
+            3,
+            [7, EOS_TOKEN_ID],
+        )
+        .expect("early EOS completion");
+        validate_terminal_stop_rules(0, SemanticTerminalOutcome::Completed, 3, 3, [7, 8, 9])
+            .expect("full-length completion");
+        validate_terminal_stop_rules(0, SemanticTerminalOutcome::Cancelled, 1, 3, [7])
+            .expect("strict non-EOS cancellation prefix");
+
+        assert!(
+            validate_terminal_stop_rules(
+                0,
+                SemanticTerminalOutcome::Completed,
+                2,
+                3,
+                [EOS_TOKEN_ID, 7],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_terminal_stop_rules(0, SemanticTerminalOutcome::Completed, 1, 3, [7],)
+                .is_err()
+        );
+        assert!(
+            validate_terminal_stop_rules(
+                0,
+                SemanticTerminalOutcome::Cancelled,
+                1,
+                3,
+                [EOS_TOKEN_ID],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_terminal_stop_rules(0, SemanticTerminalOutcome::Cancelled, 3, 3, [7, 8, 9],)
+                .is_err()
+        );
+    }
 }

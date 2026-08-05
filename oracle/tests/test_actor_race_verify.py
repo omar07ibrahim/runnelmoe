@@ -811,6 +811,260 @@ def _exact_control_repetition() -> SimpleNamespace:
     )
 
 
+def _recorder_status(observation_count: int) -> actor_race_history.RecorderStatus:
+    return actor_race_history.RecorderStatus(
+        actor_race_history.OBSERVATION_LIMIT,
+        observation_count,
+        actor_race_history.OBSERVATION_LIMIT,
+        False,
+        False,
+    )
+
+
+def _held_probe_snapshot(
+    outstanding_requests: int,
+    reap_progress: int,
+) -> actor_race_history.ProbeSnapshot:
+    return replace(
+        _probe_snapshot(outstanding_requests),
+        engine_steps=1 + reap_progress,
+        park_epoch=reap_progress,
+        pump_entries=1 + reap_progress,
+        pump_hold_observed=1,
+        pump_hold_released=1,
+        pump_hold_requested=1,
+    )
+
+
+def _exact_endpoint_repetition() -> SimpleNamespace:
+    """Extend the exact control fixture with grounded endpoint semantics."""
+
+    repetition = _exact_control_repetition()
+    actions = list(repetition.actions)
+    accepted = {
+        action.client_index: action.accepted
+        for action in actions
+        if action.result == "submit_accepted"
+    }
+    cached_ordinal = next(
+        action.ordinal for action in actions if action.cached_eof
+    )
+    cached_action = actions[cached_ordinal]
+    assert cached_action.client_index is not None
+    identity = accepted[cached_action.client_index]
+    actions[cached_ordinal] = replace(
+        cached_action,
+        result="drain_empty",
+        cached_eof=False,
+        primary_pop=actor_race_history.PopWitness(
+            "primary",
+            True,
+            identity.endpoint_slot,
+            identity.endpoint_generation,
+            0,
+            0,
+            None,
+        ),
+    )
+
+    descriptors = actor_race_verify.scheduler.build_descriptors()
+    terminals = {
+        witness.request_id: actor_race_history.Terminal(
+            witness.request_id,
+            "cancelled",
+            len(descriptors[client_index]["prompt"]) - 1,
+            0,
+        )
+        for client_index, witness in accepted.items()
+    }
+    receivers = tuple(
+        replace(
+            receiver,
+            terminal=terminals[receiver.request_id],
+            post_drop_quiescent=_held_probe_snapshot(
+                len(repetition.cleanup_receivers) - ordinal - 1,
+                ordinal + 1,
+            ),
+        )
+        for ordinal, receiver in enumerate(repetition.cleanup_receivers)
+    )
+    observations = tuple(
+        actor_race_history.Observation(
+            "terminal",
+            request_id,
+            None,
+            None,
+            terminal.outcome,
+            terminal.committed_positions,
+            terminal.emitted_tokens,
+        )
+        for request_id, terminal in sorted(terminals.items())
+    ) + tuple(
+        actor_race_history.Observation(
+            "output_eof",
+            request_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        for request_id in sorted(terminals)
+    )
+    return SimpleNamespace(
+        actions=tuple(actions),
+        cleanup_authorities=repetition.cleanup_authorities,
+        cleanup_receivers=receivers,
+        diagnostics=SimpleNamespace(
+            action_counter_final=repetition.diagnostics.action_counter_final,
+            cleanup_counter_final=repetition.diagnostics.cleanup_counter_final,
+            recorder_initial=_recorder_status(0),
+            recorder_final=_recorder_status(len(observations)),
+        ),
+        observations=observations,
+        pre_cleanup=repetition.pre_cleanup,
+        pre_shutdown=_held_probe_snapshot(
+            0,
+            len(repetition.cleanup_receivers),
+        ),
+        shutdown=repetition.shutdown,
+    )
+
+
+def _exact_cleanup_requested_endpoint_repetition() -> SimpleNamespace:
+    """Ground the one-request cleanup-Requested control fixture."""
+
+    repetition = _live_cleanup_requested_repetition()
+    receiver = repetition.cleanup_receivers[0]
+    receiver = replace(
+        receiver,
+        post_drop_quiescent=_held_probe_snapshot(0, 1),
+    )
+    observations = (
+        actor_race_history.Observation(
+            "terminal",
+            receiver.request_id,
+            None,
+            None,
+            receiver.terminal.outcome,
+            receiver.terminal.committed_positions,
+            receiver.terminal.emitted_tokens,
+        ),
+        actor_race_history.Observation(
+            "output_eof",
+            receiver.request_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    return SimpleNamespace(
+        actions=repetition.actions,
+        cleanup_authorities=repetition.cleanup_authorities,
+        cleanup_receivers=(receiver,),
+        diagnostics=SimpleNamespace(
+            action_counter_final=repetition.diagnostics.action_counter_final,
+            cleanup_counter_final=repetition.diagnostics.cleanup_counter_final,
+            recorder_initial=_recorder_status(0),
+            recorder_final=_recorder_status(len(observations)),
+        ),
+        observations=observations,
+        pre_cleanup=repetition.pre_cleanup,
+        pre_shutdown=_held_probe_snapshot(0, 1),
+        shutdown=repetition.shutdown,
+    )
+
+
+def _replace_endpoint_repetition(
+    repetition: SimpleNamespace,
+    **changes: object,
+) -> SimpleNamespace:
+    values = {
+        "actions": repetition.actions,
+        "cleanup_authorities": repetition.cleanup_authorities,
+        "cleanup_receivers": repetition.cleanup_receivers,
+        "diagnostics": repetition.diagnostics,
+        "observations": repetition.observations,
+        "pre_cleanup": repetition.pre_cleanup,
+        "pre_shutdown": repetition.pre_shutdown,
+        "shutdown": repetition.shutdown,
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def _with_endpoint_publications(
+    repetition: SimpleNamespace,
+    client_index: int,
+    outputs: tuple[actor_race_history.Output, ...],
+    cleanup_outputs: tuple[actor_race_history.Output, ...],
+    *,
+    terminal_outcome: str = "cancelled",
+) -> SimpleNamespace:
+    submit = next(
+        action
+        for action in repetition.actions
+        if action.result == "submit_accepted" and action.client_index == client_index
+    )
+    request_id = submit.request_id
+    assert request_id is not None
+    descriptor = actor_race_verify.scheduler.build_descriptors()[client_index]
+    terminal = actor_race_history.Terminal(
+        request_id,
+        terminal_outcome,
+        len(descriptor["prompt"]) - 1 + len(outputs),
+        len(outputs),
+    )
+    output_observations = tuple(
+        actor_race_history.Observation(
+            "output",
+            output.request_id,
+            output.output_index,
+            output.token_id,
+            None,
+            None,
+            None,
+        )
+        for output in outputs
+    )
+    later_observations = tuple(
+        replace(
+            observation,
+            outcome=terminal.outcome,
+            committed_positions=terminal.committed_positions,
+            emitted_tokens=terminal.emitted_tokens,
+        )
+        if observation.kind == "terminal" and observation.request_id == request_id
+        else observation
+        for observation in repetition.observations
+    )
+    observations = output_observations + later_observations
+    receivers = tuple(
+        replace(
+            receiver,
+            terminal=terminal,
+            outputs=cleanup_outputs,
+        )
+        if receiver.client_index == client_index
+        else receiver
+        for receiver in repetition.cleanup_receivers
+    )
+    diagnostics = SimpleNamespace(
+        action_counter_final=repetition.diagnostics.action_counter_final,
+        cleanup_counter_final=repetition.diagnostics.cleanup_counter_final,
+        recorder_initial=repetition.diagnostics.recorder_initial,
+        recorder_final=_recorder_status(len(observations)),
+    )
+    return _replace_endpoint_repetition(
+        repetition,
+        cleanup_receivers=receivers,
+        diagnostics=diagnostics,
+        observations=observations,
+    )
+
+
 def _live_cleanup_requested_repetition() -> SimpleNamespace:
     """Keep one submit unpublished until all of its script cancels miss."""
 
@@ -2690,6 +2944,1113 @@ class ControlLifecycleOrderTests(unittest.TestCase):
                 source,
                 program=authenticate(),
             )
+
+
+class EndpointObservationOrderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repetition = _exact_endpoint_repetition()
+        cls.order = actor_race_verify.build_endpoint_observation_order(
+            cls.repetition
+        )
+
+    def test_exact_mapping_has_frozen_node_arithmetic_and_non_action_owners(
+        self,
+    ) -> None:
+        accepted = len(self.order.endpoint.requests_by_request_id)
+        live = len(self.order.endpoint.cleanup_in_order)
+        opportunistic = sum(
+            event is not None
+            for event in self.order.endpoint.opportunistic_by_action
+        )
+        self.assertEqual(
+            self.order.graph.node_count,
+            self.order.control_order.graph.node_count
+            + 2 * accepted
+            + 3 * live
+            + opportunistic
+            + 1,
+        )
+        self.assertLessEqual(
+            self.order.graph.node_count,
+            actor_race_verify.MAX_ENDPOINT_OBSERVATION_NODES,
+        )
+        self.assertEqual(
+            actor_race_verify.MAX_ENDPOINT_OBSERVATION_NODES,
+            4_118,
+        )
+        self.assertEqual(
+            actor_race_verify.MAX_ENDPOINT_OBSERVATION_EDGE_INPUTS,
+            12_976,
+        )
+        self.assertEqual(
+            tuple(event.kind for event in self.order.endpoint.phase_events),
+            ("PreCleanupGate", "PreShutdownGate"),
+        )
+        eof_sources = {
+            lifecycle.first_eof_source
+            for lifecycle in self.order.endpoint.requests_by_request_id
+        }
+        self.assertIn("receiver_drop", eof_sources)
+        self.assertIn("cleanup_receiver", eof_sources)
+        for receiver_ordinal, events in enumerate(
+            self.order.endpoint.cleanup_in_order
+        ):
+            self.assertEqual(events.receiver_ordinal, receiver_ordinal)
+            self.assertEqual(
+                events.cleanup_sequence_ordinal,
+                accepted + receiver_ordinal,
+            )
+            for event in (
+                events.invocation,
+                events.terminal_acknowledgement,
+                events.response,
+            ):
+                self.assertIs(type(event), actor_race_verify.CleanupReceiverEvent)
+                self.assertEqual(event.receiver_ordinal, receiver_ordinal)
+
+    def test_endpoint_terminal_eof_reap_rebind_and_cleanup_edges(self) -> None:
+        graph = self.order.graph
+        for lifecycle in self.order.endpoint.requests_by_request_id:
+            bind = lifecycle.identity.submission.endpoint_bind
+            assert bind is not None
+            self.assertTrue(
+                graph.precedes(bind.node, lifecycle.endpoint_terminal_publish.node)
+            )
+            self.assertTrue(
+                graph.precedes(
+                    lifecycle.request.control_terminal_publish.node,
+                    lifecycle.endpoint_terminal_publish.node,
+                )
+            )
+            self.assertTrue(
+                graph.precedes(
+                    lifecycle.endpoint_terminal_publish.node,
+                    lifecycle.first_eof_acknowledgement.node,
+                )
+            )
+            self.assertTrue(
+                graph.precedes(
+                    lifecycle.first_eof_acknowledgement.node,
+                    lifecycle.request.request_reap.node,
+                )
+            )
+            self.assertTrue(
+                graph.precedes(
+                    lifecycle.request.request_reap.node,
+                    self.order.endpoint.pre_shutdown.node,
+                )
+            )
+        for slot in self.order.endpoint.identities.by_endpoint_slot:
+            for previous, current in zip(slot, slot[1:]):
+                previous_lifecycle = self.order.endpoint.requests_by_client_index[
+                    previous.client_index
+                ]
+                next_bind = current.submission.endpoint_bind
+                assert previous_lifecycle is not None and next_bind is not None
+                self.assertTrue(
+                    graph.precedes(
+                        previous_lifecycle.request.request_reap.node,
+                        next_bind.node,
+                    )
+                )
+        for events in self.order.endpoint.cleanup_in_order:
+            lifecycle = self.order.endpoint.requests_by_client_index[
+                events.identity.client_index
+            ]
+            assert lifecycle is not None
+            self.assertTrue(
+                graph.precedes(
+                    events.invocation.node,
+                    events.terminal_acknowledgement.node,
+                )
+            )
+            self.assertTrue(
+                graph.precedes(
+                    lifecycle.endpoint_terminal_publish.node,
+                    events.terminal_acknowledgement.node,
+                )
+            )
+            self.assertTrue(
+                graph.precedes(
+                    events.terminal_acknowledgement.node,
+                    lifecycle.request.request_reap.node,
+                )
+            )
+            self.assertTrue(
+                graph.precedes(
+                    lifecycle.request.request_reap.node,
+                    events.response.node,
+                )
+            )
+
+    def test_ungrounded_cached_eof_fails_closed(self) -> None:
+        ordinal = next(
+            action.ordinal
+            for action in self.repetition.actions
+            if action.result == "drain_empty"
+        )
+        action = self.repetition.actions[ordinal]
+        forged = _replace_endpoint_repetition(
+            self.repetition,
+            actions=tuple(
+                replace(
+                    candidate,
+                    result="drain_eof",
+                    cached_eof=True,
+                    primary_pop=_PRIMARY_POP_SENTINEL,
+                )
+                if candidate.ordinal == ordinal
+                else candidate
+                for candidate in self.repetition.actions
+            ),
+        )
+        self.assertFalse(action.cached_eof)
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "cached EOF before its first acknowledgement",
+        ):
+            actor_race_verify.build_endpoint_observation_order(forged)
+
+    def test_direct_then_cached_eof_has_exact_response_custody(self) -> None:
+        client_index = 50
+        actions = list(self.repetition.actions)
+        drains = [
+            action
+            for action in actions
+            if action.client_index == client_index
+            and action.kind == "drain"
+            and action.result == "drain_empty"
+        ]
+        direct = drains[-2]
+        cached = drains[-1]
+        identity = next(
+            action.accepted
+            for action in actions
+            if action.result == "submit_accepted"
+            and action.client_index == client_index
+        )
+        actions[direct.ordinal] = replace(
+            direct,
+            result="drain_eof",
+            primary_pop=actor_race_history.PopWitness(
+                "primary",
+                True,
+                identity.endpoint_slot,
+                identity.endpoint_generation,
+                0,
+                0,
+                None,
+            ),
+        )
+        actions[cached.ordinal] = replace(
+            cached,
+            result="drain_eof",
+            cached_eof=True,
+            primary_pop=_PRIMARY_POP_SENTINEL,
+        )
+        later_readers = []
+        for candidate in actions[direct.ordinal + 1 :]:
+            if not candidate.control.boundary:
+                continue
+            loaded_word = int(candidate.control.loaded_word, 16)
+            if (
+                candidate.control.slot != identity.control_slot
+                or loaded_word >> 3 != identity.control_generation
+                or loaded_word & 4
+            ):
+                continue
+            self.assertNotEqual(candidate.client_index, client_index)
+            self.assertEqual(candidate.result, "error")
+            self.assertIsNone(candidate.control.disposition)
+            later_readers.append(candidate.ordinal)
+            resulting_word = int(candidate.control.resulting_word, 16)
+            actions[candidate.ordinal] = replace(
+                candidate,
+                control=replace(
+                    candidate.control,
+                    loaded_word=f"{loaded_word | 4:016x}",
+                    resulting_word=f"{resulting_word | 4:016x}",
+                ),
+            )
+        self.assertEqual(later_readers, [924])
+        order = actor_race_verify.build_endpoint_observation_order(
+            _replace_endpoint_repetition(self.repetition, actions=tuple(actions))
+        )
+        lifecycle = order.endpoint.requests_by_client_index[client_index]
+        direct_target = order.control_order.target_order.targets.by_action[
+            direct.ordinal
+        ]
+        cached_target = order.control_order.target_order.targets.by_action[
+            cached.ordinal
+        ]
+        assert lifecycle is not None
+        assert direct_target is not None and cached_target is not None
+        endpoints = (
+            order.control_order.target_order.submission_order.interval_order
+            .endpoints
+        )
+        response = endpoints.by_action[direct.ordinal].response
+        self.assertEqual(lifecycle.first_eof_source, "script_direct")
+        self.assertTrue(
+            order.graph.precedes(
+                direct_target.event.node,
+                lifecycle.first_eof_acknowledgement.node,
+            )
+        )
+        self.assertTrue(
+            order.graph.precedes(
+                lifecycle.first_eof_acknowledgement.node,
+                response.node,
+            )
+        )
+        self.assertTrue(
+            order.graph.precedes(
+                lifecycle.first_eof_acknowledgement.node,
+                cached_target.event.node,
+            )
+        )
+
+    def test_requested_terminal_correlation_uses_only_causal_winners(self) -> None:
+        client_index = 50
+        request_id = next(
+            action.request_id
+            for action in self.repetition.actions
+            if action.result == "submit_accepted"
+            and action.client_index == client_index
+        )
+        assert request_id is not None
+        output = actor_race_history.Output(request_id, 0, 0)
+        late_script = _with_endpoint_publications(
+            self.repetition,
+            client_index,
+            (output,),
+            (output,),
+            terminal_outcome="completed",
+        )
+        order = actor_race_verify.build_endpoint_observation_order(late_script)
+        publication = order.endpoint.requests_by_client_index[client_index]
+        assert publication is not None
+        self.assertEqual(publication.publications.terminal.outcome, "completed")
+        self.assertTrue(
+            any(
+                observation.source_kind == "script"
+                and observation.disposition == "requested"
+                for observation in order.control_order.lifecycle.observations
+                if observation.owner_client_index == client_index
+            )
+        )
+
+        cleanup = _exact_cleanup_requested_endpoint_repetition()
+        cleanup_receiver = cleanup.cleanup_receivers[0]
+        cleanup_output = actor_race_history.Output(
+            cleanup_receiver.request_id,
+            0,
+            0,
+        )
+        lost_cleanup = _with_endpoint_publications(
+            cleanup,
+            cleanup_receiver.client_index,
+            (cleanup_output,),
+            (cleanup_output,),
+            terminal_outcome="completed",
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "requested control disposition did not reach a cancelled terminal",
+        ):
+            actor_race_verify.build_endpoint_observation_order(lost_cleanup)
+
+    def test_cancelled_terminal_requires_a_preterminal_C_publisher(self) -> None:
+        client_index = 5
+        drop = next(
+            action
+            for action in self.repetition.actions
+            if action.client_index == client_index
+            and action.result == "receiver_dropped"
+        )
+        loaded_word = int(drop.control.loaded_word, 16) | 4
+        resulting_word = int(drop.control.resulting_word, 16) | 4
+        actions = tuple(
+            replace(
+                action,
+                control=replace(
+                    action.control,
+                    loaded_word=f"{loaded_word:016x}",
+                    resulting_word=f"{resulting_word:016x}",
+                    disposition="already_terminal",
+                ),
+            )
+            if action.ordinal == drop.ordinal
+            else action
+            for action in self.repetition.actions
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "cancelled terminal lacks a preterminal C publisher",
+        ):
+            actor_race_verify.build_endpoint_observation_order(
+                _replace_endpoint_repetition(self.repetition, actions=actions)
+            )
+
+    def test_opportunistic_eof_is_distinct_and_precedes_response(self) -> None:
+        client_index = 16
+        ordinal = max(
+            action.ordinal
+            for action in self.repetition.actions
+            if action.client_index == client_index
+            and action.kind == "drain"
+            and action.result == "drain_empty"
+        )
+        action = self.repetition.actions[ordinal]
+        identity = next(
+            candidate.accepted
+            for candidate in self.repetition.actions
+            if candidate.result == "submit_accepted"
+            and candidate.client_index == client_index
+        )
+        output = actor_race_history.Output(identity.request_id, 0, 7)
+        actions = list(self.repetition.actions)
+        actions[ordinal] = replace(
+            action,
+            result="drain_output",
+            output=output,
+            primary_pop=actor_race_history.PopWitness(
+                "primary",
+                True,
+                identity.endpoint_slot,
+                identity.endpoint_generation,
+                0,
+                1,
+                output,
+            ),
+            opportunistic_eof_pop=actor_race_history.PopWitness(
+                "opportunistic_eof",
+                True,
+                identity.endpoint_slot,
+                identity.endpoint_generation,
+                1,
+                1,
+                None,
+            ),
+        )
+        repetition = _with_endpoint_publications(
+            _replace_endpoint_repetition(self.repetition, actions=tuple(actions)),
+            client_index,
+            (output,),
+            (),
+        )
+        order = actor_race_verify.build_endpoint_observation_order(repetition)
+        lifecycle = order.endpoint.requests_by_client_index[client_index]
+        primary = order.control_order.target_order.targets.by_action[ordinal]
+        opportunistic = order.endpoint.opportunistic_by_action[ordinal]
+        endpoints = (
+            order.control_order.target_order.submission_order.interval_order
+            .endpoints
+        )
+        response = endpoints.by_action[ordinal].response
+        assert lifecycle is not None
+        assert primary is not None and opportunistic is not None
+        self.assertEqual(lifecycle.first_eof_source, "script_opportunistic")
+        self.assertTrue(order.graph.precedes(primary.event.node, opportunistic.node))
+        self.assertTrue(
+            order.graph.precedes(
+                lifecycle.endpoint_terminal_publish.node,
+                opportunistic.node,
+            )
+        )
+        self.assertTrue(
+            order.graph.precedes(
+                opportunistic.node,
+                lifecycle.first_eof_acknowledgement.node,
+            )
+        )
+        self.assertTrue(
+            order.graph.precedes(
+                lifecycle.first_eof_acknowledgement.node,
+                response.node,
+            )
+        )
+        self.assertEqual(
+            order.graph.reasons(
+                lifecycle.endpoint_terminal_publish.node,
+                primary.event.node,
+            ),
+            (),
+        )
+
+    def test_nonempty_cleanup_suffix_is_conserved_without_output_nodes(self) -> None:
+        client_index = self.repetition.cleanup_receivers[0].client_index
+        request_id = self.repetition.cleanup_receivers[0].request_id
+        output = actor_race_history.Output(request_id, 0, 9)
+        repetition = _with_endpoint_publications(
+            self.repetition,
+            client_index,
+            (output,),
+            (output,),
+        )
+        order = actor_race_verify.build_endpoint_observation_order(repetition)
+        lifecycle = order.endpoint.requests_by_client_index[client_index]
+        cleanup = order.endpoint.cleanup_by_client_index[client_index]
+        assert lifecycle is not None and cleanup is not None
+        self.assertEqual(lifecycle.first_eof_source, "cleanup_receiver")
+        self.assertEqual(lifecycle.publications.outputs, (output,))
+        self.assertEqual(order.graph.node_count, self.order.graph.node_count)
+        self.assertTrue(
+            order.graph.precedes(
+                cleanup.terminal_acknowledgement.node,
+                lifecycle.first_eof_acknowledgement.node,
+            )
+        )
+
+    def test_undrained_capacity_is_bounded_for_live_and_consumed_requests(
+        self,
+    ) -> None:
+        live_clients = {
+            receiver.client_index for receiver in self.repetition.cleanup_receivers
+        }
+        for client_index in (50, 5):
+            with self.subTest(client_index=client_index):
+                request_id = next(
+                    action.request_id
+                    for action in self.repetition.actions
+                    if action.result == "submit_accepted"
+                    and action.client_index == client_index
+                )
+                assert request_id is not None
+                outputs = tuple(
+                    actor_race_history.Output(request_id, index, index + 1)
+                    for index in range(3)
+                )
+                cleanup_outputs = (
+                    outputs if client_index in live_clients else ()
+                )
+                forged = _with_endpoint_publications(
+                    self.repetition,
+                    client_index,
+                    outputs,
+                    cleanup_outputs,
+                )
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    "retained more than two undrained outputs",
+                ):
+                    actor_race_verify.build_endpoint_observation_order(forged)
+
+    def test_terminal_stop_rules_reject_impossible_output_prefixes(self) -> None:
+        client_index = 50
+        request_id = next(
+            action.request_id
+            for action in self.repetition.actions
+            if action.result == "submit_accepted"
+            and action.client_index == client_index
+        )
+        assert request_id is not None
+        maximum = actor_race_verify.scheduler.build_descriptors()[client_index][
+            "max_new_tokens"
+        ]
+        cases = (
+            (
+                "cancelled-eos",
+                (actor_race_history.Output(request_id, 0, 0),),
+                "cancelled",
+                "cancelled after EOS",
+            ),
+            (
+                "cancelled-limit",
+                tuple(
+                    actor_race_history.Output(request_id, index, 1)
+                    for index in range(maximum)
+                ),
+                "cancelled",
+                "cancelled at its generation limit",
+            ),
+            (
+                "continued-after-eos",
+                (
+                    actor_race_history.Output(request_id, 0, 0),
+                    actor_race_history.Output(request_id, 1, 1),
+                ),
+                "completed",
+                "published output after EOS",
+            ),
+            (
+                "completed-early-without-eos",
+                (actor_race_history.Output(request_id, 0, 1),),
+                "completed",
+                "completed early without EOS",
+            ),
+        )
+        for label, outputs, outcome, error in cases:
+            with self.subTest(label=label):
+                forged = _with_endpoint_publications(
+                    self.repetition,
+                    client_index,
+                    outputs,
+                    outputs,
+                    terminal_outcome=outcome,
+                )
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    error,
+                ):
+                    actor_race_verify.build_endpoint_observation_order(forged)
+
+    def test_canonical_observation_phases_are_value_only_but_enforced(self) -> None:
+        eof_index = next(
+            index
+            for index, observation in enumerate(self.repetition.observations)
+            if observation.kind == "output_eof"
+        )
+        observations = list(self.repetition.observations)
+        eof = observations.pop(eof_index)
+        observations.insert(0, eof)
+        forged = _replace_endpoint_repetition(
+            self.repetition,
+            observations=tuple(observations),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "terminal appears after the EOF phase",
+        ):
+            actor_race_verify.build_endpoint_observation_order(forged)
+
+    def test_observation_and_shell_mutations_fail_closed(self) -> None:
+        client_index = 50
+        request_id = next(
+            action.request_id
+            for action in self.repetition.actions
+            if action.result == "submit_accepted"
+            and action.client_index == client_index
+        )
+        assert request_id is not None
+        outputs = (
+            actor_race_history.Output(request_id, 0, 7),
+            actor_race_history.Output(request_id, 1, 8),
+        )
+        valid = _with_endpoint_publications(
+            self.repetition,
+            client_index,
+            outputs,
+            outputs,
+        )
+
+        def with_observations(
+            repetition: SimpleNamespace,
+            observations: tuple[actor_race_history.Observation, ...],
+        ) -> SimpleNamespace:
+            diagnostics = SimpleNamespace(
+                action_counter_final=(
+                    repetition.diagnostics.action_counter_final
+                ),
+                cleanup_counter_final=(
+                    repetition.diagnostics.cleanup_counter_final
+                ),
+                recorder_initial=repetition.diagnostics.recorder_initial,
+                recorder_final=_recorder_status(len(observations)),
+            )
+            return _replace_endpoint_repetition(
+                repetition,
+                diagnostics=diagnostics,
+                observations=observations,
+            )
+
+        swapped = list(valid.observations)
+        swapped[0], swapped[1] = swapped[1], swapped[0]
+        one_output = _with_endpoint_publications(
+            self.repetition,
+            client_index,
+            outputs[:1],
+            outputs[:1],
+        )
+        gap = tuple(
+            replace(observation, output_index=1)
+            if observation.kind == "output"
+            else observation
+            for observation in one_output.observations
+        )
+        vocabulary = tuple(
+            replace(observation, token_id=32)
+            if observation.kind == "output"
+            else observation
+            for observation in one_output.observations
+        )
+        missing_terminal = tuple(
+            observation
+            for observation in self.repetition.observations
+            if not (
+                observation.kind == "terminal"
+                and observation.request_id == request_id
+            )
+        )
+        bad_progress = tuple(
+            replace(
+                observation,
+                committed_positions=observation.committed_positions + 1,
+                emitted_tokens=observation.emitted_tokens + 1,
+            )
+            if observation.kind == "terminal"
+            and observation.request_id == request_id
+            else observation
+            for observation in one_output.observations
+        )
+        cases = (
+            (
+                "output-sort",
+                with_observations(valid, tuple(swapped)),
+                "output observations are not strictly sorted",
+            ),
+            (
+                "output-gap",
+                with_observations(one_output, gap),
+                "output publications are not consecutive",
+            ),
+            (
+                "vocabulary",
+                with_observations(one_output, vocabulary),
+                "token is outside the tiny-v3 vocabulary",
+            ),
+            (
+                "missing-terminal",
+                with_observations(self.repetition, missing_terminal),
+                "has no terminal observation",
+            ),
+            (
+                "terminal-progress",
+                with_observations(one_output, bad_progress),
+                "terminal/output counts differ",
+            ),
+        )
+        for label, forged, error in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    error,
+                ):
+                    actor_race_verify.build_endpoint_observation_order(forged)
+
+        bool_index = tuple(
+            replace(observation, output_index=True)
+            if observation.kind == "output"
+            else observation
+            for observation in one_output.observations
+        )
+        receiver = one_output.cleanup_receivers[-1]
+        shell_cases = (
+            (
+                "bool-output-index",
+                with_observations(one_output, bool_index),
+                "output_index must be an integer",
+            ),
+            (
+                "mutable-cleanup-outputs",
+                _replace_endpoint_repetition(
+                    one_output,
+                    cleanup_receivers=tuple(
+                        replace(candidate, outputs=list(candidate.outputs))
+                        if candidate.client_index == client_index
+                        else candidate
+                        for candidate in one_output.cleanup_receivers
+                    ),
+                ),
+                "outputs must be an exact immutable tuple",
+            ),
+            (
+                "bool-snapshot-counter",
+                _replace_endpoint_repetition(
+                    one_output,
+                    cleanup_receivers=tuple(
+                        replace(
+                            candidate,
+                            post_drop_quiescent=replace(
+                                candidate.post_drop_quiescent,
+                                pump_entries=True,
+                            ),
+                        )
+                        if candidate == receiver
+                        else candidate
+                        for candidate in one_output.cleanup_receivers
+                    ),
+                ),
+                "pump_entries must be an integer",
+            ),
+        )
+        for label, forged, error in shell_cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    error,
+                ):
+                    actor_race_verify.build_endpoint_observation_order(forged)
+
+    def test_missing_eof_and_wrong_cleanup_suffix_fail_conservation(self) -> None:
+        missing_observations = self.repetition.observations[:-1]
+        missing = _replace_endpoint_repetition(
+            self.repetition,
+            observations=missing_observations,
+            diagnostics=SimpleNamespace(
+                action_counter_final=self.repetition.diagnostics.action_counter_final,
+                cleanup_counter_final=self.repetition.diagnostics.cleanup_counter_final,
+                recorder_initial=self.repetition.diagnostics.recorder_initial,
+                recorder_final=_recorder_status(len(missing_observations)),
+            ),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "has no first-EOF observation",
+        ):
+            actor_race_verify.build_endpoint_observation_order(missing)
+
+        receiver = self.repetition.cleanup_receivers[0]
+        output = actor_race_history.Output(receiver.request_id, 0, 4)
+        valid = _with_endpoint_publications(
+            self.repetition,
+            receiver.client_index,
+            (output,),
+            (output,),
+        )
+        forged_receivers = tuple(
+            replace(candidate, outputs=())
+            if candidate.client_index == receiver.client_index
+            else candidate
+            for candidate in valid.cleanup_receivers
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "not the exact FIFO suffix",
+        ):
+            actor_race_verify.build_endpoint_observation_order(
+                _replace_endpoint_repetition(
+                    valid,
+                    cleanup_receivers=forged_receivers,
+                )
+            )
+
+    def test_drain_frontier_mutations_fail_closed(self) -> None:
+        client_index = 16
+        drains = [
+            action
+            for action in self.repetition.actions
+            if action.client_index == client_index
+            and action.kind == "drain"
+            and action.result == "drain_empty"
+        ]
+        first = drains[0]
+        identity = next(
+            action.accepted
+            for action in self.repetition.actions
+            if action.result == "submit_accepted"
+            and action.client_index == client_index
+        )
+
+        bad_empty = tuple(
+            replace(
+                action,
+                primary_pop=replace(action.primary_pop, drained_after=1),
+            )
+            if action.ordinal == first.ordinal
+            else action
+            for action in self.repetition.actions
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "empty pop has invalid count algebra",
+        ):
+            actor_race_verify.build_endpoint_observation_order(
+                _replace_endpoint_repetition(
+                    self.repetition,
+                    actions=bad_empty,
+                )
+            )
+
+        popped = actor_race_history.Output(identity.request_id, 0, 7)
+        published = actor_race_history.Output(identity.request_id, 0, 8)
+        mismatch_actions = tuple(
+            replace(
+                action,
+                result="drain_output",
+                output=popped,
+                primary_pop=actor_race_history.PopWitness(
+                    "primary",
+                    True,
+                    identity.endpoint_slot,
+                    identity.endpoint_generation,
+                    0,
+                    1,
+                    popped,
+                ),
+            )
+            if action.ordinal == first.ordinal
+            else action
+            for action in self.repetition.actions
+        )
+        mismatch = _with_endpoint_publications(
+            _replace_endpoint_repetition(
+                self.repetition,
+                actions=mismatch_actions,
+            ),
+            client_index,
+            (published,),
+            (),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "output has no exact publication",
+        ):
+            actor_race_verify.build_endpoint_observation_order(mismatch)
+
+        last = drains[-1]
+        direct_actions = tuple(
+            replace(action, result="drain_eof")
+            if action.ordinal == last.ordinal
+            else action
+            for action in self.repetition.actions
+        )
+        premature = _with_endpoint_publications(
+            _replace_endpoint_repetition(
+                self.repetition,
+                actions=direct_actions,
+            ),
+            client_index,
+            (published,),
+            (published,),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "acknowledged EOF before conserving publications",
+        ):
+            actor_race_verify.build_endpoint_observation_order(premature)
+
+        reentry_action = drains[-2]
+        reentry_actions = tuple(
+            replace(action, result="drain_eof")
+            if action.ordinal == reentry_action.ordinal
+            else action
+            for action in self.repetition.actions
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "re-entered an endpoint after EOF",
+        ):
+            actor_race_verify.build_endpoint_observation_order(
+                _replace_endpoint_repetition(
+                    self.repetition,
+                    actions=reentry_actions,
+                )
+            )
+
+    def test_cleanup_snapshot_reap_progress_is_strict(self) -> None:
+        first = self.repetition.cleanup_receivers[0]
+        snapshot = first.post_drop_quiescent
+        previous = self.repetition.pre_cleanup
+        cases = (
+            (
+                "request-bytes",
+                replace(snapshot, request_bytes=previous.request_bytes),
+                "did not release request ledger bytes",
+            ),
+            (
+                "pump-entry",
+                replace(snapshot, pump_entries=previous.pump_entries),
+                "did not advance actor reap progress",
+            ),
+            (
+                "park-epoch",
+                replace(snapshot, park_epoch=previous.park_epoch),
+                "did not advance actor reap progress",
+            ),
+            (
+                "engine-step",
+                replace(snapshot, engine_steps=previous.engine_steps),
+                "did not advance actor reap progress",
+            ),
+            (
+                "outstanding",
+                replace(snapshot, outstanding_requests=previous.outstanding_requests),
+                "did not reap exactly one receiver",
+            ),
+            (
+                "shared-ledger",
+                replace(snapshot, shared_bytes=previous.shared_bytes + 1),
+                "changed static shared ledger bytes",
+            ),
+            (
+                "pump-hold",
+                replace(
+                    snapshot,
+                    pump_hold_requested=2,
+                    pump_hold_observed=2,
+                    pump_hold_released=2,
+                ),
+                "does not conserve the cleanup pump hold",
+            ),
+        )
+        for label, forged_snapshot, error in cases:
+            with self.subTest(label=label):
+                receivers = (
+                    replace(first, post_drop_quiescent=forged_snapshot),
+                    *self.repetition.cleanup_receivers[1:],
+                )
+                forged = _replace_endpoint_repetition(
+                    self.repetition,
+                    cleanup_receivers=receivers,
+                )
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    error,
+                ):
+                    actor_race_verify.build_endpoint_observation_order(forged)
+
+        retained = replace(
+            self.repetition.pre_shutdown,
+            outstanding_requests=1,
+            request_bytes=1,
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "pre_shutdown increased request ledger bytes",
+        ):
+            actor_race_verify.build_endpoint_observation_order(
+                _replace_endpoint_repetition(
+                    self.repetition,
+                    pre_shutdown=retained,
+                )
+            )
+
+    def test_preflight_rejects_before_auth_and_snapshots_properties_once(self) -> None:
+        source = self.repetition
+
+        class CountingRepetition:
+            def __init__(self) -> None:
+                self.reads: dict[str, int] = {}
+
+            def _read(self, name: str) -> object:
+                self.reads[name] = self.reads.get(name, 0) + 1
+                return getattr(source, name)
+
+            actions = property(lambda self: self._read("actions"))
+            cleanup_authorities = property(
+                lambda self: self._read("cleanup_authorities")
+            )
+            cleanup_receivers = property(
+                lambda self: self._read("cleanup_receivers")
+            )
+            observations = property(lambda self: self._read("observations"))
+            diagnostics = property(lambda self: self._read("diagnostics"))
+            pre_cleanup = property(lambda self: self._read("pre_cleanup"))
+            pre_shutdown = property(lambda self: self._read("pre_shutdown"))
+            shutdown = property(lambda self: self._read("shutdown"))
+
+        counting = CountingRepetition()
+        authenticate = actor_race_verify.regenerate_authenticated_action_program
+        with mock.patch.object(
+            actor_race_verify,
+            "regenerate_authenticated_action_program",
+            wraps=authenticate,
+        ) as authenticate_once:
+            actor_race_verify.build_endpoint_observation_order(counting)
+        authenticate_once.assert_called_once_with()
+        self.assertEqual(
+            counting.reads,
+            {
+                "actions": 1,
+                "cleanup_authorities": 1,
+                "cleanup_receivers": 1,
+                "observations": 1,
+                "diagnostics": 1,
+                "pre_cleanup": 1,
+                "pre_shutdown": 1,
+                "shutdown": 1,
+            },
+        )
+
+        malformed = _replace_endpoint_repetition(
+            self.repetition,
+            observations=list(self.repetition.observations),
+        )
+        with mock.patch.object(
+            actor_race_verify,
+            "regenerate_authenticated_action_program",
+        ) as authenticate_never:
+            with mock.patch.object(
+                actor_race_verify.ReasonedDAG,
+                "build",
+            ) as graph_never:
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    "exact immutable tuple",
+                ):
+                    actor_race_verify.build_endpoint_observation_order(malformed)
+        authenticate_never.assert_not_called()
+        graph_never.assert_not_called()
+
+    def test_descriptor_and_recorder_preflight_are_noninjectable(self) -> None:
+        descriptors = actor_race_verify.scheduler.build_descriptors()
+        stateful_first = [
+            {**descriptor, "prompt": list(descriptor["prompt"])}
+            for descriptor in descriptors
+        ]
+        original_token = stateful_first[0]["prompt"][0]
+        stateful_first[0]["prompt"][0] = 1 if original_token != 1 else 2
+        with mock.patch.object(
+            actor_race_verify.scheduler,
+            "build_descriptors",
+            side_effect=(stateful_first, descriptors),
+        ):
+            with mock.patch.object(
+                actor_race_verify,
+                "regenerate_authenticated_action_program",
+            ) as authenticate:
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    "descriptor identity differs from the frozen corpus",
+                ):
+                    actor_race_verify.build_endpoint_observation_order(
+                        self.repetition
+                    )
+        authenticate.assert_not_called()
+
+        with mock.patch.object(
+            actor_race_verify.scheduler,
+            "build_descriptors",
+            return_value=(),
+        ):
+            with mock.patch.object(
+                actor_race_verify,
+                "regenerate_authenticated_action_program",
+            ) as authenticate:
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    "exact 64-entry list",
+                ):
+                    actor_race_verify.build_endpoint_observation_order(
+                        self.repetition
+                    )
+        authenticate.assert_not_called()
+
+        unhealthy = replace(
+            self.repetition.diagnostics.recorder_final,
+            overflowed=True,
+        )
+        forged = _replace_endpoint_repetition(
+            self.repetition,
+            diagnostics=SimpleNamespace(
+                action_counter_final=self.repetition.diagnostics.action_counter_final,
+                cleanup_counter_final=self.repetition.diagnostics.cleanup_counter_final,
+                recorder_initial=self.repetition.diagnostics.recorder_initial,
+                recorder_final=unhealthy,
+            ),
+        )
+        with mock.patch.object(
+            actor_race_verify,
+            "regenerate_authenticated_action_program",
+        ) as authenticate:
+            with self.assertRaisesRegex(
+                actor_race_verify.ActorRaceVerificationError,
+                "unhealthy",
+            ):
+                actor_race_verify.build_endpoint_observation_order(forged)
+        authenticate.assert_not_called()
 
 
 class SubmissionProtocolOrderTests(unittest.TestCase):

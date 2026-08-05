@@ -214,6 +214,30 @@ impl ProbeSnapshotCapture {
         )
     }
 
+    fn validate_receiver_reap_after(
+        self,
+        previous: Self,
+        context: &'static str,
+    ) -> HarnessResult<()> {
+        self.validate_not_before(previous, context)?;
+        require(
+            self.request_bytes < previous.request_bytes,
+            format!("{context} snapshot did not strictly decrease request ledger bytes"),
+        )?;
+        require(
+            self.pump_entries > previous.pump_entries,
+            format!("{context} snapshot did not strictly advance pump entries"),
+        )?;
+        require(
+            self.park_epoch > previous.park_epoch,
+            format!("{context} snapshot did not strictly advance the park epoch"),
+        )?;
+        require(
+            self.engine_steps > previous.engine_steps,
+            format!("{context} snapshot did not strictly advance engine steps"),
+        )
+    }
+
     fn validate_request_ledger_presence(self, context: &'static str) -> HarnessResult<()> {
         require(
             (self.outstanding_requests == 0) == (self.request_bytes == 0),
@@ -275,11 +299,16 @@ impl RaceCleanupCapture {
         &self,
         registry: &RaceRegistrySnapshot,
         descriptors: &[Descriptor],
+        output_capacity_per_request: usize,
     ) -> HarnessResult<()> {
         registry.require_all_authorities_present()?;
         require(
             descriptors.len() == REQUEST_COUNT,
             "cleanup capture descriptor table has the wrong length",
+        )?;
+        require(
+            output_capacity_per_request != 0,
+            "cleanup capture output capacity is zero",
         )?;
         require(
             self.cleanup_authorities.len() == registry.accepted_count(),
@@ -414,6 +443,10 @@ impl RaceCleanupCapture {
                 to_u64(record.5.len(), "cleanup capture output suffix length")? <= record.4.3,
                 "cleanup capture output suffix exceeds terminal emissions",
             )?;
+            require(
+                record.5.len() <= output_capacity_per_request,
+                "cleanup capture output suffix exceeds the actor endpoint capacity",
+            )?;
             for output in &record.5 {
                 require(
                     output.0 == record.3,
@@ -453,11 +486,7 @@ impl RaceCleanupCapture {
                 .validate_request_ledger_presence("captured cleanup post-drop")?;
             record
                 .7
-                .validate_not_before(preceding_snapshot, "captured cleanup post-drop")?;
-            require(
-                record.7.request_bytes <= preceding_snapshot.request_bytes,
-                "cleanup post-drop snapshot increased request ledger bytes",
-            )?;
+                .validate_receiver_reap_after(preceding_snapshot, "captured cleanup post-drop")?;
             require(
                 record.7.pump_hold_requested == expected_hold_epoch
                     && record.7.pump_hold_observed == expected_hold_epoch
@@ -537,6 +566,7 @@ pub(super) async fn run_ordered_cleanup(
     registry: &RaceRegistry,
     probe: &ActorProbe,
     descriptors: &[Descriptor],
+    output_capacity_per_request: usize,
 ) -> HarnessResult<RaceCleanupCapture> {
     let registry_before = registry.snapshot()?;
     registry_before.require_all_authorities_present()?;
@@ -568,7 +598,8 @@ pub(super) async fn run_ordered_cleanup(
     cleanup_receivers
         .try_reserve_exact(live_receiver_count)
         .map_err(|_| "cleanup-receiver capture allocation failed".to_owned())?;
-    let mut receiver_scratch = preallocate_receiver_scratch(&handles, descriptors)?;
+    let mut receiver_scratch =
+        preallocate_receiver_scratch(&handles, descriptors, output_capacity_per_request)?;
     let counter = AtomicU64::new(0);
 
     let hold = probe
@@ -670,6 +701,7 @@ pub(super) async fn run_ordered_cleanup(
             client_index,
             handle,
             scratch.events,
+            scratch.logical_output_capacity,
             scratch.sink,
         )
         .await?;
@@ -711,7 +743,7 @@ pub(super) async fn run_ordered_cleanup(
         let post_drop_quiescent =
             ProbeSnapshotCapture::normalize_quiescent(post_drop_raw, "post-drop")?;
         post_drop_quiescent.validate_request_ledger_presence("post-drop")?;
-        post_drop_quiescent.validate_not_before(preceding, "post-drop")?;
+        post_drop_quiescent.validate_receiver_reap_after(preceding, "post-drop")?;
         require(
             post_drop_quiescent.command_occupancy_is_zero(),
             "post-drop command table is not empty",
@@ -723,10 +755,6 @@ pub(super) async fn run_ordered_cleanup(
         require(
             post_drop_quiescent.outstanding_requests == expected_outstanding,
             "cleanup receiver did not reap exactly one request record",
-        )?;
-        require(
-            post_drop_quiescent.request_bytes <= preceding.request_bytes,
-            "post-drop snapshot increased request ledger bytes",
         )?;
         require(
             post_drop_quiescent.shared_bytes == pre_cleanup.shared_bytes,
@@ -807,7 +835,7 @@ pub(super) async fn run_ordered_cleanup(
         pre_cleanup,
         pre_shutdown,
     };
-    capture.validate(&registry_before, descriptors)?;
+    capture.validate(&registry_before, descriptors, output_capacity_per_request)?;
     Ok(capture)
 }
 
@@ -896,10 +924,15 @@ fn reconcile_producer_handles(
 fn preallocate_receiver_scratch(
     handles: &[Option<RequestHandle>; REQUEST_COUNT],
     descriptors: &[Descriptor],
+    output_capacity_per_request: usize,
 ) -> HarnessResult<[Option<ReceiverScratch>; REQUEST_COUNT]> {
     require(
         descriptors.len() == REQUEST_COUNT,
         "cleanup descriptor table has the wrong length",
+    )?;
+    require(
+        output_capacity_per_request != 0,
+        "cleanup output capacity is zero",
     )?;
     let mut scratch = std::array::from_fn(|_| None);
     for (client_index, ((handle, descriptor), scratch_slot)) in handles
@@ -917,9 +950,13 @@ fn preallocate_receiver_scratch(
         if handle.is_none() {
             continue;
         }
-        let capacity = usize::try_from(descriptor.max_new_tokens)
+        let descriptor_output_bound = usize::try_from(descriptor.max_new_tokens)
             .map_err(|_| "descriptor output bound does not fit usize".to_owned())?;
-        require(capacity != 0, "cleanup descriptor output bound is zero")?;
+        require(
+            descriptor_output_bound != 0,
+            "cleanup descriptor output bound is zero",
+        )?;
+        let capacity = output_capacity_per_request;
         let mut events = Vec::new();
         events
             .try_reserve_exact(capacity)
@@ -1122,12 +1159,16 @@ mod tests {
         .expect("requested cancellation witness");
         let mut pre_cleanup_raw = quiescent_snapshot();
         pre_cleanup_raw.outstanding_requests = 1;
+        pre_cleanup_raw.request_bytes = 768;
         let pre_cleanup =
             ProbeSnapshotCapture::normalize_quiescent(pre_cleanup_raw, "synthetic pre-cleanup")
                 .expect("pre-cleanup capture");
         let mut zero_raw = quiescent_snapshot();
         zero_raw.outstanding_requests = 0;
         zero_raw.request_bytes = 0;
+        zero_raw.park_epoch = 8;
+        zero_raw.pump_entries = 13;
+        zero_raw.engine_steps = 14;
         zero_raw.pump_hold_requested = 6;
         zero_raw.pump_hold_observed = 6;
         zero_raw.pump_hold_released = 6;
@@ -1193,30 +1234,90 @@ mod tests {
     }
 
     #[test]
+    fn receiver_reap_snapshot_requires_strict_ledger_and_actor_progress() {
+        let mut before_raw = quiescent_snapshot();
+        before_raw.outstanding_requests = 1;
+        before_raw.request_bytes = 768;
+        let before = ProbeSnapshotCapture::normalize_quiescent(before_raw, "before receiver reap")
+            .expect("before capture");
+
+        let mut after_raw = before_raw;
+        after_raw.outstanding_requests = 0;
+        after_raw.request_bytes = 0;
+        after_raw.pump_entries += 2;
+        after_raw.park_epoch += 1;
+        after_raw.engine_steps += 1;
+        let after = ProbeSnapshotCapture::normalize_quiescent(after_raw, "after receiver reap")
+            .expect("after capture");
+        after
+            .validate_receiver_reap_after(before, "receiver reap")
+            .expect("strict receiver-reap progress");
+
+        for stalled in [
+            ProbeSnapshotCapture {
+                request_bytes: before.request_bytes,
+                ..after
+            },
+            ProbeSnapshotCapture {
+                pump_entries: before.pump_entries,
+                ..after
+            },
+            ProbeSnapshotCapture {
+                park_epoch: before.park_epoch,
+                ..after
+            },
+            ProbeSnapshotCapture {
+                engine_steps: before.engine_steps,
+                ..after
+            },
+        ] {
+            assert!(
+                stalled
+                    .validate_receiver_reap_after(before, "stalled receiver reap")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn whole_cleanup_capture_rejects_cross_record_corruption() {
         let registry = one_live_registry();
         let descriptors = crate::descriptors(REQUEST_COUNT);
+        let output_capacity_per_request =
+            crate::expected_actor_config().output_capacity_per_request;
         one_live_cleanup_capture(TerminalOutcomeCapture::Cancelled)
-            .validate(&registry, &descriptors)
+            .validate(&registry, &descriptors, output_capacity_per_request)
             .expect("valid cleanup capture");
 
         let completed = one_live_cleanup_capture(TerminalOutcomeCapture::Completed);
-        assert!(completed.validate(&registry, &descriptors).is_err());
+        assert!(
+            completed
+                .validate(&registry, &descriptors, output_capacity_per_request)
+                .is_err()
+        );
 
         let mut wrong_receiver = one_live_cleanup_capture(TerminalOutcomeCapture::Cancelled);
         wrong_receiver.cleanup_receivers[0].2 = 1;
-        assert!(wrong_receiver.validate(&registry, &descriptors).is_err());
+        assert!(
+            wrong_receiver
+                .validate(&registry, &descriptors, output_capacity_per_request)
+                .is_err()
+        );
 
         let mut wrong_count = one_live_cleanup_capture(TerminalOutcomeCapture::Cancelled);
         wrong_count.cleanup_receivers[0].7.outstanding_requests = 1;
-        assert!(wrong_count.validate(&registry, &descriptors).is_err());
+        assert!(
+            wrong_count
+                .validate(&registry, &descriptors, output_capacity_per_request)
+                .is_err()
+        );
 
         let prompt_prefix = u64::try_from(descriptors[0].prompt.len() - 1).expect("prompt prefix");
         let mut inconsistent_progress = one_live_cleanup_capture(TerminalOutcomeCapture::Cancelled);
         inconsistent_progress.cleanup_receivers[0].4.2 = prompt_prefix + 1;
         assert!(
             inconsistent_progress
-                .validate(&registry, &descriptors)
+                .validate(&registry, &descriptors, output_capacity_per_request)
                 .is_err()
         );
 
@@ -1226,11 +1327,19 @@ mod tests {
         truncated_suffix.cleanup_receivers[0]
             .5
             .push(RaceOutput(7, 0, 1));
-        assert!(truncated_suffix.validate(&registry, &descriptors).is_err());
+        assert!(
+            truncated_suffix
+                .validate(&registry, &descriptors, output_capacity_per_request)
+                .is_err()
+        );
 
         let mut residual_ledger = one_live_cleanup_capture(TerminalOutcomeCapture::Cancelled);
         residual_ledger.cleanup_receivers[0].7.request_bytes = 1;
-        assert!(residual_ledger.validate(&registry, &descriptors).is_err());
+        assert!(
+            residual_ledger
+                .validate(&registry, &descriptors, output_capacity_per_request)
+                .is_err()
+        );
     }
 
     #[test]
