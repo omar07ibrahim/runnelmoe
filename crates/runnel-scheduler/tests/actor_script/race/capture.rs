@@ -19,11 +19,74 @@ use super::cleanup::{
 use super::*;
 use crate::Descriptor;
 use crate::common::{
+    EXPECTED_ARTIFACT_ID, EXPECTED_OBJECT_DIGEST, EXPECTED_PAGE_TABLE_DIGEST, EXPECTED_SPEC_DIGEST,
     OBSERVATION_LIMIT, PUMP_ENTRY_LIMIT, SemanticRecords, SemanticTerminalOutcome,
     collect_semantic_records, require, to_u64, validate_shutdown,
 };
 
-const REPETITION_COUNT: u64 = 32;
+pub(super) const REPETITION_COUNT: usize = 32;
+const REPETITION_COUNT_U64: u64 = 32;
+const SCHEMA: &str = "runnel.actor-race-history/1";
+const SPECIFICATION: &str = "runnel-m5-actor-stress-v1";
+const VECTOR_SCHEMA: &str = "runnel.actor-stress-vectors/2";
+
+/// Exact lexicographically keyed top-level capture from ADR 0007.
+#[derive(Serialize)]
+pub(super) struct ActorRaceCapture {
+    repetition_count: u64,
+    repetitions: Vec<RepetitionCapture>,
+    schema: &'static str,
+    workload: WorkloadCapture,
+}
+
+impl ActorRaceCapture {
+    pub(super) fn new(repetitions: Vec<RepetitionCapture>) -> HarnessResult<Self> {
+        require(
+            repetitions.len() == REPETITION_COUNT,
+            "actor race capture has the wrong repetition count",
+        )?;
+        for (expected, repetition) in repetitions.iter().enumerate() {
+            require(
+                repetition.repetition == to_u64(expected, "actor race repetition index")?,
+                "actor race repetitions are not indexed consecutively",
+            )?;
+        }
+        Ok(Self {
+            repetition_count: REPETITION_COUNT_U64,
+            repetitions,
+            schema: SCHEMA,
+            workload: WorkloadCapture::exact(),
+        })
+    }
+}
+
+/// Exact lexicographically keyed authenticated workload identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct WorkloadCapture {
+    artifact_id: &'static str,
+    artifact_object_sha256: &'static str,
+    artifact_page_table_sha256: &'static str,
+    model_spec_sha256: &'static str,
+    specification: &'static str,
+    vector_file_sha256: &'static str,
+    vector_id: &'static str,
+    vector_schema: &'static str,
+}
+
+impl WorkloadCapture {
+    const fn exact() -> Self {
+        Self {
+            artifact_id: EXPECTED_ARTIFACT_ID,
+            artifact_object_sha256: EXPECTED_OBJECT_DIGEST,
+            artifact_page_table_sha256: EXPECTED_PAGE_TABLE_DIGEST,
+            model_spec_sha256: EXPECTED_SPEC_DIGEST,
+            specification: SPECIFICATION,
+            vector_file_sha256: crate::FIXTURE_FILE_DIGEST,
+            vector_id: crate::FIXTURE_ID,
+            vector_schema: VECTOR_SCHEMA,
+        }
+    }
+}
 
 /// Exact seven-position `Observation` tuple from ADR 0007.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -227,7 +290,7 @@ impl RepetitionDraft {
         initial_recorder: ActorStressRecorderStatus,
     ) -> HarnessResult<Self> {
         require(
-            repetition < REPETITION_COUNT,
+            repetition < REPETITION_COUNT_U64,
             "race repetition index is out of range",
         )?;
         require(
@@ -710,6 +773,23 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ObservationCapture::output_eof(7)).expect("EOF JSON"),
             r#"["output_eof",7,null,null,null,null,null]"#,
+        );
+    }
+
+    #[test]
+    fn workload_capture_has_exact_sorted_identity_keys() {
+        assert_eq!(
+            serde_json::to_string(&WorkloadCapture::exact()).expect("workload JSON"),
+            concat!(
+                r#"{"artifact_id":"sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c","#,
+                r#""artifact_object_sha256":"sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab","#,
+                r#""artifact_page_table_sha256":"sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c","#,
+                r#""model_spec_sha256":"sha256:ed57d7961e65c76223c169cabebaff9c02d8293da026abb0c0c0a22d38079845","#,
+                r#""specification":"runnel-m5-actor-stress-v1","#,
+                r#""vector_file_sha256":"sha256:eca1faeee91a41d19d98be7ffdad6fc5cebb9027f3e7a634c01ea1cc394fb574","#,
+                r#""vector_id":"sha256:5010492fb74eda207511b26811992ed4779814185b9f184663b37a37747bd051","#,
+                r#""vector_schema":"runnel.actor-stress-vectors/2"}"#,
+            ),
         );
     }
 }

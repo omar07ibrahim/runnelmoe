@@ -29,6 +29,8 @@ const TERMINAL_FLAG: u64 = 1 << 2;
 
 #[path = "race/capture.rs"]
 mod capture;
+#[path = "race/capture_file.rs"]
+mod capture_file;
 #[path = "race/cleanup.rs"]
 mod cleanup;
 #[path = "race/execution.rs"]
@@ -2293,9 +2295,11 @@ mod tests {
     use super::*;
     use crate::Descriptor;
     use crate::common::{
-        DropWitnessContext, authenticated_workload, drop_receiver_with_preallocated_witness,
-        finish_receiver, finish_receiver_with_preallocated_witness, receive_once_with_witness,
-        request_spec, spawn_fresh_actor, spawn_fresh_actor_before, validate_shutdown,
+        DropWitnessContext, HardDeadlineWatchdog, authenticated_workload,
+        drop_receiver_with_preallocated_witness, finish_receiver,
+        finish_receiver_with_preallocated_witness, receive_once_with_witness, request_spec,
+        spawn_fresh_actor, spawn_fresh_actor_before, terminate_hung_evidence_process,
+        validate_shutdown,
     };
 
     fn valid_identity() -> AcceptedIdentity {
@@ -3494,10 +3498,19 @@ mod tests {
 
     async fn abort_and_drain_race_producers(
         tasks: &mut JoinSet<(usize, HarnessResult<execution::RaceProducerExit>)>,
+        hard_deadline: tokio::time::Instant,
+        primary: &str,
     ) -> Vec<String> {
         let mut failures = Vec::new();
         tasks.abort_all();
-        while let Some(joined) = tasks.join_next().await {
+        while !tasks.is_empty() {
+            let joined = match tokio::time::timeout_at(hard_deadline, tasks.join_next()).await {
+                Ok(Some(joined)) => joined,
+                Ok(None) => break,
+                Err(_) => terminate_hung_evidence_process(&format!(
+                    "{primary}; producer tasks did not abort and join before the repetition hard deadline"
+                )),
+            };
             match joined {
                 Ok((index, Ok(exit))) => {
                     if index >= PRODUCER_COUNT || usize::from(exit.index) != index {
@@ -3528,28 +3541,27 @@ mod tests {
 
     async fn join_race_producers(
         tasks: &mut JoinSet<(usize, HarnessResult<execution::RaceProducerExit>)>,
-        deadline: tokio::time::Instant,
+        operation_deadline: tokio::time::Instant,
+        hard_deadline: tokio::time::Instant,
     ) -> HarnessResult<[execution::RaceProducerExit; PRODUCER_COUNT]> {
         let mut exits = [None, None];
         let mut joined = 0_usize;
         while !tasks.is_empty() {
-            let joined_task = match tokio::time::timeout_at(deadline, tasks.join_next()).await {
-                Ok(Some(joined_task)) => joined_task,
-                Ok(None) => break,
-                Err(_) => {
-                    let failures = abort_and_drain_race_producers(tasks).await;
-                    return Err(append_drain_failures(
-                        "producer execution timed out",
-                        failures,
-                    ));
-                }
-            };
+            let joined_task =
+                match tokio::time::timeout_at(operation_deadline, tasks.join_next()).await {
+                    Ok(Some(joined_task)) => joined_task,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let primary = "producer execution timed out";
+                        let failures =
+                            abort_and_drain_race_producers(tasks, hard_deadline, primary).await;
+                        return Err(append_drain_failures(primary, failures));
+                    }
+                };
             let Some(next_joined) = joined.checked_add(1) else {
-                let failures = abort_and_drain_race_producers(tasks).await;
-                return Err(append_drain_failures(
-                    "producer join count overflowed",
-                    failures,
-                ));
+                let primary = "producer join count overflowed";
+                let failures = abort_and_drain_race_producers(tasks, hard_deadline, primary).await;
+                return Err(append_drain_failures(primary, failures));
             };
             joined = next_joined;
             let failure = match joined_task {
@@ -3574,7 +3586,7 @@ mod tests {
                 Err(error) => Some(format!("producer task failed to join: {error}")),
             };
             if let Some(failure) = failure {
-                let failures = abort_and_drain_race_producers(tasks).await;
+                let failures = abort_and_drain_race_producers(tasks, hard_deadline, &failure).await;
                 return Err(append_drain_failures(failure, failures));
             }
         }
@@ -3591,12 +3603,45 @@ mod tests {
 
     async fn run_genuine_two_producer_race_once(
         repetition: u64,
+        full_deadline: tokio::time::Instant,
     ) -> HarnessResult<capture::RepetitionCapture> {
         const REPETITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+        const TEARDOWN_RESERVE: std::time::Duration = std::time::Duration::from_secs(2);
 
-        let deadline = tokio::time::Instant::now() + REPETITION_TIMEOUT;
+        let now = tokio::time::Instant::now();
+        require(now < full_deadline, "full actor race deadline expired")?;
+        let repetition_deadline = now
+            .checked_add(REPETITION_TIMEOUT)
+            .ok_or_else(|| "race repetition deadline overflowed".to_owned())?;
+        let hard_deadline = repetition_deadline.min(full_deadline);
+        let operation_deadline = hard_deadline
+            .checked_sub(TEARDOWN_RESERVE)
+            .ok_or_else(|| "race operation deadline underflowed".to_owned())?;
+        require(
+            now < operation_deadline,
+            "actor race deadline has no reserved teardown window",
+        )?;
+        let _watchdog = HardDeadlineWatchdog::start(
+            hard_deadline,
+            "actor race repetition exceeded its hard deadline",
+        )?;
+        run_genuine_two_producer_race_once_before(repetition, operation_deadline, hard_deadline)
+            .await
+    }
+
+    async fn run_genuine_two_producer_race_once_before(
+        repetition: u64,
+        operation_deadline: tokio::time::Instant,
+        hard_deadline: tokio::time::Instant,
+    ) -> HarnessResult<capture::RepetitionCapture> {
         let workload = authenticated_workload()?;
-        let fresh = spawn_fresh_actor_before(&workload.actor_config, deadline).await?;
+        require(
+            tokio::time::Instant::now() < operation_deadline,
+            "race authentication exhausted the operation deadline",
+        )?;
+        let fresh =
+            spawn_fresh_actor_before(&workload.actor_config, operation_deadline, hard_deadline)
+                .await?;
         let actor = fresh.actor;
         let probe = fresh.probe;
         let recorder = fresh.recorder;
@@ -3632,17 +3677,16 @@ mod tests {
                 let start = Arc::clone(&start);
                 async move { (1_usize, producer_one.run(start).await) }
             });
-            if tokio::time::timeout_at(deadline, start.wait())
+            if tokio::time::timeout_at(operation_deadline, start.wait())
                 .await
                 .is_err()
             {
-                let failures = abort_and_drain_race_producers(&mut tasks).await;
-                return Err(append_drain_failures(
-                    "producer start barrier timed out",
-                    failures,
-                ));
+                let primary = "producer start barrier timed out";
+                let failures =
+                    abort_and_drain_race_producers(&mut tasks, hard_deadline, primary).await;
+                return Err(append_drain_failures(primary, failures));
             }
-            let exits = join_race_producers(&mut tasks, deadline).await?;
+            let exits = join_race_producers(&mut tasks, operation_deadline, hard_deadline).await?;
             require(tasks.is_empty(), "producer task set was not fully drained")?;
             let [exit_zero, exit_one] = exits;
 
@@ -3681,7 +3725,7 @@ mod tests {
             )?;
 
             let cleanup = tokio::time::timeout_at(
-                deadline,
+                operation_deadline,
                 cleanup::run_ordered_cleanup(
                     [exit_zero, exit_one],
                     &registry,
@@ -3727,7 +3771,15 @@ mod tests {
         }
         .await;
 
-        let shutdown_result = actor.shutdown().await;
+        let shutdown_result = match tokio::time::timeout_at(hard_deadline, actor.shutdown()).await {
+            Ok(result) => result,
+            Err(_) => match &race_result {
+                Ok(_) => terminate_hung_evidence_process("cooperative race shutdown timed out"),
+                Err(error) => terminate_hung_evidence_process(&format!(
+                    "{error}; cooperative race shutdown also timed out"
+                )),
+            },
+        };
         let draft = match race_result {
             Ok(draft) => draft,
             Err(error) => {
@@ -3749,10 +3801,90 @@ mod tests {
             .map_err(|error| format!("semantic recording failed: {error}"))?;
         let capture = draft.finalize(recording, report, post_shutdown)?;
         require(
-            tokio::time::Instant::now() <= deadline,
-            "genuine race repetition exceeded its 20-second deadline",
+            tokio::time::Instant::now() < hard_deadline,
+            "genuine race repetition exceeded its hard deadline",
         )?;
         Ok(capture)
+    }
+
+    async fn run_genuine_actor_race_capture_before(
+        full_deadline: tokio::time::Instant,
+    ) -> HarnessResult<capture::ActorRaceCapture> {
+        require(
+            tokio::time::Instant::now() < full_deadline,
+            "full actor race deadline expired before execution",
+        )?;
+        let mut repetitions = Vec::new();
+        repetitions
+            .try_reserve_exact(capture::REPETITION_COUNT)
+            .map_err(|_| "actor race repetition allocation failed".to_owned())?;
+        for repetition in 0..capture::REPETITION_COUNT {
+            require(
+                repetitions.len() < repetitions.capacity(),
+                "actor race repetition storage exhausted its reservation",
+            )?;
+            repetitions.push(
+                run_genuine_two_producer_race_once(
+                    to_u64(repetition, "actor race repetition index")?,
+                    full_deadline,
+                )
+                .await?,
+            );
+        }
+        let capture = capture::ActorRaceCapture::new(repetitions)?;
+        require(
+            tokio::time::Instant::now() < full_deadline,
+            "full actor race deadline expired after capture assembly",
+        )?;
+        Ok(capture)
+    }
+
+    const WATCHDOG_CHILD_ENV: &str = "RUNNEL_ACTOR_WATCHDOG_CHILD";
+
+    #[test]
+    fn hard_deadline_watchdog_child_exits_124() {
+        if std::env::var(WATCHDOG_CHILD_ENV).as_deref() != Ok("1") {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(75);
+        let _watchdog = HardDeadlineWatchdog::start(deadline, "synthetic non-yielding child")
+            .expect("start synthetic hard-deadline watchdog");
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn hard_deadline_watchdog_bounds_a_non_yielding_child_process() {
+        let executable = std::env::current_exe().expect("resolve actor-script test executable");
+        let mut child = std::process::Command::new(executable)
+            .arg("--exact")
+            .arg("race::tests::hard_deadline_watchdog_child_exits_124")
+            .env(WATCHDOG_CHILD_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn watchdog regression child");
+        let parent_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < parent_deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("hard-deadline watchdog child did not terminate in five seconds");
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("cannot inspect hard-deadline watchdog child: {error}");
+                }
+            }
+        };
+        assert_eq!(status.code(), Some(124));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3775,10 +3907,12 @@ mod tests {
                 }),
             )
         });
+        let now = tokio::time::Instant::now();
         assert!(
             join_race_producers(
                 &mut failed,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                now + std::time::Duration::from_secs(1),
+                now + std::time::Duration::from_secs(2),
             )
             .await
             .is_err()
@@ -3799,17 +3933,23 @@ mod tests {
                 )
             });
         }
+        let now = tokio::time::Instant::now();
         assert!(
-            abort_and_drain_race_producers(&mut stalled)
-                .await
-                .is_empty()
+            join_race_producers(
+                &mut stalled,
+                now + std::time::Duration::from_millis(10),
+                now + std::time::Duration::from_secs(2),
+            )
+            .await
+            .is_err()
         );
         assert!(stalled.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn genuine_two_producer_race_completes_and_cleans_up_one_repetition() {
-        let capture = run_genuine_two_producer_race_once(0)
+        let full_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
+        let capture = run_genuine_two_producer_race_once(0, full_deadline)
             .await
             .expect("genuine race repetition");
         let encoded = serde_json::to_vec(&capture).expect("serialize race repetition");
@@ -3820,6 +3960,46 @@ mod tests {
                 .iter()
                 .any(|byte| matches!(byte, b'\n' | b'\r' | b'\t'))
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn genuine_race_rejects_an_expired_deadline_before_actor_spawn() {
+        let deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the monotonic clock can represent one second ago");
+        let error = match run_genuine_two_producer_race_once(0, deadline).await {
+            Ok(_) => panic!("an expired race deadline must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("deadline expired"));
+
+        let insufficient = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let error = match run_genuine_two_producer_race_once(0, insufficient).await {
+            Ok(_) => panic!("a race deadline without teardown reserve must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("reserved teardown window"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn genuine_actor_race_capture_runs_exactly_32_fresh_repetitions() {
+        let full_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
+        let _watchdog = HardDeadlineWatchdog::start(
+            full_deadline,
+            "complete actor race command exceeded its 15-minute hard deadline",
+        )
+        .expect("start complete-command hard-deadline watchdog");
+        let capture = run_genuine_actor_race_capture_before(full_deadline)
+            .await
+            .expect("complete actor race capture");
+        let encoded = capture_file::encode_actor_race_capture_before(&capture, full_deadline)
+            .expect("encode bounded complete race capture before its deadline");
+        capture_file::publish_actor_race_capture_from_env(&encoded, full_deadline)
+            .expect("validate or publish complete actor race capture before its deadline");
+        assert!(tokio::time::Instant::now() < full_deadline);
+        assert!(encoded.starts_with(b"{\"repetition_count\":32,\"repetitions\":["));
+        assert!(encoded.ends_with(b"\"vector_schema\":\"runnel.actor-stress-vectors/2\"}}\n"));
+        assert!(encoded.len() <= capture_file::MAX_ACTOR_RACE_CAPTURE_BYTES);
     }
 
     #[tokio::test(flavor = "current_thread")]

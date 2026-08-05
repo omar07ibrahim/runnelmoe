@@ -7,6 +7,10 @@
 //! synchronization contracts for those responsibilities.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use runnel_fixture::FixtureArtifact;
 use runnel_format::{Artifact, Limits};
@@ -56,6 +60,66 @@ pub(super) struct FreshActor {
     pub(super) initial_recorder: ActorStressRecorderStatus,
     pub(super) max_outstanding_requests: u64,
     pub(super) output_capacity_per_request: usize,
+}
+
+/// Independent wall-clock guard for one test-only evidence boundary.
+///
+/// Tokio timers cannot run when every runtime worker is blocked in non-yielding
+/// code. This guard owns a dedicated OS thread and terminates the evidence
+/// subprocess with the conventional timeout status if it is not dropped before
+/// the absolute hard deadline.
+pub(super) struct HardDeadlineWatchdog {
+    disarmed: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HardDeadlineWatchdog {
+    pub(super) fn start(
+        deadline: tokio::time::Instant,
+        context: &'static str,
+    ) -> HarnessResult<Self> {
+        require(
+            tokio::time::Instant::now() < deadline,
+            "hard-deadline watchdog was started after expiry",
+        )?;
+        let deadline = deadline.into_std();
+        let disarmed = Arc::new(AtomicBool::new(false));
+        let thread_disarmed = Arc::clone(&disarmed);
+        let join = std::thread::Builder::new()
+            .name("runnel-actor-hard-deadline".to_owned())
+            .spawn(move || {
+                loop {
+                    if thread_disarmed.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        if thread_disarmed.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        terminate_hung_evidence_process(context);
+                    }
+                    std::thread::park_timeout(deadline.saturating_duration_since(now));
+                }
+            })
+            .map_err(|error| format!("cannot start hard-deadline watchdog: {error}"))?;
+        Ok(Self {
+            disarmed,
+            join: Some(join),
+        })
+    }
+}
+
+impl Drop for HardDeadlineWatchdog {
+    fn drop(&mut self) {
+        self.disarmed.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            join.thread().unpark();
+            if join.join().is_err() {
+                terminate_hung_evidence_process("hard-deadline watchdog thread panicked");
+            }
+        }
+    }
 }
 
 pub(super) struct CleanupResult {
@@ -210,22 +274,33 @@ pub(super) fn authenticated_workload() -> HarnessResult<AuthenticatedWorkload> {
 }
 
 pub(super) async fn spawn_fresh_actor(config: &ActorConfig) -> HarnessResult<FreshActor> {
-    spawn_fresh_actor_with_deadline(config, None).await
+    spawn_fresh_actor_with_deadlines(config, None, None).await
 }
 
 pub(super) async fn spawn_fresh_actor_before(
     config: &ActorConfig,
-    deadline: tokio::time::Instant,
-) -> HarnessResult<FreshActor> {
-    spawn_fresh_actor_with_deadline(config, Some(deadline)).await
-}
-
-async fn spawn_fresh_actor_with_deadline(
-    config: &ActorConfig,
-    deadline: Option<tokio::time::Instant>,
+    operation_deadline: tokio::time::Instant,
+    teardown_deadline: tokio::time::Instant,
 ) -> HarnessResult<FreshActor> {
     require(
-        deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline),
+        operation_deadline < teardown_deadline,
+        "actor operation deadline must reserve teardown time",
+    )?;
+    spawn_fresh_actor_with_deadlines(config, Some(operation_deadline), Some(teardown_deadline))
+        .await
+}
+
+async fn spawn_fresh_actor_with_deadlines(
+    config: &ActorConfig,
+    operation_deadline: Option<tokio::time::Instant>,
+    teardown_deadline: Option<tokio::time::Instant>,
+) -> HarnessResult<FreshActor> {
+    require(
+        operation_deadline.is_some() == teardown_deadline.is_some(),
+        "actor deadlines must either both be present or both be absent",
+    )?;
+    require(
+        operation_deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline),
         "actor construction deadline expired before authentication",
     )?;
     let fixture_artifact = FixtureArtifact::build_v3();
@@ -240,7 +315,7 @@ async fn spawn_fresh_actor_with_deadline(
     let scheduler_config = runnel_scheduler::SchedulerConfig::new(&model, limits)
         .map_err(|error| format!("actor configuration failed: {error}"))?;
     require(
-        deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline),
+        operation_deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline),
         "actor construction deadline expired before spawn",
     )?;
     let (actor, probe) = SchedulerActor::spawn_instrumented_with_capacity(
@@ -267,7 +342,7 @@ async fn spawn_fresh_actor_with_deadline(
             "recorder did not preallocate its logical limit",
         )?;
         require(initial_recorder.healthy(), "recorder began unhealthy")?;
-        let initial_probe = match deadline {
+        let initial_probe = match operation_deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, probe.wait_quiescent())
                 .await
                 .map_err(|_| "initial actor quiescence timed out".to_owned())?,
@@ -292,13 +367,35 @@ async fn spawn_fresh_actor_with_deadline(
             max_outstanding_requests,
             output_capacity_per_request,
         }),
-        Err(error) => match actor.shutdown().await {
-            Ok(_) => Err(error),
-            Err(shutdown_error) => Err(format!(
-                "{error}; failed to join actor after initialization failure: {shutdown_error}"
-            )),
-        },
+        Err(error) => {
+            let shutdown_result = match teardown_deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, actor.shutdown()).await {
+                    Ok(result) => result,
+                    Err(_) => terminate_hung_evidence_process(&format!(
+                        "{error}; actor teardown timed out after initialization failure"
+                    )),
+                },
+                None => actor.shutdown().await,
+            };
+            match shutdown_result {
+                Ok(_) => Err(error),
+                Err(shutdown_error) => Err(format!(
+                    "{error}; failed to join actor after initialization failure: {shutdown_error}"
+                )),
+            }
+        }
     }
+}
+
+/// Terminates the test subprocess when task ownership cannot be reclaimed.
+///
+/// Returning after a hard teardown timeout would detach the scheduler's
+/// blocking owner and make a failed evidence run look bounded. The full race
+/// command is itself executed as a child, so process termination is the only
+/// fail-closed outcome once cooperative shutdown exhausts its reserved budget.
+pub(super) fn terminate_hung_evidence_process(context: &str) -> ! {
+    eprintln!("fatal actor evidence timeout: {context}");
+    std::process::exit(124)
 }
 
 pub(super) fn request_spec(descriptor: &Descriptor) -> HarnessResult<RequestSpec<'_>> {
