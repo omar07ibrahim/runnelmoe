@@ -27,6 +27,8 @@ const CANCELLED_FLAG: u64 = 1 << 0;
 const DISCONNECTED_FLAG: u64 = 1 << 1;
 const TERMINAL_FLAG: u64 = 1 << 2;
 
+#[path = "race/capture.rs"]
+mod capture;
 #[path = "race/cleanup.rs"]
 mod cleanup;
 #[path = "race/execution.rs"]
@@ -2291,10 +2293,9 @@ mod tests {
     use super::*;
     use crate::Descriptor;
     use crate::common::{
-        DropWitnessContext, PUMP_ENTRY_LIMIT, authenticated_workload,
-        drop_receiver_with_preallocated_witness, finish_receiver,
-        finish_receiver_with_preallocated_witness, receive_once_with_witness, request_spec,
-        spawn_fresh_actor, spawn_fresh_actor_before, validate_shutdown,
+        DropWitnessContext, authenticated_workload, drop_receiver_with_preallocated_witness,
+        finish_receiver, finish_receiver_with_preallocated_witness, receive_once_with_witness,
+        request_spec, spawn_fresh_actor, spawn_fresh_actor_before, validate_shutdown,
     };
 
     fn valid_identity() -> AcceptedIdentity {
@@ -3588,7 +3589,9 @@ mod tests {
         ])
     }
 
-    async fn run_genuine_two_producer_race_once() -> HarnessResult<()> {
+    async fn run_genuine_two_producer_race_once(
+        repetition: u64,
+    ) -> HarnessResult<capture::RepetitionCapture> {
         const REPETITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
         let deadline = tokio::time::Instant::now() + REPETITION_TIMEOUT;
@@ -3597,9 +3600,15 @@ mod tests {
         let actor = fresh.actor;
         let probe = fresh.probe;
         let recorder = fresh.recorder;
-        let initial = fresh.initial_probe;
+        let initial_probe = fresh.initial_probe;
+        let initial_recorder = fresh.initial_recorder;
 
-        let race_result: HarnessResult<(usize, usize)> = async {
+        let race_result: HarnessResult<capture::RepetitionDraft> = async {
+            // Producer construction and the pre-barrier portion of `run` make
+            // no actor API call. The actor's acknowledged fresh quiescence is
+            // therefore the exact counter endpoint at barrier release.
+            let initial =
+                cleanup::ProbeSnapshotCapture::normalize_quiescent(initial_probe, "initial race")?;
             let descriptors: Arc<[Descriptor]> = workload.descriptors.into();
             let actions = workload.actions;
             let registry = Arc::new(RaceRegistry::new());
@@ -3639,6 +3648,7 @@ mod tests {
 
             let registry_after_race = registry.snapshot()?;
             registry_after_race.require_all_authorities_present()?;
+            let accepted_ids = registry_after_race.accepted_ids();
             let producer_live = exit_zero
                 .live_receiver_count()
                 .checked_add(exit_one.live_receiver_count())
@@ -3705,13 +3715,21 @@ mod tests {
                 cleanup.pre_cleanup().parked,
                 "cleanup precondition was not quiescent",
             )?;
-            Ok((accepted, rejected))
+            capture::RepetitionDraft::new(
+                repetition,
+                descriptors,
+                complete,
+                cleanup,
+                accepted_ids,
+                initial,
+                initial_recorder,
+            )
         }
         .await;
 
         let shutdown_result = actor.shutdown().await;
-        let (accepted, rejected) = match race_result {
-            Ok(counts) => counts,
+        let draft = match race_result {
+            Ok(draft) => draft,
             Err(error) => {
                 return match shutdown_result {
                     Ok(_) => Err(error),
@@ -3726,42 +3744,15 @@ mod tests {
         let post_shutdown = probe
             .snapshot()
             .map_err(|error| format!("post-shutdown snapshot failed: {error}"))?;
-        validate_shutdown(
-            report,
-            accepted,
-            rejected,
-            post_shutdown.request_bytes,
-            post_shutdown.shared_bytes,
-        )?;
-        require(post_shutdown.owner_done, "race actor did not stop")?;
-        require(
-            post_shutdown
-                .pump_entries
-                .checked_sub(initial.pump_entries)
-                .is_some_and(|delta| delta <= PUMP_ENTRY_LIMIT),
-            "race actor exceeded its pump-entry limit",
-        )?;
-        require(
-            recorder.status().healthy(),
-            "race recorder became unhealthy",
-        )?;
         let recording = recorder
             .recording()
             .map_err(|error| format!("semantic recording failed: {error}"))?;
-        let output_count = recording
-            .observations()
-            .iter()
-            .filter(|observation| observation.output_event().is_some())
-            .count();
-        let expected_observations = accepted
-            .checked_mul(2)
-            .and_then(|base| base.checked_add(output_count))
-            .ok_or_else(|| "semantic observation count overflowed".to_owned())?;
+        let capture = draft.finalize(recording, report, post_shutdown)?;
         require(
-            recording.observations().len() == expected_observations,
-            "semantic observation count differs from output/terminal/EOF conservation",
+            tokio::time::Instant::now() <= deadline,
+            "genuine race repetition exceeded its 20-second deadline",
         )?;
-        Ok(())
+        Ok(capture)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3818,9 +3809,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn genuine_two_producer_race_completes_and_cleans_up_one_repetition() {
-        run_genuine_two_producer_race_once()
+        let capture = run_genuine_two_producer_race_once(0)
             .await
             .expect("genuine race repetition");
+        let encoded = serde_json::to_vec(&capture).expect("serialize race repetition");
+        assert!(encoded.starts_with(b"{\"actions\":["));
+        assert!(encoded.ends_with(b"}}"));
+        assert!(
+            !encoded
+                .iter()
+                .any(|byte| matches!(byte, b'\n' | b'\r' | b'\t'))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

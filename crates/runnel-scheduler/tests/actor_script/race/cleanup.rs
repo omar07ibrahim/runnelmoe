@@ -113,13 +113,41 @@ pub(super) struct ProbeSnapshotCapture {
 }
 
 impl ProbeSnapshotCapture {
-    fn normalize_quiescent(
+    pub(super) fn normalize_quiescent(
         snapshot: ActorProbeSnapshot,
         context: &'static str,
     ) -> HarnessResult<Self> {
         if !snapshot.quiescent() {
             return Err(format!("{context} snapshot is not quiescent"));
         }
+        Self::normalize(snapshot)
+    }
+
+    pub(super) fn normalize_post_shutdown(snapshot: ActorProbeSnapshot) -> HarnessResult<Self> {
+        let capture = Self::normalize(snapshot)?;
+        require(
+            capture.owner_done && capture.dirty && !capture.parked && !capture.pump_in_flight,
+            "post-shutdown snapshot has an invalid owner state",
+        )?;
+        require(
+            capture.command_occupancy_is_zero(),
+            "post-shutdown snapshot retained command occupancy",
+        )?;
+        require(
+            capture.outstanding_requests == 0
+                && capture.request_bytes == 0
+                && capture.shared_bytes == 0,
+            "post-shutdown snapshot retained actor-owned state",
+        )?;
+        require(
+            capture.pump_hold_requested == capture.pump_hold_observed
+                && capture.pump_hold_observed == capture.pump_hold_released,
+            "post-shutdown snapshot retained an incomplete pump hold",
+        )?;
+        Ok(capture)
+    }
+
+    fn normalize(snapshot: ActorProbeSnapshot) -> HarnessResult<Self> {
         Ok(Self {
             command_in_flight: to_u64(
                 snapshot.command_in_flight,
@@ -154,7 +182,7 @@ impl ProbeSnapshotCapture {
             && self.command_responded == 0
     }
 
-    fn validate_quiescent(self, context: &'static str) -> HarnessResult<()> {
+    pub(super) fn validate_quiescent(self, context: &'static str) -> HarnessResult<()> {
         require(
             self.parked && !self.dirty && !self.pump_in_flight && !self.owner_done,
             format!("{context} snapshot is not quiescent"),
@@ -170,7 +198,11 @@ impl ProbeSnapshotCapture {
         )
     }
 
-    fn validate_not_before(self, previous: Self, context: &'static str) -> HarnessResult<()> {
+    pub(super) fn validate_not_before(
+        self,
+        previous: Self,
+        context: &'static str,
+    ) -> HarnessResult<()> {
         require(
             self.park_epoch >= previous.park_epoch
                 && self.pump_entries >= previous.pump_entries
@@ -188,6 +220,14 @@ impl ProbeSnapshotCapture {
             format!("{context} snapshot request count and ledger presence differ"),
         )
     }
+}
+
+pub(super) struct RaceCleanupParts {
+    pub(super) cleanup_authorities: Vec<CleanupAuthorityCapture>,
+    pub(super) cleanup_counter_final: u64,
+    pub(super) cleanup_receivers: Vec<CleanupReceiverCapture>,
+    pub(super) pre_cleanup: ProbeSnapshotCapture,
+    pub(super) pre_shutdown: ProbeSnapshotCapture,
 }
 
 /// All cleanup-owned fields needed by the enclosing repetition capture.
@@ -219,6 +259,16 @@ impl RaceCleanupCapture {
 
     pub(super) const fn pre_shutdown(&self) -> ProbeSnapshotCapture {
         self.pre_shutdown
+    }
+
+    pub(super) fn into_parts(self) -> RaceCleanupParts {
+        RaceCleanupParts {
+            cleanup_authorities: self.cleanup_authorities,
+            cleanup_counter_final: self.cleanup_counter_final,
+            cleanup_receivers: self.cleanup_receivers,
+            pre_cleanup: self.pre_cleanup,
+            pre_shutdown: self.pre_shutdown,
+        }
     }
 
     fn validate(
@@ -1121,6 +1171,17 @@ mod tests {
         let mut invalid = quiescent_snapshot();
         invalid.dirty = true;
         assert!(ProbeSnapshotCapture::normalize_quiescent(invalid, "unit-test").is_err());
+
+        let mut stopped = quiescent_snapshot();
+        stopped.dirty = true;
+        stopped.parked = false;
+        stopped.owner_done = true;
+        stopped.outstanding_requests = 0;
+        stopped.request_bytes = 0;
+        stopped.shared_bytes = 0;
+        ProbeSnapshotCapture::normalize_post_shutdown(stopped).expect("post-shutdown snapshot");
+        stopped.shared_bytes = 1;
+        assert!(ProbeSnapshotCapture::normalize_post_shutdown(stopped).is_err());
     }
 
     #[test]

@@ -100,6 +100,7 @@ REQUIRED = {
     "crates/runnel-scheduler/tests/actor_script/common.rs",
     "crates/runnel-scheduler/tests/actor_script/golden.rs",
     "crates/runnel-scheduler/tests/actor_script/race.rs",
+    "crates/runnel-scheduler/tests/actor_script/race/capture.rs",
     "crates/runnel-scheduler/tests/actor_script/race/cleanup.rs",
     "crates/runnel-scheduler/tests/actor_script/race/execution.rs",
     "crates/runnel-scheduler/tests/engine.rs",
