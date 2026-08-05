@@ -2,7 +2,7 @@
 
 - Status: accepted; implementation in progress; measurement pending
 - Date: 2026-08-03
-- Last amended: 2026-08-04 (pre-result stress-protocol and transcript clarification)
+- Last amended: 2026-08-05 (stress-protocol, transcript, and race-evidence clarifications)
 - Milestone: M5
 
 ## Context
@@ -1121,8 +1121,29 @@ genuine race.
 The accepted-request registry publishes one mutex-protected entry containing
 request ID, cancellation authority, accepted identity witness, and receiver
 ownership before publishing the submit response counter. It never publishes
-those fields piecemeal. The command, control, and endpoint slot numbers are
-three distinct namespaces and are never compared as though they shared an
+those fields piecemeal. This submit response is the harness action-response
+counter. It is distinct from the actor's command-response publication and the
+producer's subsequent consumption of that response. The checker reconstructs
+the complete accepted path as distinct existential events:
+
+```text
+Invoke -> CommandReserve -> ReadyCommit -> ActorCommandClaim
+       -> {ControlBind, EndpointBind} -> ActorCommandRespond
+       -> CommandRelease -> RegistryPublish -> action Respond
+```
+
+The two bind events are unordered siblings. A rejected in-range offer follows
+the same path through `ActorCommandClaim`, then goes directly through
+`ActorCommandRespond` and `CommandRelease` to the action `Respond`, without
+bind or registry-publication events. `ActorCommandRespond` moves the command
+slot to `Responded`; `CommandRelease` is the producer's later consumption and
+slot release. For consecutive ready-sequence entries, the previous
+`ActorCommandRespond` precedes the next `ActorCommandClaim`, making the single
+owner's FIFO processing explicit rather than inferring it from action-counter
+order. Ready commits are also chained in witnessed sequence order, and reuse
+of one command slot requires the previous ticket's `CommandRelease` before the
+next ticket's `CommandReserve`. The command, control, and endpoint slot numbers
+are three distinct namespaces and are never compared as though they shared an
 allocator. Their complete identities are respectively `(slot, ticket)`,
 `(slot, generation)`, and `(slot, generation)`. An accepted response carries
 its request ID plus the exact control and endpoint identities returned by the
@@ -1506,6 +1527,16 @@ always enable the separate PyTorch gate for all 64 model sequences; a
 `--no-model` checker mode may diagnose structural history only and is never
 publishable evidence because it cannot independently validate token values or
 the completed/cancelled prefix claims.
+
+For the genuine race, an exact typed saturation error requires the closed
+five-field engine result, a reached command witness, and no accepted witness or
+request ID. Accepted request IDs must still be consecutive in ready-sequence
+order, so a rejection followed by a later acceptance cannot leave an observable
+ID gap. The capture has neither an admission-linearization occupancy witness
+nor a request-ID high-water witness, so the checker does not reinterpret that
+result as independent evidence that exactly 16 request records were live at the
+rejection instant or that no otherwise-unobservable trailing ID was issued. The
+action-by-action golden retains its stronger quiescent live-count proof.
 
 #### Canonical actor semantic transcript
 

@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """Independent bounded semantic primitives for actor race-history captures.
 
-This layer owns three deliberately narrow responsibilities:
+This layer owns four deliberately narrow responsibilities:
 
 * a deterministic, reason-labelled partial-order DAG with bitset reachability;
-* authentication and exact comparison of the frozen scheduler action program.
-* exact action invocation/response custody and its witnessed partial order.
+* authentication and exact comparison of the frozen scheduler action program;
+* exact action invocation/response custody and its witnessed partial order;
+* submission-command custody and an explicit event graph for admission results.
 
-It does not interpret command, control-word, object-boundary, or terminal
-witnesses.  Action interval counters are mapped to explicit Invoke and Respond
-nodes; they are never promoted into a counter-derived global execution order.
+It does not yet interpret later control operations, output-pop boundaries, or
+terminal witnesses.  Action interval counters are mapped to explicit Invoke
+and Respond nodes; they are never promoted into a counter-derived global
+execution order.  In particular, consuming an actor command response is a
+separate CommandRelease event, never an alias for either ActorCommandRespond
+publication or the action's final Respond counter.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 import heapq
 from typing import Any, NoReturn
 
-from oracle import scheduler
+from oracle import actor_race_history, scheduler
 
 
 MAX_DAG_NODES = 8_192
@@ -28,6 +32,9 @@ MAX_EDGE_INPUTS = 262_144
 MAX_REASONS_PER_EDGE = 8
 MAX_REASON_BYTES = 128
 MAX_CYCLE_DIAGNOSTIC_EDGES = 8
+
+# The protocol edge planner is intentionally tighter than the reusable DAG.
+MAX_PROTOCOL_EDGE_INPUTS = 32_768
 
 CAPTURE_ACTION_KINDS = (
     "submit",
@@ -50,6 +57,44 @@ EXPECTED_PRODUCER_COUNTS = (518, 506)
 EXPECTED_REPETITION_COUNT = 32
 EXPECTED_ACTION_COUNT = 1_024
 EXPECTED_ACTION_COUNTER_FINAL = 2_048
+EXPECTED_SUBMIT_COUNT = 206
+EXPECTED_IN_RANGE_SUBMIT_COUNT = 64
+EXPECTED_EXHAUSTED_SUBMIT_COUNT = 142
+
+# Exact schema maximum for the finished event model.  Several classes are not
+# allocated by the submission-only layer yet, but reserving and checking their
+# budget now prevents a later integration from silently crossing the generic
+# DAG cap.  The component counts follow ADR-0007's frozen cardinalities.
+_PROTOCOL_NODE_BUDGET = (
+    ("script action endpoints", 2 * EXPECTED_ACTION_COUNT),
+    (
+        "main non-exhausted operations",
+        EXPECTED_ACTION_COUNT - EXPECTED_EXHAUSTED_SUBMIT_COUNT,
+    ),
+    (
+        "submit ready, actor claim, actor response, and release events",
+        4 * EXPECTED_IN_RANGE_SUBMIT_COUNT,
+    ),
+    ("accepted bind and publish events", 3 * EXPECTED_IN_RANGE_SUBMIT_COUNT),
+    ("opportunistic endpoint pops", EXPECTED_KIND_COUNTS[3]),
+    (
+        "per-request terminal EOF and reap events",
+        4 * EXPECTED_IN_RANGE_SUBMIT_COUNT,
+    ),
+    (
+        "cleanup invocation and response events",
+        4 * EXPECTED_IN_RANGE_SUBMIT_COUNT,
+    ),
+    ("cleanup authority control events", EXPECTED_IN_RANGE_SUBMIT_COUNT),
+    (
+        "cleanup receiver terminal acknowledgements",
+        EXPECTED_IN_RANGE_SUBMIT_COUNT,
+    ),
+    ("lifecycle phase gates", 3),
+)
+MAX_PROTOCOL_NODES = 4_258
+if sum(count for _, count in _PROTOCOL_NODE_BUDGET) != MAX_PROTOCOL_NODES:
+    raise RuntimeError("actor race protocol node budget does not total 4258")
 _SCHEDULER_TO_CAPTURE_KIND = {
     "submit": "submit",
     "cancel": "cancel",
@@ -70,6 +115,12 @@ def _fail(message: str) -> NoReturn:
 def _plain_int(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         _fail(f"{label} must be an integer")
+    return value
+
+
+def _plain_bool(value: Any, label: str) -> bool:
+    if type(value) is not bool:
+        _fail(f"{label} must be a boolean")
     return value
 
 
@@ -356,6 +407,150 @@ class ActionIntervalOrder:
     graph: ReasonedDAG
 
 
+@dataclass(frozen=True, slots=True)
+class ProtocolEvent:
+    """One explicitly allocated submission-protocol event node."""
+
+    node: int
+    action_ordinal: int
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubmitEventNodes:
+    """All protocol nodes allocated for one authenticated in-range submit."""
+
+    action_ordinal: int
+    submit_attempt: int
+    command_slot: int
+    command_ticket: int
+    ready_sequence: int
+    accepted: bool
+    command_reserve: ProtocolEvent
+    ready_commit: ProtocolEvent
+    actor_command_claim: ProtocolEvent
+    actor_command_respond: ProtocolEvent
+    command_release: ProtocolEvent
+    control_bind: ProtocolEvent | None
+    endpoint_bind: ProtocolEvent | None
+    registry_publish: ProtocolEvent | None
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionProtocolMapping:
+    """Exact submit-event lookup by action, ready sequence, and added node."""
+
+    by_action: tuple[SubmitEventNodes | None, ...]
+    by_ready_sequence: tuple[SubmitEventNodes, ...]
+    protocol_events: tuple[ProtocolEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionProtocolOrder:
+    """Authenticated action intervals plus the submission protocol event DAG."""
+
+    interval_order: ActionIntervalOrder
+    submissions: SubmissionProtocolMapping
+    graph: ReasonedDAG
+    accepted_count: int
+    rejected_count: int
+
+
+class _ProtocolGraphPlanner:
+    """Bound protocol node and edge allocation before retaining each input."""
+
+    __slots__ = (
+        "_base_node_count",
+        "_constraints",
+        "_events",
+        "_next_node",
+    )
+
+    def __init__(self, base_node_count: int):
+        base_node_count = _plain_int(
+            base_node_count,
+            "protocol base node count",
+        )
+        if base_node_count < 0 or base_node_count > MAX_PROTOCOL_NODES:
+            _fail(
+                "protocol base node count exceeds the "
+                f"{MAX_PROTOCOL_NODES}-node limit"
+            )
+        self._base_node_count = base_node_count
+        self._next_node = base_node_count
+        self._constraints: list[EdgeConstraint] = []
+        self._events: list[ProtocolEvent] = []
+
+    @property
+    def node_count(self) -> int:
+        return self._next_node
+
+    @property
+    def edge_input_count(self) -> int:
+        return len(self._constraints)
+
+    @property
+    def protocol_events(self) -> tuple[ProtocolEvent, ...]:
+        return tuple(self._events)
+
+    def allocate(self, action_ordinal: int, kind: str) -> ProtocolEvent:
+        """Allocate one new node, rejecting the first over-limit request."""
+
+        action_ordinal = _plain_int(
+            action_ordinal,
+            "protocol event action ordinal",
+        )
+        if action_ordinal < 0 or action_ordinal >= EXPECTED_ACTION_COUNT:
+            _fail("protocol event action ordinal is outside the action corpus")
+        if kind not in {
+            "CommandReserve",
+            "ReadyCommit",
+            "ActorCommandClaim",
+            "ActorCommandRespond",
+            "CommandRelease",
+            "ControlBind",
+            "EndpointBind",
+            "RegistryPublish",
+        }:
+            _fail("protocol event kind is unsupported")
+        if self._next_node >= MAX_PROTOCOL_NODES:
+            _fail(
+                f"protocol graph exceeds the {MAX_PROTOCOL_NODES}-node limit"
+            )
+        event = ProtocolEvent(self._next_node, action_ordinal, kind)
+        self._next_node += 1
+        self._events.append(event)
+        return event
+
+    def edge(self, before: int, after: int, reason: str) -> None:
+        """Retain one reasoned input, rejecting before the list can exceed its cap."""
+
+        if len(self._constraints) >= MAX_PROTOCOL_EDGE_INPUTS:
+            _fail(
+                "protocol graph exceeds the "
+                f"{MAX_PROTOCOL_EDGE_INPUTS}-constraint input limit"
+            )
+        # Reason and endpoint validation remain centralized in ReasonedDAG;
+        # the planner's responsibility is to cap retained attacker influence.
+        self._constraints.append(EdgeConstraint(before, after, reason))
+
+    def layer(self, graph: ReasonedDAG) -> None:
+        """Copy every base edge reason without collapsing its provenance."""
+
+        if not isinstance(graph, ReasonedDAG):
+            _fail("protocol base graph has an invalid type")
+        if graph.node_count != self._base_node_count:
+            _fail("protocol base graph node count changed")
+        for edge in graph.edges:
+            for reason in edge.reasons:
+                self.edge(edge.before, edge.after, reason)
+
+    def build(self) -> ReasonedDAG:
+        """Build the immutable graph from the already bounded input set."""
+
+        return ReasonedDAG.build(self._next_node, tuple(self._constraints))
+
+
 def _normalize_generated_action(raw: Any, expected_ordinal: int) -> StaticAction:
     if not isinstance(raw, dict):
         _fail(f"regenerated action {expected_ordinal} is not an object")
@@ -510,6 +705,37 @@ def regenerate_authenticated_action_program() -> ActionProgram:
         _fail("regenerated scheduler producer counts differ from frozen gates")
     if fixture["action_counts"]["total"] != len(actions):
         _fail("fixture action total differs from regenerated actions")
+
+    submit_attempts = tuple(
+        action.submit_attempt
+        for action in actions
+        if action.kind == "submit"
+    )
+    in_range_attempts = tuple(
+        attempt
+        for attempt in submit_attempts
+        if attempt is not None and attempt < scheduler.REQUEST_COUNT
+    )
+    exhausted_attempts = tuple(
+        attempt
+        for attempt in submit_attempts
+        if attempt is not None and attempt >= scheduler.REQUEST_COUNT
+    )
+    if (
+        scheduler.REQUEST_COUNT != EXPECTED_IN_RANGE_SUBMIT_COUNT
+        or len(submit_attempts) != EXPECTED_SUBMIT_COUNT
+        or len(in_range_attempts) != EXPECTED_IN_RANGE_SUBMIT_COUNT
+        or len(exhausted_attempts) != EXPECTED_EXHAUSTED_SUBMIT_COUNT
+    ):
+        _fail("regenerated scheduler submit counts differ from frozen gates")
+    if tuple(sorted(in_range_attempts)) != tuple(
+        range(EXPECTED_IN_RANGE_SUBMIT_COUNT)
+    ):
+        _fail("regenerated in-range submit attempts lack exact coverage")
+    if tuple(sorted(exhausted_attempts)) != tuple(
+        range(EXPECTED_IN_RANGE_SUBMIT_COUNT, EXPECTED_SUBMIT_COUNT)
+    ):
+        _fail("regenerated exhausted submit attempts lack exact coverage")
 
     return ActionProgram(
         actions,
@@ -809,6 +1035,633 @@ def build_action_interval_order(repetition: Any) -> ActionIntervalOrder:
         action_counter_final,
         expected_action_count=EXPECTED_ACTION_COUNT,
     )
+
+
+_COMMAND_SENTINEL = actor_race_history.CommandWitness(False, 0, 0, 0)
+_ACCEPTED_SENTINEL = actor_race_history.AcceptedWitness(
+    False,
+    0,
+    0,
+    0,
+    0,
+    0,
+)
+_CONTROL_SENTINEL = actor_race_history.ControlWitness(
+    "none",
+    False,
+    0,
+    0,
+    "0000000000000000",
+    "0000000000000000",
+    None,
+)
+_PRIMARY_POP_SENTINEL = actor_race_history.PopWitness(
+    "primary",
+    False,
+    0,
+    0,
+    0,
+    0,
+    None,
+)
+_OPPORTUNISTIC_POP_SENTINEL = actor_race_history.PopWitness(
+    "opportunistic_eof",
+    False,
+    0,
+    0,
+    0,
+    0,
+    None,
+)
+_WAKE_SENTINEL = actor_race_history.WakeWitness(False, False, 0, 0)
+_SATURATED_SUBMIT_ERROR = actor_race_history.CapturedError(
+    "resource_exhausted",
+    "resource_exhausted",
+    "request slot count",
+    16,
+    16,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedSubmit:
+    action_ordinal: int
+    submit_attempt: int
+    command_slot: int
+    command_ticket: int
+    ready_sequence: int
+    accepted: bool
+
+
+def _field(value: Any, name: str, label: str) -> Any:
+    try:
+        return getattr(value, name)
+    except AttributeError:
+        _fail(f"{label} lacks field {name}")
+
+
+def _exact_typed_value(value: Any, expected: Any, label: str) -> None:
+    """Require one closed decoded dataclass spelling and all of its values."""
+
+    if not _same_exact_value(value, expected):
+        _fail(f"{label} does not use its exact typed sentinel")
+
+
+def _same_exact_value(value: Any, expected: Any) -> bool:
+    """Compare a bounded frozen value without Python bool/int coercion."""
+
+    if type(value) is not type(expected):
+        return False
+    if is_dataclass(expected) and not isinstance(expected, type):
+        return all(
+            _same_exact_value(
+                getattr(value, field.name),
+                getattr(expected, field.name),
+            )
+            for field in fields(expected)
+        )
+    if isinstance(expected, tuple):
+        return len(value) == len(expected) and all(
+            _same_exact_value(actual, wanted)
+            for actual, wanted in zip(value, expected, strict=True)
+        )
+    return bool(value == expected)
+
+
+def _validate_submit_zero_effects(action: Any, ordinal: int) -> None:
+    """Reject non-submission effects on every submit result spelling."""
+
+    label = f"submit action {ordinal}"
+    if _field(action, "output", label) is not None:
+        _fail(f"{label} retained an output")
+    _exact_typed_value(
+        _field(action, "control", label),
+        _CONTROL_SENTINEL,
+        f"{label} control witness",
+    )
+    _exact_typed_value(
+        _field(action, "primary_pop", label),
+        _PRIMARY_POP_SENTINEL,
+        f"{label} primary-pop witness",
+    )
+    _exact_typed_value(
+        _field(action, "opportunistic_eof_pop", label),
+        _OPPORTUNISTIC_POP_SENTINEL,
+        f"{label} opportunistic-pop witness",
+    )
+    if _plain_bool(_field(action, "cached_eof", label), f"{label} cached_eof"):
+        _fail(f"{label} retained cached EOF state")
+    _exact_typed_value(
+        _field(action, "wake", label),
+        _WAKE_SENTINEL,
+        f"{label} wake witness",
+    )
+
+
+def _validate_command_witness(
+    action: Any,
+    ordinal: int,
+    *,
+    applicable: bool,
+) -> tuple[int, int, int] | None:
+    label = f"action {ordinal} command witness"
+    command = _field(action, "command", label)
+    if type(command) is not actor_race_history.CommandWitness:
+        _fail(f"{label} has an invalid decoded type")
+    boundary = _plain_bool(command.boundary, f"{label} boundary")
+    slot = _plain_int(command.slot, f"{label} slot")
+    ticket = _plain_int(command.ticket, f"{label} ticket")
+    ready_sequence = _plain_int(
+        command.ready_sequence,
+        f"{label} ready_sequence",
+    )
+    if not applicable:
+        _exact_typed_value(command, _COMMAND_SENTINEL, label)
+        return None
+    if not boundary:
+        _fail(f"{label} omitted its in-range submit boundary")
+    if slot < 0 or slot >= 8:
+        _fail(f"{label} slot is outside 0..7")
+    if ticket < 1 or ticket > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail(f"{label} ticket is outside 1..64")
+    if ready_sequence < 1 or ready_sequence > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail(f"{label} ready_sequence is outside 1..64")
+    return slot, ticket, ready_sequence
+
+
+def _validate_accepted_witness(
+    action: Any,
+    ordinal: int,
+) -> actor_race_history.AcceptedWitness:
+    label = f"submit action {ordinal} accepted witness"
+    accepted = _field(action, "accepted", label)
+    if type(accepted) is not actor_race_history.AcceptedWitness:
+        _fail(f"{label} has an invalid decoded type")
+    if not _plain_bool(accepted.boundary, f"{label} boundary"):
+        _fail(f"{label} omitted its boundary")
+    request_id = _plain_int(accepted.request_id, f"{label} request_id")
+    control_slot = _plain_int(accepted.control_slot, f"{label} control_slot")
+    control_generation = _plain_int(
+        accepted.control_generation,
+        f"{label} control_generation",
+    )
+    endpoint_slot = _plain_int(
+        accepted.endpoint_slot,
+        f"{label} endpoint_slot",
+    )
+    endpoint_generation = _plain_int(
+        accepted.endpoint_generation,
+        f"{label} endpoint_generation",
+    )
+    if request_id < 1 or request_id > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail(f"{label} request_id is outside 1..64")
+    if control_slot < 0 or control_slot >= 16:
+        _fail(f"{label} control_slot is outside 0..15")
+    if endpoint_slot < 0 or endpoint_slot >= 16:
+        _fail(f"{label} endpoint_slot is outside 0..15")
+    if control_generation < 1 or control_generation > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail(f"{label} control_generation is outside 1..64")
+    if endpoint_generation < 1 or endpoint_generation > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail(f"{label} endpoint_generation is outside 1..64")
+    action_request_id = _plain_int(
+        _field(action, "request_id", label),
+        f"submit action {ordinal} request_id",
+    )
+    if action_request_id != request_id:
+        _fail(f"{label} does not match the action request identity")
+    return accepted
+
+
+def _validate_shutdown(
+    repetition: Any,
+    accepted_count: int,
+    rejected_count: int,
+) -> None:
+    try:
+        shutdown = repetition.shutdown
+    except AttributeError:
+        _fail("decoded repetition lacks shutdown accounting")
+    if type(shutdown) is not actor_race_history.Shutdown:
+        _fail("shutdown accounting has an invalid decoded type")
+
+    values = {
+        name: _plain_int(getattr(shutdown, name), f"shutdown {name}")
+        for name in (
+            "accepted_submissions",
+            "discarded_output_events",
+            "engine_steps",
+            "rejected_submissions",
+            "released_request_bytes",
+            "remaining_shared_bytes",
+            "shutdown_cancellations",
+            "terminated_requests",
+        )
+    }
+    if values["accepted_submissions"] != accepted_count:
+        _fail("shutdown accepted_submissions differs from accepted submit evidence")
+    if values["rejected_submissions"] != rejected_count:
+        _fail("shutdown rejected_submissions differs from rejected submit evidence")
+    if values["engine_steps"] < 0:
+        _fail("shutdown engine_steps must be nonnegative")
+    for field_name in (
+        "discarded_output_events",
+        "released_request_bytes",
+        "remaining_shared_bytes",
+        "shutdown_cancellations",
+        "terminated_requests",
+    ):
+        if values[field_name] != 0:
+            _fail(f"shutdown {field_name} must be exactly zero")
+
+
+def _validate_submission_custody(
+    repetition: Any,
+    program: ActionProgram,
+) -> tuple[tuple[_ValidatedSubmit, ...], int, int]:
+    """Validate exact command coverage and admission-result identities."""
+
+    try:
+        actions = repetition.actions
+    except AttributeError:
+        _fail("decoded repetition lacks its action sequence")
+    if not isinstance(actions, tuple):
+        _fail("decoded actions must be an immutable tuple")
+
+    expected_in_range = {
+        action.ordinal
+        for action in program.actions
+        if action.kind == "submit"
+        and action.submit_attempt is not None
+        and action.submit_attempt < EXPECTED_IN_RANGE_SUBMIT_COUNT
+    }
+    expected_exhausted = {
+        action.ordinal
+        for action in program.actions
+        if action.kind == "submit"
+        and action.submit_attempt is not None
+        and action.submit_attempt >= EXPECTED_IN_RANGE_SUBMIT_COUNT
+    }
+    if len(expected_in_range) != EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail("authenticated action program does not contain exactly 64 in-range submits")
+    if len(expected_exhausted) != EXPECTED_EXHAUSTED_SUBMIT_COUNT:
+        _fail("authenticated action program does not contain exactly 142 exhausted submits")
+
+    records: list[_ValidatedSubmit] = []
+    by_ready: list[_ValidatedSubmit | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    tickets_by_slot: list[list[_ValidatedSubmit]] = [[] for _ in range(8)]
+    accepted_by_ordinal: dict[int, actor_race_history.AcceptedWitness] = {}
+
+    for ordinal, (action, expected) in enumerate(
+        zip(actions, program.actions, strict=True)
+    ):
+        in_range = ordinal in expected_in_range
+        command_fields = _validate_command_witness(
+            action,
+            ordinal,
+            applicable=in_range,
+        )
+        if expected.kind != "submit":
+            continue
+
+        _validate_submit_zero_effects(action, ordinal)
+        result = _field(action, "result", f"submit action {ordinal}")
+        if type(result) is not str:
+            _fail(f"submit action {ordinal} result must be a string")
+        error = _field(action, "error", f"submit action {ordinal}")
+        request_id = _field(action, "request_id", f"submit action {ordinal}")
+        accepted_witness = _field(
+            action,
+            "accepted",
+            f"submit action {ordinal}",
+        )
+
+        if ordinal in expected_exhausted:
+            if (
+                result != "submit_offer_exhausted"
+                or error is not None
+                or request_id is not None
+            ):
+                _fail(f"submit action {ordinal} has an invalid exhausted spelling")
+            _exact_typed_value(
+                accepted_witness,
+                _ACCEPTED_SENTINEL,
+                f"submit action {ordinal} accepted witness",
+            )
+            continue
+
+        if command_fields is None:
+            _fail(f"submit action {ordinal} lacks command custody")
+        slot, ticket, ready_sequence = command_fields
+        if result == "submit_accepted":
+            if error is not None or request_id is None:
+                _fail(f"submit action {ordinal} has an invalid accepted spelling")
+            accepted = True
+            accepted_by_ordinal[ordinal] = _validate_accepted_witness(
+                action,
+                ordinal,
+            )
+        elif result == "error":
+            # This gate proves only the exact typed rejection returned by the
+            # actor.  It intentionally makes no claim about admission-time
+            # live occupancy, for which the capture has no atomic witness.
+            if request_id is not None:
+                _fail(f"submit action {ordinal} rejected with a request identity")
+            _exact_typed_value(
+                error,
+                _SATURATED_SUBMIT_ERROR,
+                f"submit action {ordinal} rejection error",
+            )
+            _exact_typed_value(
+                accepted_witness,
+                _ACCEPTED_SENTINEL,
+                f"submit action {ordinal} accepted witness",
+            )
+            accepted = False
+        else:
+            _fail(f"submit action {ordinal} has an invalid in-range result spelling")
+
+        submit_attempt = _plain_int(
+            expected.submit_attempt,
+            f"authenticated submit action {ordinal} attempt",
+        )
+        record = _ValidatedSubmit(
+            ordinal,
+            submit_attempt,
+            slot,
+            ticket,
+            ready_sequence,
+            accepted,
+        )
+        ready_slot = ready_sequence - 1
+        if by_ready[ready_slot] is not None:
+            _fail(f"command ready_sequence {ready_sequence} is duplicated")
+        by_ready[ready_slot] = record
+        tickets_by_slot[slot].append(record)
+        records.append(record)
+
+    if len(records) != EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail("observed command custody does not cover exactly 64 in-range submits")
+    missing_ready = next(
+        (
+            index + 1
+            for index, record in enumerate(by_ready)
+            if record is None
+        ),
+        None,
+    )
+    if missing_ready is not None:
+        _fail(f"command ready_sequence {missing_ready} is missing")
+
+    for slot, slot_records in enumerate(tickets_by_slot):
+        tickets = tuple(sorted(record.command_ticket for record in slot_records))
+        if tickets != tuple(range(1, len(slot_records) + 1)):
+            _fail(f"command slot {slot} tickets are not exactly 1..k")
+
+    ready_records = tuple(record for record in by_ready if record is not None)
+    next_request_id = 1
+    next_control_generation = [1] * 16
+    next_endpoint_generation = [1] * 16
+    for record in ready_records:
+        if not record.accepted:
+            continue
+        witness = accepted_by_ordinal[record.action_ordinal]
+        if witness.request_id != next_request_id:
+            _fail(
+                "accepted request IDs are not exactly 1..N in command-ready order"
+            )
+        expected_control_generation = next_control_generation[witness.control_slot]
+        if witness.control_generation != expected_control_generation:
+            _fail(
+                f"control slot {witness.control_slot} generations do not start at 1 "
+                "and remain contiguous in command-ready order"
+            )
+        next_control_generation[witness.control_slot] += 1
+        expected_endpoint_generation = next_endpoint_generation[witness.endpoint_slot]
+        if witness.endpoint_generation != expected_endpoint_generation:
+            _fail(
+                f"endpoint slot {witness.endpoint_slot} generations do not start at 1 "
+                "and remain contiguous in command-ready order"
+            )
+        next_endpoint_generation[witness.endpoint_slot] += 1
+        next_request_id += 1
+
+    accepted_count = next_request_id - 1
+    rejected_count = EXPECTED_IN_RANGE_SUBMIT_COUNT - accepted_count
+    _validate_shutdown(repetition, accepted_count, rejected_count)
+    return tuple(records), accepted_count, rejected_count
+
+
+def _build_submission_protocol_order(
+    repetition: Any,
+    program: ActionProgram,
+    interval_order: ActionIntervalOrder,
+) -> SubmissionProtocolOrder:
+    records, accepted_count, rejected_count = _validate_submission_custody(
+        repetition,
+        program,
+    )
+    planner = _ProtocolGraphPlanner(interval_order.graph.node_count)
+    planner.layer(interval_order.graph)
+
+    by_action: list[SubmitEventNodes | None] = [None] * EXPECTED_ACTION_COUNT
+    for record in records:
+        ordinal = record.action_ordinal
+        reserve = planner.allocate(ordinal, "CommandReserve")
+        ready = planner.allocate(ordinal, "ReadyCommit")
+        actor_claim = planner.allocate(ordinal, "ActorCommandClaim")
+        actor_respond = planner.allocate(ordinal, "ActorCommandRespond")
+        release = planner.allocate(ordinal, "CommandRelease")
+        control_bind: ProtocolEvent | None = None
+        endpoint_bind: ProtocolEvent | None = None
+        registry_publish: ProtocolEvent | None = None
+        if record.accepted:
+            control_bind = planner.allocate(ordinal, "ControlBind")
+            endpoint_bind = planner.allocate(ordinal, "EndpointBind")
+            registry_publish = planner.allocate(ordinal, "RegistryPublish")
+
+        nodes = SubmitEventNodes(
+            ordinal,
+            record.submit_attempt,
+            record.command_slot,
+            record.command_ticket,
+            record.ready_sequence,
+            record.accepted,
+            reserve,
+            ready,
+            actor_claim,
+            actor_respond,
+            release,
+            control_bind,
+            endpoint_bind,
+            registry_publish,
+        )
+        by_action[ordinal] = nodes
+        endpoints = interval_order.endpoints.by_action[ordinal]
+        if endpoints.response.node == release.node:
+            _fail("command release was aliased to the action response endpoint")
+        planner.edge(
+            endpoints.invocation.node,
+            reserve.node,
+            "submit-invocation-before-command-reserve",
+        )
+        planner.edge(
+            reserve.node,
+            ready.node,
+            "command-reserve-before-ready-commit",
+        )
+        planner.edge(
+            ready.node,
+            actor_claim.node,
+            "ready-commit-before-actor-command-claim",
+        )
+        if record.accepted:
+            if (
+                control_bind is None
+                or endpoint_bind is None
+                or registry_publish is None
+            ):
+                _fail("accepted submit event allocation is incomplete")
+            planner.edge(
+                actor_claim.node,
+                control_bind.node,
+                "actor-command-claim-before-control-bind",
+            )
+            planner.edge(
+                actor_claim.node,
+                endpoint_bind.node,
+                "actor-command-claim-before-endpoint-bind",
+            )
+            planner.edge(
+                control_bind.node,
+                actor_respond.node,
+                "control-bind-before-actor-command-respond",
+            )
+            planner.edge(
+                endpoint_bind.node,
+                actor_respond.node,
+                "endpoint-bind-before-actor-command-respond",
+            )
+            planner.edge(
+                actor_respond.node,
+                release.node,
+                "actor-command-respond-before-command-release",
+            )
+            planner.edge(
+                release.node,
+                registry_publish.node,
+                "command-release-before-registry-publish",
+            )
+            planner.edge(
+                registry_publish.node,
+                endpoints.response.node,
+                "registry-publish-before-submit-action-response",
+            )
+        else:
+            planner.edge(
+                actor_claim.node,
+                actor_respond.node,
+                "rejected-actor-command-claim-before-respond",
+            )
+            planner.edge(
+                actor_respond.node,
+                release.node,
+                "actor-command-respond-before-command-release",
+            )
+            planner.edge(
+                release.node,
+                endpoints.response.node,
+                "rejected-command-release-before-submit-action-response",
+            )
+
+    ready_nodes = tuple(
+        sorted(
+            (nodes for nodes in by_action if nodes is not None),
+            key=lambda nodes: nodes.ready_sequence,
+        )
+    )
+    if tuple(nodes.ready_sequence for nodes in ready_nodes) != tuple(
+        range(1, EXPECTED_IN_RANGE_SUBMIT_COUNT + 1)
+    ):
+        _fail("internal ready-sequence mapping is incomplete")
+    for previous, current in zip(ready_nodes, ready_nodes[1:]):
+        planner.edge(
+            previous.ready_commit.node,
+            current.ready_commit.node,
+            "command-ready-sequence-order",
+        )
+        planner.edge(
+            previous.actor_command_respond.node,
+            current.actor_command_claim.node,
+            "actor-command-ready-sequence-order",
+        )
+
+    for slot in range(8):
+        slot_nodes = tuple(
+            sorted(
+                (
+                    nodes
+                    for nodes in ready_nodes
+                    if nodes.command_slot == slot
+                ),
+                key=lambda nodes: nodes.command_ticket,
+            )
+        )
+        for previous, current in zip(slot_nodes, slot_nodes[1:]):
+            planner.edge(
+                previous.command_release.node,
+                current.command_reserve.node,
+                f"command-slot-{slot}-ticket-order",
+            )
+
+    graph = planner.build()
+    for nodes in ready_nodes:
+        if not nodes.accepted:
+            continue
+        control_bind = nodes.control_bind
+        endpoint_bind = nodes.endpoint_bind
+        if control_bind is None or endpoint_bind is None:
+            _fail("accepted submit lacks its bind nodes")
+        if graph.precedes(control_bind.node, endpoint_bind.node) or graph.precedes(
+            endpoint_bind.node,
+            control_bind.node,
+        ):
+            _fail("accepted control and endpoint binds became ordered")
+
+    return SubmissionProtocolOrder(
+        interval_order,
+        SubmissionProtocolMapping(
+            tuple(by_action),
+            ready_nodes,
+            planner.protocol_events,
+        ),
+        graph,
+        accepted_count,
+        rejected_count,
+    )
+
+
+def build_submission_protocol_order(repetition: Any) -> SubmissionProtocolOrder:
+    """Authenticate and reconstruct one exact submission-command event DAG.
+
+    Authentication is deliberately local: callers cannot inject an action
+    program or bypass frozen fixture and count gates.
+    """
+
+    program = regenerate_authenticated_action_program()
+    _verify_repetition_static_actions(repetition, program)
+    try:
+        actions = repetition.actions
+        action_counter_final = repetition.diagnostics.action_counter_final
+    except AttributeError:
+        _fail("decoded repetition lacks submission protocol custody fields")
+    interval_order = _build_action_interval_order(
+        actions,
+        action_counter_final,
+        expected_action_count=EXPECTED_ACTION_COUNT,
+    )
+    return _build_submission_protocol_order(repetition, program, interval_order)
 
 
 def producer_action_interval_edges(
