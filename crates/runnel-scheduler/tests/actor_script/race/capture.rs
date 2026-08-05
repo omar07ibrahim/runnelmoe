@@ -281,6 +281,10 @@ pub(super) struct RepetitionDraft {
 }
 
 impl RepetitionDraft {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a separately authenticated race-capture boundary"
+    )]
     pub(super) fn new(
         repetition: u64,
         descriptors: Arc<[Descriptor]>,
