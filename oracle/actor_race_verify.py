@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Independent bounded semantic primitives for actor race-history captures.
 
-This layer owns five deliberately narrow responsibilities:
+This layer owns six deliberately narrow responsibilities:
 
 * a deterministic, reason-labelled partial-order DAG with bitset reachability;
 * authentication and exact comparison of the frozen scheduler action program;
 * exact action invocation/response custody and its witnessed partial order;
 * submission-command custody and an explicit event graph for admission results;
-* immutable accepted-identity projection and target lookup/access custody.
+* immutable accepted-identity projection and target lookup/access custody;
+* packed control-word algebra and request/control lifecycle custody.
 
-It does not yet interpret packed control-word transitions, output drain-count
-chains, terminal witnesses, or observation conservation.  Action interval
-counters are mapped to explicit Invoke and Respond nodes; they are never
-promoted into a counter-derived global execution order.  In particular,
+It does not yet interpret output drain-count chains, endpoint terminal/EOF
+witnesses, publication observations, or observation conservation.  Action
+interval counters are mapped to explicit Invoke and Respond nodes; they are
+never promoted into a counter-derived global execution order.  In particular,
 consuming an actor command response is a separate CommandRelease event, never
 an alias for either ActorCommandRespond publication or the action's final
 Respond counter.
@@ -98,6 +99,70 @@ _PROTOCOL_NODE_BUDGET = (
 MAX_PROTOCOL_NODES = 4_258
 if sum(count for _, count in _PROTOCOL_NODE_BUDGET) != MAX_PROTOCOL_NODES:
     raise RuntimeError("actor race protocol node budget does not total 4258")
+
+# This vertical slice allocates the complete target-access graph plus two
+# request-owned lifecycle nodes, three cleanup-authority-owned nodes, and one
+# phase gate.  The accepted-count maximum is 64, so the exact worst-case node
+# arithmetic is 3,239 + 128 + 192 + 1 = 3,560.  Later endpoint/output layers
+# retain the remaining finished-model headroom up to MAX_PROTOCOL_NODES.
+_CONTROL_LIFECYCLE_NODE_BUDGET = (
+    (
+        "target-access graph at 64 accepts",
+        EXPECTED_ACTION_COUNTER_FINAL
+        + 5 * EXPECTED_IN_RANGE_SUBMIT_COUNT
+        + 3 * EXPECTED_IN_RANGE_SUBMIT_COUNT
+        + EXPECTED_TARGET_ACTION_COUNT,
+    ),
+    ("request terminal and reap events", 2 * EXPECTED_IN_RANGE_SUBMIT_COUNT),
+    (
+        "cleanup invoke, decision, and response events",
+        3 * EXPECTED_IN_RANGE_SUBMIT_COUNT,
+    ),
+    ("pre-cleanup phase gate", 1),
+)
+MAX_CONTROL_LIFECYCLE_NODES = 3_560
+if (
+    sum(count for _, count in _CONTROL_LIFECYCLE_NODE_BUDGET)
+    != MAX_CONTROL_LIFECYCLE_NODES
+):
+    raise RuntimeError("control lifecycle node budget does not total 3560")
+if MAX_CONTROL_LIFECYCLE_NODES > MAX_PROTOCOL_NODES:
+    raise RuntimeError(
+        "control lifecycle node budget exceeds the finished protocol budget"
+    )
+
+# A deliberately conservative, named upper bound on retained edge inputs for
+# this slice.  It counts each possible relation before graph deduplication:
+# interval custody, submission custody, target shells/publication/consumption,
+# request lifecycle/partition, cleanup sequencing, and five word-lattice
+# brackets for every possible script or cleanup control observation.
+_CONTROL_LIFECYCLE_EDGE_INPUT_BUDGET = (
+    ("action interval custody", 3 * EXPECTED_ACTION_COUNT),
+    ("submission custody", 15 * EXPECTED_IN_RANGE_SUBMIT_COUNT),
+    ("target access custody", 4 * EXPECTED_TARGET_ACTION_COUNT),
+    ("request lifecycle and cleanup partition", 6 * EXPECTED_IN_RANGE_SUBMIT_COUNT + 2),
+    ("cleanup authority sequencing", 4 * EXPECTED_IN_RANGE_SUBMIT_COUNT),
+    (
+        "control word generation and flag lattice",
+        5
+        * (
+            EXPECTED_KIND_COUNTS[1]
+            + EXPECTED_KIND_COUNTS[2]
+            + EXPECTED_IN_RANGE_SUBMIT_COUNT
+        ),
+    ),
+    (
+        "cleanup hold terminal brackets",
+        2 * EXPECTED_IN_RANGE_SUBMIT_COUNT,
+    ),
+)
+MAX_CONTROL_LIFECYCLE_EDGE_INPUTS = sum(
+    count for _, count in _CONTROL_LIFECYCLE_EDGE_INPUT_BUDGET
+)
+if MAX_CONTROL_LIFECYCLE_EDGE_INPUTS != 10_048:
+    raise RuntimeError("control lifecycle edge-input budget does not total 10048")
+if MAX_CONTROL_LIFECYCLE_EDGE_INPUTS > MAX_PROTOCOL_EDGE_INPUTS:
+    raise RuntimeError("control lifecycle edge bound exceeds the protocol edge cap")
 _SCHEDULER_TO_CAPTURE_KIND = {
     "submit": "submit",
     "cancel": "cancel",
@@ -514,14 +579,124 @@ class TargetAccessOrder:
     graph: ReasonedDAG
 
 
+@dataclass(frozen=True, slots=True)
+class RequestEvent:
+    """One request-owned lifecycle event with no fictitious action owner."""
+
+    node: int
+    client_index: int
+    request_id: int
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupEvent:
+    """One cleanup-authority event owned by its exact cleanup record."""
+
+    node: int
+    cleanup_ordinal: int
+    client_index: int
+    request_id: int
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseEvent:
+    """One lifecycle phase gate, deliberately not action-owned."""
+
+    node: int
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class RequestLifecycleEvents:
+    """Existential control-terminal publication and reap for one request."""
+
+    identity: AcceptedIdentityProjection
+    control_terminal_publish: RequestEvent
+    request_reap: RequestEvent
+    receiver_state: str
+    successful_drop_action: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ControlWordObservation:
+    """One exact packed-word observation, indexed by the generation loaded."""
+
+    node: int
+    source_kind: str
+    owner_client_index: int
+    owner_request_id: int
+    operation: str
+    expected_slot: int
+    expected_generation: int
+    observed_identity: AcceptedIdentityProjection
+    loaded_word: int
+    resulting_word: int
+    disposition: str | None
+    stale: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupAuthorityEvents:
+    """Exact invoke/decision/respond ownership for one cleanup authority."""
+
+    cleanup_ordinal: int
+    identity: AcceptedIdentityProjection
+    invocation: CleanupEvent
+    control_decision: CleanupEvent
+    response: CleanupEvent
+    observation: ControlWordObservation
+
+
+@dataclass(frozen=True, slots=True)
+class ControlGenerationLifecycle:
+    """Bind, word-state observations, terminal publication, and reap."""
+
+    identity: AcceptedIdentityProjection
+    request: RequestLifecycleEvents
+    observations: tuple[ControlWordObservation, ...]
+    cancel_publisher: ControlWordObservation | None
+    disconnect_publisher: ControlWordObservation | None
+
+
+@dataclass(frozen=True, slots=True)
+class ControlLifecycleMapping:
+    """Immutable lookup for request, cleanup, and control-generation custody."""
+
+    identities: AcceptedIdentityMapping
+    requests_by_client_index: tuple[RequestLifecycleEvents | None, ...]
+    requests_by_request_id: tuple[RequestLifecycleEvents, ...]
+    cleanup_by_client_index: tuple[CleanupAuthorityEvents | None, ...]
+    cleanup_in_order: tuple[CleanupAuthorityEvents, ...]
+    control_by_slot: tuple[tuple[ControlGenerationLifecycle, ...], ...]
+    observations: tuple[ControlWordObservation, ...]
+    pre_cleanup: PhaseEvent
+    request_events: tuple[RequestEvent, ...]
+    cleanup_events: tuple[CleanupEvent, ...]
+    phase_events: tuple[PhaseEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ControlLifecycleOrder:
+    """Target custody extended through control words and request cleanup."""
+
+    target_order: TargetAccessOrder
+    lifecycle: ControlLifecycleMapping
+    graph: ReasonedDAG
+
+
 class _ProtocolGraphPlanner:
     """Bound protocol node and edge allocation before retaining each input."""
 
     __slots__ = (
         "_base_node_count",
+        "_cleanup_events",
         "_constraints",
         "_events",
         "_next_node",
+        "_phase_events",
+        "_request_events",
     )
 
     def __init__(self, base_node_count: int):
@@ -538,6 +713,9 @@ class _ProtocolGraphPlanner:
         self._next_node = base_node_count
         self._constraints: list[EdgeConstraint] = []
         self._events: list[ProtocolEvent] = []
+        self._request_events: list[RequestEvent] = []
+        self._cleanup_events: list[CleanupEvent] = []
+        self._phase_events: list[PhaseEvent] = []
 
     @property
     def node_count(self) -> int:
@@ -550,6 +728,29 @@ class _ProtocolGraphPlanner:
     @property
     def protocol_events(self) -> tuple[ProtocolEvent, ...]:
         return tuple(self._events)
+
+    @property
+    def request_events(self) -> tuple[RequestEvent, ...]:
+        return tuple(self._request_events)
+
+    @property
+    def cleanup_events(self) -> tuple[CleanupEvent, ...]:
+        return tuple(self._cleanup_events)
+
+    @property
+    def phase_events(self) -> tuple[PhaseEvent, ...]:
+        return tuple(self._phase_events)
+
+    def _reserve_node(self) -> int:
+        """Reserve one bounded node only after event ownership is validated."""
+
+        if self._next_node >= MAX_PROTOCOL_NODES:
+            _fail(
+                f"protocol graph exceeds the {MAX_PROTOCOL_NODES}-node limit"
+            )
+        node = self._next_node
+        self._next_node += 1
+        return node
 
     def allocate(self, action_ordinal: int, kind: str) -> ProtocolEvent:
         """Allocate one new node, rejecting the first over-limit request."""
@@ -576,13 +777,75 @@ class _ProtocolGraphPlanner:
             "CachedEofRead",
         }:
             _fail("protocol event kind is unsupported")
-        if self._next_node >= MAX_PROTOCOL_NODES:
-            _fail(
-                f"protocol graph exceeds the {MAX_PROTOCOL_NODES}-node limit"
-            )
-        event = ProtocolEvent(self._next_node, action_ordinal, kind)
-        self._next_node += 1
+        event = ProtocolEvent(self._reserve_node(), action_ordinal, kind)
         self._events.append(event)
+        return event
+
+    def allocate_request(
+        self,
+        client_index: int,
+        request_id: int,
+        kind: str,
+    ) -> RequestEvent:
+        """Allocate one request-owned event without an action ordinal."""
+
+        client_index = _plain_int(client_index, "request event client index")
+        request_id = _plain_int(request_id, "request event request ID")
+        if client_index < 0 or client_index >= EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail("request event client index is outside 0..63")
+        if request_id < 1 or request_id > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail("request event request ID is outside 1..64")
+        if kind not in {"ControlTerminalPublish", "RequestReap"}:
+            _fail("request event kind is unsupported")
+        event = RequestEvent(
+            self._reserve_node(),
+            client_index,
+            request_id,
+            kind,
+        )
+        self._request_events.append(event)
+        return event
+
+    def allocate_cleanup(
+        self,
+        cleanup_ordinal: int,
+        client_index: int,
+        request_id: int,
+        kind: str,
+    ) -> CleanupEvent:
+        """Allocate one cleanup-owned event with exact record identity."""
+
+        cleanup_ordinal = _plain_int(
+            cleanup_ordinal,
+            "cleanup event ordinal",
+        )
+        client_index = _plain_int(client_index, "cleanup event client index")
+        request_id = _plain_int(request_id, "cleanup event request ID")
+        if cleanup_ordinal < 0 or cleanup_ordinal >= EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail("cleanup event ordinal is outside 0..63")
+        if client_index < 0 or client_index >= EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail("cleanup event client index is outside 0..63")
+        if request_id < 1 or request_id > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail("cleanup event request ID is outside 1..64")
+        if kind not in {"CleanupInvoke", "CleanupControlDecision", "CleanupRespond"}:
+            _fail("cleanup event kind is unsupported")
+        event = CleanupEvent(
+            self._reserve_node(),
+            cleanup_ordinal,
+            client_index,
+            request_id,
+            kind,
+        )
+        self._cleanup_events.append(event)
+        return event
+
+    def allocate_phase(self, kind: str) -> PhaseEvent:
+        """Allocate one non-action phase gate."""
+
+        if kind != "PreCleanupGate":
+            _fail("phase event kind is unsupported")
+        event = PhaseEvent(self._reserve_node(), kind)
+        self._phase_events.append(event)
         return event
 
     def edge(self, before: int, after: int, reason: str) -> None:
@@ -1173,6 +1436,20 @@ class _ValidatedTarget:
     event_kind: str
     identity: AcceptedIdentityProjection | None
     prior_receiver_drop_action: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ControlWordRecord:
+    source_kind: str
+    owner_identity: AcceptedIdentityProjection
+    operation: str
+    loaded_word: int
+    resulting_word: int
+    disposition: str | None
+    stale: bool
+    observed_identity: AcceptedIdentityProjection
+    action_event: ProtocolEvent | None
+    cleanup_ordinal: int | None
 
 
 def _field(value: Any, name: str, label: str) -> Any:
@@ -1873,6 +2150,37 @@ def _validate_hex64_word(value: Any, label: str) -> str:
     return value
 
 
+def _validate_control_witness_identity(
+    control: Any,
+    identity: AcceptedIdentityProjection,
+    operation: str,
+    label: str,
+) -> actor_race_history.ControlWitness:
+    """Validate one reached control boundary against its owning request."""
+
+    if type(control) is not actor_race_history.ControlWitness:
+        _fail(f"{label} has an invalid decoded type")
+    if type(control.operation) is not str or control.operation != operation:
+        _fail(f"{label} has the wrong operation")
+    if not _plain_bool(control.boundary, f"{label} boundary"):
+        _fail(f"{label} omitted its reached boundary")
+    slot = _plain_int(control.slot, f"{label} slot")
+    generation = _plain_int(
+        control.expected_generation,
+        f"{label} expected_generation",
+    )
+    if (slot, generation) != (
+        identity.control_slot,
+        identity.control_generation,
+    ):
+        _fail(f"{label} differs from its accepted control identity")
+    _validate_hex64_word(control.loaded_word, f"{label} loaded_word")
+    _validate_hex64_word(control.resulting_word, f"{label} resulting_word")
+    if control.disposition is not None and type(control.disposition) is not str:
+        _fail(f"{label} disposition must be a string or null")
+    return control
+
+
 def _validate_output_identity(
     output: Any,
     identity: AcceptedIdentityProjection,
@@ -1900,27 +2208,12 @@ def _validate_control_target(
 ) -> actor_race_history.ControlWitness:
     label = f"{operation} action {ordinal} control witness"
     control = _field(action, "control", label)
-    if type(control) is not actor_race_history.ControlWitness:
-        _fail(f"{label} has an invalid decoded type")
-    if type(control.operation) is not str or control.operation != operation:
-        _fail(f"{label} has the wrong operation")
-    if not _plain_bool(control.boundary, f"{label} boundary"):
-        _fail(f"{label} omitted its reached boundary")
-    slot = _plain_int(control.slot, f"{label} slot")
-    generation = _plain_int(
-        control.expected_generation,
-        f"{label} expected_generation",
+    return _validate_control_witness_identity(
+        control,
+        identity,
+        operation,
+        label,
     )
-    if (slot, generation) != (
-        identity.control_slot,
-        identity.control_generation,
-    ):
-        _fail(f"{label} differs from its accepted control identity")
-    _validate_hex64_word(control.loaded_word, f"{label} loaded_word")
-    _validate_hex64_word(control.resulting_word, f"{label} resulting_word")
-    if control.disposition is not None and type(control.disposition) is not str:
-        _fail(f"{label} disposition must be a string or null")
-    return control
 
 
 def _validate_pop_target(
@@ -2483,6 +2776,829 @@ def build_target_access_order(repetition: Any) -> TargetAccessOrder:
         interval_order,
     )
     return _build_target_access_order(actions, program, submission_order)
+
+
+_CONTROL_CANCELLED = 1
+_CONTROL_DISCONNECTED = 2
+_CONTROL_TERMINAL = 4
+_CONTROL_FLAG_MASK = 7
+_REACHABLE_CONTROL_FLAGS = frozenset((0, 1, 3, 4, 5, 7))
+
+
+def _control_identity_for_loaded_generation(
+    identities: AcceptedIdentityMapping,
+    slot: int,
+    generation: int,
+    label: str,
+) -> AcceptedIdentityProjection:
+    """Resolve a word's generation to a real accepted bind, never a number."""
+
+    if generation < 1 or generation > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail(f"{label} loaded generation is outside 1..64")
+    slot_identities = identities.by_control_slot[slot]
+    if generation > len(slot_identities):
+        _fail(f"{label} loaded generation has no accepted control bind")
+    identity = slot_identities[generation - 1]
+    if identity.control_generation != generation:
+        _fail(f"{label} loaded generation projection changed")
+    return identity
+
+
+def _validate_control_word_record(
+    *,
+    control: actor_race_history.ControlWitness,
+    error: Any,
+    owner_identity: AcceptedIdentityProjection,
+    identities: AcceptedIdentityMapping,
+    source_kind: str,
+    label: str,
+    action_event: ProtocolEvent | None,
+    cleanup_ordinal: int | None,
+) -> _ControlWordRecord:
+    """Validate exact packed-word generation, flags, and operation algebra."""
+
+    loaded_word = int(
+        _validate_hex64_word(control.loaded_word, f"{label} loaded_word"),
+        16,
+    )
+    resulting_word = int(
+        _validate_hex64_word(
+            control.resulting_word,
+            f"{label} resulting_word",
+        ),
+        16,
+    )
+    loaded_generation = loaded_word >> 3
+    resulting_generation = resulting_word >> 3
+    loaded_flags = loaded_word & _CONTROL_FLAG_MASK
+    resulting_flags = resulting_word & _CONTROL_FLAG_MASK
+    if loaded_flags not in _REACHABLE_CONTROL_FLAGS:
+        _fail(f"{label} loaded flags violate D-implies-C")
+    if resulting_flags not in _REACHABLE_CONTROL_FLAGS:
+        _fail(f"{label} resulting flags violate D-implies-C")
+    if resulting_generation != loaded_generation:
+        _fail(f"{label} changed the loaded control generation")
+
+    observed_identity = _control_identity_for_loaded_generation(
+        identities,
+        owner_identity.control_slot,
+        loaded_generation,
+        label,
+    )
+    if error is not None:
+        _exact_typed_value(error, _STALE_TARGET_ERROR, f"{label} stale error")
+        if control.operation != "cancel":
+            _fail(f"{label} stale control must be a cancel")
+        if control.disposition is not None:
+            _fail(f"{label} stale control retained a disposition")
+        if resulting_word != loaded_word:
+            _fail(f"{label} stale control changed its loaded word")
+        if loaded_generation <= owner_identity.control_generation:
+            _fail(f"{label} stale control did not load a later generation")
+        stale = True
+    else:
+        if loaded_generation != owner_identity.control_generation:
+            _fail(f"{label} live control loaded the wrong generation")
+        if observed_identity is not owner_identity:
+            _fail(f"{label} live control resolved to the wrong accepted bind")
+        terminal = bool(loaded_flags & _CONTROL_TERMINAL)
+        cancelled = bool(loaded_flags & _CONTROL_CANCELLED)
+        disconnected = bool(loaded_flags & _CONTROL_DISCONNECTED)
+        if control.operation == "cancel":
+            if terminal:
+                expected_disposition = "already_terminal"
+                expected_flags = loaded_flags
+            elif cancelled:
+                expected_disposition = "already_requested"
+                expected_flags = loaded_flags
+            else:
+                expected_disposition = "requested"
+                expected_flags = loaded_flags | _CONTROL_CANCELLED
+        elif control.operation == "disconnect":
+            if terminal:
+                expected_disposition = "already_terminal"
+            elif disconnected:
+                expected_disposition = "already_requested"
+            else:
+                expected_disposition = "requested"
+            expected_flags = (
+                loaded_flags | _CONTROL_CANCELLED | _CONTROL_DISCONNECTED
+                if not disconnected
+                else loaded_flags
+            )
+        else:
+            _fail(f"{label} has an unsupported control operation")
+        if control.disposition != expected_disposition:
+            _fail(f"{label} disposition disagrees with its loaded flags")
+        if resulting_flags != expected_flags:
+            _fail(f"{label} resulting flags violate the operation algebra")
+        stale = False
+
+    return _ControlWordRecord(
+        source_kind,
+        owner_identity,
+        control.operation,
+        loaded_word,
+        resulting_word,
+        control.disposition,
+        stale,
+        observed_identity,
+        action_event,
+        cleanup_ordinal,
+    )
+
+
+def _successful_receiver_drops(
+    target_order: TargetAccessOrder,
+) -> tuple[TargetActionEvent | None, ...]:
+    drops: list[TargetActionEvent | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    for target in target_order.targets.by_action:
+        if target is None or target.event.kind != "ControlDisconnect":
+            continue
+        if target.identity is None:
+            _fail("successful receiver drop omitted its accepted identity")
+        if drops[target.client_index] is not None:
+            _fail(f"accepted client {target.client_index} has duplicate drops")
+        drops[target.client_index] = target
+    return tuple(drops)
+
+
+def _require_exact_cleanup_shells(
+    cleanup_authorities: Any,
+    cleanup_receivers: Any,
+    cleanup_counter_final: Any,
+    pre_cleanup: Any,
+) -> tuple[
+    tuple[actor_race_history.CleanupAuthority, ...],
+    tuple[actor_race_history.CleanupReceiver, ...],
+    int,
+]:
+    """Reject malformed sealed cleanup inputs before any graph construction."""
+
+    if type(cleanup_authorities) is not tuple:
+        _fail("cleanup authorities must be an exact immutable tuple")
+    if len(cleanup_authorities) > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail("cleanup authorities exceed the 64-record limit")
+    for ordinal, authority in enumerate(cleanup_authorities):
+        if type(authority) is not actor_race_history.CleanupAuthority:
+            _fail(f"cleanup authority {ordinal} has an invalid exact type")
+    if type(cleanup_receivers) is not tuple:
+        _fail("cleanup receivers must be an exact immutable tuple")
+    if len(cleanup_receivers) > EXPECTED_IN_RANGE_SUBMIT_COUNT:
+        _fail("cleanup receivers exceed the 64-record limit")
+    for ordinal, receiver in enumerate(cleanup_receivers):
+        if type(receiver) is not actor_race_history.CleanupReceiver:
+            _fail(f"cleanup receiver {ordinal} has an invalid exact type")
+    if type(pre_cleanup) is not actor_race_history.ProbeSnapshot:
+        _fail("pre_cleanup has an invalid exact type")
+    cleanup_counter_final = _plain_int(
+        cleanup_counter_final,
+        "cleanup_counter_final",
+    )
+    expected_cleanup_counter = 2 * (
+        len(cleanup_authorities) + len(cleanup_receivers)
+    )
+    if cleanup_counter_final != expected_cleanup_counter:
+        _fail(
+            "cleanup_counter_final differs from the exact cleanup sequence"
+        )
+    return cleanup_authorities, cleanup_receivers, cleanup_counter_final
+
+
+def _validate_cleanup_custody(
+    cleanup_authorities: Any,
+    cleanup_receivers: Any,
+    cleanup_counter_final: Any,
+    pre_cleanup: Any,
+    identities: AcceptedIdentityMapping,
+    successful_drops: tuple[TargetActionEvent | None, ...],
+) -> tuple[
+    tuple[actor_race_history.CleanupAuthority, ...],
+    tuple[actor_race_history.CleanupReceiver, ...],
+    frozenset[int],
+]:
+    """Validate cleanup sequence identity and the drop/live partition."""
+
+    cleanup_authorities, cleanup_receivers, cleanup_counter_final = (
+        _require_exact_cleanup_shells(
+            cleanup_authorities,
+            cleanup_receivers,
+            cleanup_counter_final,
+            pre_cleanup,
+        )
+    )
+    accepted = identities.by_request_id
+    if len(cleanup_authorities) != len(accepted):
+        _fail("cleanup authorities do not exactly cover accepted requests")
+    accepted_by_client = tuple(sorted(accepted, key=lambda item: item.client_index))
+
+    for ordinal, (authority, identity) in enumerate(
+        zip(cleanup_authorities, accepted_by_client, strict=True)
+    ):
+        label = f"cleanup authority {ordinal}"
+        invocation = _plain_int(authority.invocation, f"{label} invocation")
+        response = _plain_int(authority.response, f"{label} response")
+        if invocation != ordinal * 2 + 1 or response != invocation + 1:
+            _fail(f"{label} violates the exact cleanup counter sequence")
+        client_index = _plain_int(authority.client_index, f"{label} client_index")
+        request_id = _plain_int(authority.request_id, f"{label} request_id")
+        if (client_index, request_id) != (
+            identity.client_index,
+            identity.request_id,
+        ):
+            _fail(f"{label} differs from its accepted request identity")
+        _validate_control_witness_identity(
+            authority.control,
+            identity,
+            "cancel",
+            f"{label} control witness",
+        )
+
+    receiver_clients: list[int] = []
+    for receiver_ordinal, receiver in enumerate(cleanup_receivers):
+        sequence_ordinal = len(cleanup_authorities) + receiver_ordinal
+        label = f"cleanup receiver {receiver_ordinal}"
+        invocation = _plain_int(receiver.invocation, f"{label} invocation")
+        response = _plain_int(receiver.response, f"{label} response")
+        if invocation != sequence_ordinal * 2 + 1 or response != invocation + 1:
+            _fail(f"{label} violates the exact cleanup counter sequence")
+        client_index = _plain_int(receiver.client_index, f"{label} client_index")
+        request_id = _plain_int(receiver.request_id, f"{label} request_id")
+        if client_index < 0 or client_index >= EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail(f"{label} client_index is outside 0..63")
+        identity = identities.by_client_index[client_index]
+        if identity is None or request_id != identity.request_id:
+            _fail(f"{label} differs from its accepted request identity")
+        if receiver_clients and client_index <= receiver_clients[-1]:
+            _fail("cleanup receiver client indexes are not strictly ascending")
+        receiver_clients.append(client_index)
+
+    outstanding = _plain_int(
+        pre_cleanup.outstanding_requests,
+        "pre_cleanup outstanding_requests",
+    )
+    if outstanding != len(cleanup_receivers):
+        _fail("pre_cleanup outstanding requests differ from receiver custody")
+
+    live_clients = frozenset(receiver_clients)
+    accepted_clients = frozenset(
+        identity.client_index for identity in accepted
+    )
+    dropped_clients = frozenset(
+        client_index
+        for client_index, drop in enumerate(successful_drops)
+        if drop is not None
+    )
+    if live_clients & dropped_clients:
+        _fail("cleanup receiver and successful drop ownership overlap")
+    if live_clients | dropped_clients != accepted_clients:
+        _fail("successful drops and cleanup receivers do not partition requests")
+    return cleanup_authorities, cleanup_receivers, live_clients
+
+
+def _word_bit_relation(
+    planner: _ProtocolGraphPlanner,
+    observation: ControlWordObservation,
+    publisher_node: int,
+    bit: int,
+    bit_name: str,
+) -> None:
+    """Bracket an observation around one unique monotone bit publisher."""
+
+    if observation.node == publisher_node:
+        return
+    if observation.loaded_word & bit:
+        planner.edge(
+            publisher_node,
+            observation.node,
+            f"control-{bit_name}-publisher-before-observer",
+        )
+    elif not observation.resulting_word & bit:
+        planner.edge(
+            observation.node,
+            publisher_node,
+            f"control-observer-before-{bit_name}-publisher",
+        )
+    else:
+        _fail(f"control {bit_name} publisher custody is inconsistent")
+
+
+def _add_cleanup_terminal_hold_brackets(
+    planner: _ProtocolGraphPlanner,
+    observations: tuple[ControlWordObservation, ...],
+    terminal_node: int,
+    first_cleanup_invocation_node: int,
+    last_cleanup_response_node: int,
+) -> None:
+    """Keep one generation's terminal transition outside the pump hold."""
+
+    if any(
+        (observation.loaded_word | observation.resulting_word)
+        & _CONTROL_TERMINAL
+        for observation in observations
+    ):
+        planner.edge(
+            terminal_node,
+            first_cleanup_invocation_node,
+            "control-terminal-before-cleanup-hold",
+        )
+    if any(
+        not (
+            (observation.loaded_word | observation.resulting_word)
+            & _CONTROL_TERMINAL
+        )
+        for observation in observations
+    ):
+        planner.edge(
+            last_cleanup_response_node,
+            terminal_node,
+            "cleanup-hold-before-control-terminal",
+        )
+
+
+def _build_control_lifecycle_order(
+    actions: tuple[Any, ...],
+    target_order: TargetAccessOrder,
+    cleanup_authorities: Any,
+    cleanup_receivers: Any,
+    cleanup_counter_final: Any,
+    pre_cleanup: Any,
+) -> ControlLifecycleOrder:
+    """Extend target custody with exact control words and request cleanup."""
+
+    _require_exact_decoded_actions(actions)
+    identities = target_order.targets.identities
+    successful_drops = _successful_receiver_drops(target_order)
+    authorities, _, live_clients = _validate_cleanup_custody(
+        cleanup_authorities,
+        cleanup_receivers,
+        cleanup_counter_final,
+        pre_cleanup,
+        identities,
+        successful_drops,
+    )
+
+    script_records: list[_ControlWordRecord] = []
+    for target in target_order.targets.by_action:
+        if target is None or target.event.kind not in {
+            "ControlCancel",
+            "ControlDisconnect",
+        }:
+            continue
+        identity = target.identity
+        if identity is None:
+            _fail("script control event omitted its accepted identity")
+        action = actions[target.action_ordinal]
+        operation = (
+            "cancel" if target.event.kind == "ControlCancel" else "disconnect"
+        )
+        label = f"{operation} action {target.action_ordinal} control witness"
+        control = _validate_control_witness_identity(
+            action.control,
+            identity,
+            operation,
+            label,
+        )
+        script_records.append(
+            _validate_control_word_record(
+                control=control,
+                error=action.error,
+                owner_identity=identity,
+                identities=identities,
+                source_kind="script",
+                label=label,
+                action_event=target.event,
+                cleanup_ordinal=None,
+            )
+        )
+
+    planner = _ProtocolGraphPlanner(target_order.graph.node_count)
+    planner.layer(target_order.graph)
+    requests_by_client: list[RequestLifecycleEvents | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    requests_by_request: list[RequestLifecycleEvents] = []
+    for identity in identities.by_request_id:
+        terminal = planner.allocate_request(
+            identity.client_index,
+            identity.request_id,
+            "ControlTerminalPublish",
+        )
+        reap = planner.allocate_request(
+            identity.client_index,
+            identity.request_id,
+            "RequestReap",
+        )
+        drop = successful_drops[identity.client_index]
+        receiver_state = "live" if identity.client_index in live_clients else "consumed"
+        lifecycle = RequestLifecycleEvents(
+            identity,
+            terminal,
+            reap,
+            receiver_state,
+            None if drop is None else drop.action_ordinal,
+        )
+        requests_by_client[identity.client_index] = lifecycle
+        requests_by_request.append(lifecycle)
+        control_bind = identity.submission.control_bind
+        if control_bind is None:
+            _fail("accepted request omitted its control bind")
+        planner.edge(
+            control_bind.node,
+            terminal.node,
+            "control-bind-before-terminal-publication",
+        )
+        planner.edge(
+            terminal.node,
+            reap.node,
+            "control-terminal-publication-before-request-reap",
+        )
+
+    for slot, slot_identities in enumerate(identities.by_control_slot):
+        for previous, current in zip(slot_identities, slot_identities[1:]):
+            previous_request = requests_by_client[previous.client_index]
+            next_bind = current.submission.control_bind
+            if previous_request is None or next_bind is None:
+                _fail(f"control slot {slot} rebind projection is incomplete")
+            planner.edge(
+                previous_request.request_reap.node,
+                next_bind.node,
+                f"control-slot-{slot}-reap-before-rebind",
+            )
+
+    cleanup_events: list[CleanupAuthorityEvents] = []
+    for ordinal, authority in enumerate(authorities):
+        identity = identities.by_client_index[authority.client_index]
+        if identity is None:
+            _fail(f"cleanup authority {ordinal} omitted accepted identity")
+        invocation = planner.allocate_cleanup(
+            ordinal,
+            identity.client_index,
+            identity.request_id,
+            "CleanupInvoke",
+        )
+        decision = planner.allocate_cleanup(
+            ordinal,
+            identity.client_index,
+            identity.request_id,
+            "CleanupControlDecision",
+        )
+        response = planner.allocate_cleanup(
+            ordinal,
+            identity.client_index,
+            identity.request_id,
+            "CleanupRespond",
+        )
+        label = f"cleanup authority {ordinal} control witness"
+        record = _validate_control_word_record(
+            control=authority.control,
+            error=authority.error,
+            owner_identity=identity,
+            identities=identities,
+            source_kind="cleanup",
+            label=label,
+            action_event=None,
+            cleanup_ordinal=ordinal,
+        )
+        if identity.client_index in live_clients:
+            if record.stale or record.disposition == "already_requested":
+                _fail(f"cleanup authority {ordinal} has invalid live-request result")
+            if record.disposition not in {"requested", "already_terminal"}:
+                _fail(f"cleanup authority {ordinal} has invalid live-request result")
+            if (
+                record.disposition == "already_terminal"
+                and record.loaded_word & _CONTROL_FLAG_MASK not in {4, 5}
+            ):
+                _fail(
+                    f"cleanup authority {ordinal} live terminal flags are invalid"
+                )
+        elif not record.stale:
+            if (
+                record.disposition != "already_terminal"
+                or record.loaded_word & _CONTROL_FLAG_MASK != 7
+            ):
+                _fail(
+                    f"cleanup authority {ordinal} consumed tombstone must be flags 7"
+                )
+        observation = ControlWordObservation(
+            decision.node,
+            record.source_kind,
+            identity.client_index,
+            identity.request_id,
+            record.operation,
+            identity.control_slot,
+            identity.control_generation,
+            record.observed_identity,
+            record.loaded_word,
+            record.resulting_word,
+            record.disposition,
+            record.stale,
+        )
+        events = CleanupAuthorityEvents(
+            ordinal,
+            identity,
+            invocation,
+            decision,
+            response,
+            observation,
+        )
+        cleanup_events.append(events)
+        planner.edge(
+            invocation.node,
+            decision.node,
+            "cleanup-invocation-before-control-decision",
+        )
+        planner.edge(
+            decision.node,
+            response.node,
+            "cleanup-control-decision-before-response",
+        )
+
+    pre_cleanup_event = planner.allocate_phase("PreCleanupGate")
+    interval_mapping = target_order.submission_order.interval_order.endpoints
+    for producer in (0, 1):
+        tail = next(
+            endpoints.response
+            for endpoints in reversed(interval_mapping.by_action)
+            if endpoints.producer == producer
+        )
+        planner.edge(
+            tail.node,
+            pre_cleanup_event.node,
+            f"producer-{producer}-tail-before-pre-cleanup",
+        )
+    if cleanup_events:
+        planner.edge(
+            pre_cleanup_event.node,
+            cleanup_events[0].invocation.node,
+            "pre-cleanup-before-first-authority",
+        )
+    for previous, current in zip(cleanup_events, cleanup_events[1:]):
+        planner.edge(
+            previous.response.node,
+            current.invocation.node,
+            "cleanup-authority-counter-order",
+        )
+
+    cleanup_by_client: list[CleanupAuthorityEvents | None] = [
+        None
+    ] * EXPECTED_IN_RANGE_SUBMIT_COUNT
+    for events in cleanup_events:
+        cleanup_by_client[events.identity.client_index] = events
+    for request in requests_by_request:
+        client_index = request.identity.client_index
+        if request.receiver_state == "consumed":
+            drop = successful_drops[client_index]
+            if drop is None:
+                _fail("consumed request omitted its successful receiver drop")
+            planner.edge(
+                drop.event.node,
+                request.request_reap.node,
+                "successful-disconnect-before-request-reap",
+            )
+            planner.edge(
+                request.request_reap.node,
+                pre_cleanup_event.node,
+                "consumed-request-reap-before-pre-cleanup",
+            )
+        else:
+            authority_events = cleanup_by_client[client_index]
+            if authority_events is None:
+                _fail("live request omitted its cleanup authority")
+            planner.edge(
+                pre_cleanup_event.node,
+                request.request_reap.node,
+                "pre-cleanup-before-live-request-reap",
+            )
+            planner.edge(
+                authority_events.response.node,
+                request.request_reap.node,
+                "live-cleanup-response-before-request-reap",
+            )
+
+    observations: list[ControlWordObservation] = []
+    for record in script_records:
+        if record.action_event is None:
+            _fail("script word observation omitted its action event")
+        owner = record.owner_identity
+        observations.append(
+            ControlWordObservation(
+                record.action_event.node,
+                record.source_kind,
+                owner.client_index,
+                owner.request_id,
+                record.operation,
+                owner.control_slot,
+                owner.control_generation,
+                record.observed_identity,
+                record.loaded_word,
+                record.resulting_word,
+                record.disposition,
+                record.stale,
+            )
+        )
+    observations.extend(events.observation for events in cleanup_events)
+
+    by_generation: dict[tuple[int, int], list[ControlWordObservation]] = {}
+    for observation in observations:
+        key = (
+            observation.observed_identity.control_slot,
+            observation.observed_identity.control_generation,
+        )
+        by_generation.setdefault(key, []).append(observation)
+
+    control_by_slot: list[list[ControlGenerationLifecycle]] = [
+        [] for _ in range(16)
+    ]
+    for slot, slot_identities in enumerate(identities.by_control_slot):
+        for generation_index, identity in enumerate(slot_identities):
+            state_observations = tuple(
+                by_generation.get((slot, identity.control_generation), ())
+            )
+            cancelled_publishers = tuple(
+                observation
+                for observation in state_observations
+                if not observation.loaded_word & _CONTROL_CANCELLED
+                and observation.resulting_word & _CONTROL_CANCELLED
+            )
+            disconnect_publishers = tuple(
+                observation
+                for observation in state_observations
+                if not observation.loaded_word & _CONTROL_DISCONNECTED
+                and observation.resulting_word & _CONTROL_DISCONNECTED
+            )
+            cancelled_seen = any(
+                (observation.loaded_word | observation.resulting_word)
+                & _CONTROL_CANCELLED
+                for observation in state_observations
+            )
+            disconnected_seen = any(
+                (observation.loaded_word | observation.resulting_word)
+                & _CONTROL_DISCONNECTED
+                for observation in state_observations
+            )
+            if cancelled_seen and len(cancelled_publishers) != 1:
+                _fail(
+                    f"control slot {slot} generation {identity.control_generation} "
+                    "does not have exactly one captured C publisher"
+                )
+            if disconnected_seen and len(disconnect_publishers) != 1:
+                _fail(
+                    f"control slot {slot} generation {identity.control_generation} "
+                    "does not have exactly one captured D publisher"
+                )
+            cancel_publisher = (
+                cancelled_publishers[0] if cancelled_publishers else None
+            )
+            disconnect_publisher = (
+                disconnect_publishers[0] if disconnect_publishers else None
+            )
+            request = requests_by_client[identity.client_index]
+            control_bind = identity.submission.control_bind
+            if request is None or control_bind is None:
+                _fail("control generation lifecycle projection is incomplete")
+            next_bind = (
+                slot_identities[generation_index + 1].submission.control_bind
+                if generation_index + 1 < len(slot_identities)
+                else None
+            )
+            cleanup_state_observations = tuple(
+                observation
+                for observation in state_observations
+                if observation.source_kind == "cleanup"
+            )
+            if cleanup_state_observations:
+                if not cleanup_events:
+                    _fail("cleanup word observation omitted authority events")
+                _add_cleanup_terminal_hold_brackets(
+                    planner,
+                    cleanup_state_observations,
+                    request.control_terminal_publish.node,
+                    cleanup_events[0].invocation.node,
+                    cleanup_events[-1].response.node,
+                )
+            for observation in state_observations:
+                planner.edge(
+                    control_bind.node,
+                    observation.node,
+                    "control-bind-before-word-observation",
+                )
+                if next_bind is not None:
+                    planner.edge(
+                        observation.node,
+                        next_bind.node,
+                        "word-observation-before-next-control-bind",
+                    )
+                _word_bit_relation(
+                    planner,
+                    observation,
+                    request.control_terminal_publish.node,
+                    _CONTROL_TERMINAL,
+                    "T",
+                )
+                if cancel_publisher is not None:
+                    _word_bit_relation(
+                        planner,
+                        observation,
+                        cancel_publisher.node,
+                        _CONTROL_CANCELLED,
+                        "C",
+                    )
+                if disconnect_publisher is not None:
+                    _word_bit_relation(
+                        planner,
+                        observation,
+                        disconnect_publisher.node,
+                        _CONTROL_DISCONNECTED,
+                        "D",
+                    )
+            control_by_slot[slot].append(
+                ControlGenerationLifecycle(
+                    identity,
+                    request,
+                    state_observations,
+                    cancel_publisher,
+                    disconnect_publisher,
+                )
+            )
+
+    accepted_count = len(identities.by_request_id)
+    expected_nodes = target_order.graph.node_count + 5 * accepted_count + 1
+    if planner.node_count != expected_nodes:
+        _fail("control lifecycle node arithmetic changed")
+    if planner.node_count > MAX_CONTROL_LIFECYCLE_NODES:
+        _fail("control lifecycle graph exceeds its 3560-node slice bound")
+    if planner.edge_input_count > MAX_CONTROL_LIFECYCLE_EDGE_INPUTS:
+        _fail("control lifecycle graph exceeds its 10048-edge-input bound")
+    graph = planner.build()
+    return ControlLifecycleOrder(
+        target_order,
+        ControlLifecycleMapping(
+            identities,
+            tuple(requests_by_client),
+            tuple(requests_by_request),
+            tuple(cleanup_by_client),
+            tuple(cleanup_events),
+            tuple(tuple(slot) for slot in control_by_slot),
+            tuple(observations),
+            pre_cleanup_event,
+            planner.request_events,
+            planner.cleanup_events,
+            planner.phase_events,
+        ),
+        graph,
+    )
+
+
+def build_control_lifecycle_order(repetition: Any) -> ControlLifecycleOrder:
+    """Authenticate and reconstruct exact control words and request cleanup."""
+
+    try:
+        actions = repetition.actions
+        cleanup_authorities = repetition.cleanup_authorities
+        cleanup_receivers = repetition.cleanup_receivers
+        diagnostics = repetition.diagnostics
+        pre_cleanup = repetition.pre_cleanup
+        shutdown = repetition.shutdown
+        action_counter_final = diagnostics.action_counter_final
+        cleanup_counter_final = diagnostics.cleanup_counter_final
+    except AttributeError:
+        _fail("decoded repetition lacks control lifecycle custody fields")
+    _require_exact_decoded_actions(actions)
+    _require_exact_cleanup_shells(
+        cleanup_authorities,
+        cleanup_receivers,
+        cleanup_counter_final,
+        pre_cleanup,
+    )
+    program = regenerate_authenticated_action_program()
+    _verify_static_actions(actions, program)
+    interval_order = _build_action_interval_order(
+        actions,
+        action_counter_final,
+        expected_action_count=EXPECTED_ACTION_COUNT,
+    )
+    submission_order = _build_submission_protocol_order(
+        actions,
+        shutdown,
+        program,
+        interval_order,
+    )
+    target_order = _build_target_access_order(
+        actions,
+        program,
+        submission_order,
+    )
+    return _build_control_lifecycle_order(
+        actions,
+        target_order,
+        cleanup_authorities,
+        cleanup_receivers,
+        cleanup_counter_final,
+        pre_cleanup,
+    )
 
 
 def producer_action_interval_edges(

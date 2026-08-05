@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from itertools import permutations
 import random
 from types import SimpleNamespace
 import unittest
@@ -338,10 +339,21 @@ _SATURATED_ERROR = actor_race_history.CapturedError(
     16,
     16,
 )
+_STALE_ERROR = actor_race_history.CapturedError(
+    "request_not_found",
+    "invalid_request",
+    None,
+    None,
+    None,
+)
 
 
-def _exact_submission_repetition() -> SimpleNamespace:
+def _exact_submission_repetition(
+    accepted_attempts: frozenset[int] | None = None,
+) -> SimpleNamespace:
     program = actor_race_verify.regenerate_authenticated_action_program()
+    if accepted_attempts is None:
+        accepted_attempts = frozenset(range(0, 64, 2))
     actions: list[actor_race_history.Action] = []
     request_id = 0
     control_generations = [0] * 16
@@ -361,7 +373,7 @@ def _exact_submission_repetition() -> SimpleNamespace:
                     attempt // 8 + 1,
                     attempt + 1,
                 )
-                if attempt % 2 == 0:
+                if attempt in accepted_attempts:
                     result = "submit_accepted"
                     request_id += 1
                     action_request_id = request_id
@@ -550,6 +562,399 @@ def _exact_target_repetition() -> SimpleNamespace:
     )
 
 
+def _probe_snapshot(outstanding_requests: int) -> actor_race_history.ProbeSnapshot:
+    return actor_race_history.ProbeSnapshot(
+        command_in_flight=0,
+        command_ready=0,
+        command_reserved=0,
+        command_responded=0,
+        dirty=False,
+        engine_steps=1,
+        outstanding_requests=outstanding_requests,
+        owner_done=False,
+        park_epoch=0,
+        parked=True,
+        pump_entries=1,
+        pump_hold_observed=0,
+        pump_hold_released=0,
+        pump_hold_requested=0,
+        pump_in_flight=False,
+        request_bytes=outstanding_requests,
+        shared_bytes=1,
+    )
+
+
+def _exact_control_repetition() -> SimpleNamespace:
+    """Build an exact synthetic word history with one real control rebind."""
+
+    accepted_attempts = frozenset((*range(4, 20), 50))
+    repetition = _exact_submission_repetition(accepted_attempts)
+    actions = list(repetition.actions)
+    accepted: dict[int, actor_race_history.AcceptedWitness] = {}
+    current_by_slot: dict[int, actor_race_history.AcceptedWitness] = {}
+    flags: dict[tuple[int, int], int] = {}
+    receiver_state = ["absent"] * actor_race_verify.EXPECTED_IN_RANGE_SUBMIT_COUNT
+    cached_eof_added = False
+
+    for ordinal, action in enumerate(actions):
+        if action.kind == "submit" and action.result == "submit_accepted":
+            assert action.client_index is not None
+            accepted[action.client_index] = action.accepted
+            current_by_slot[action.accepted.control_slot] = action.accepted
+            flags[
+                (
+                    action.accepted.control_slot,
+                    action.accepted.control_generation,
+                )
+            ] = 0
+            receiver_state[action.client_index] = "owned"
+            continue
+        if action.kind not in ("cancel", "receiver_drop", "drain"):
+            continue
+
+        assert action.client_index is not None
+        client_index = action.client_index
+        witness = accepted.get(client_index)
+        if action.kind == "cancel":
+            if witness is None:
+                actions[ordinal] = replace(action, result="target_unavailable")
+                continue
+            current = current_by_slot[witness.control_slot]
+            current_key = (current.control_slot, current.control_generation)
+            loaded_flags = flags[current_key]
+            loaded_word = current.control_generation << 3 | loaded_flags
+            if current.control_generation > witness.control_generation:
+                result = "error"
+                error = _STALE_ERROR
+                resulting_word = loaded_word
+                disposition = None
+            elif loaded_flags & 4:
+                result = "cancel_already_terminal"
+                error = None
+                resulting_word = loaded_word
+                disposition = "already_terminal"
+            elif loaded_flags & 1:
+                result = "cancel_already_requested"
+                error = None
+                resulting_word = loaded_word
+                disposition = "already_requested"
+            else:
+                result = "cancel_requested"
+                error = None
+                resulting_word = loaded_word | 1
+                disposition = "requested"
+                flags[current_key] = loaded_flags | 1
+            actions[ordinal] = replace(
+                action,
+                result=result,
+                error=error,
+                request_id=witness.request_id,
+                control=actor_race_history.ControlWitness(
+                    "cancel",
+                    True,
+                    witness.control_slot,
+                    witness.control_generation,
+                    f"{loaded_word:016x}",
+                    f"{resulting_word:016x}",
+                    disposition,
+                ),
+            )
+            continue
+
+        state = receiver_state[client_index]
+        if state == "absent":
+            actions[ordinal] = replace(action, result="target_unavailable")
+            continue
+        assert witness is not None
+        if state == "consumed":
+            actions[ordinal] = replace(
+                action,
+                result="target_unavailable",
+                request_id=witness.request_id,
+            )
+            continue
+
+        if action.kind == "receiver_drop":
+            key = (witness.control_slot, witness.control_generation)
+            loaded_flags = flags[key]
+            loaded_word = witness.control_generation << 3 | loaded_flags
+            if loaded_flags & 4:
+                disposition = "already_terminal"
+            elif loaded_flags & 2:
+                disposition = "already_requested"
+            else:
+                disposition = "requested"
+            resulting_flags = loaded_flags | 3
+            resulting_word = witness.control_generation << 3 | resulting_flags
+            actions[ordinal] = replace(
+                action,
+                result="receiver_dropped",
+                request_id=witness.request_id,
+                control=actor_race_history.ControlWitness(
+                    "disconnect",
+                    True,
+                    witness.control_slot,
+                    witness.control_generation,
+                    f"{loaded_word:016x}",
+                    f"{resulting_word:016x}",
+                    disposition,
+                ),
+            )
+            # The synthetic engine terminalizes immediately after the reached
+            # destructor boundary, so all later readers observe the tombstone.
+            flags[key] = resulting_flags | 4
+            receiver_state[client_index] = "consumed"
+            continue
+
+        if not cached_eof_added:
+            actions[ordinal] = replace(
+                action,
+                result="drain_eof",
+                request_id=witness.request_id,
+                cached_eof=True,
+            )
+            cached_eof_added = True
+        else:
+            actions[ordinal] = replace(
+                action,
+                result="drain_empty",
+                request_id=witness.request_id,
+                primary_pop=actor_race_history.PopWitness(
+                    "primary",
+                    True,
+                    witness.endpoint_slot,
+                    witness.endpoint_generation,
+                    0,
+                    0,
+                    None,
+                ),
+            )
+
+    assert cached_eof_added
+    live_clients = tuple(
+        sorted(
+            client_index
+            for client_index in accepted
+            if receiver_state[client_index] == "owned"
+        )
+    )
+    for client_index in live_clients:
+        witness = accepted[client_index]
+        key = (witness.control_slot, witness.control_generation)
+        flags[key] |= 4
+
+    authorities: list[actor_race_history.CleanupAuthority] = []
+    for ordinal, client_index in enumerate(sorted(accepted)):
+        witness = accepted[client_index]
+        current = current_by_slot[witness.control_slot]
+        key = (current.control_slot, current.control_generation)
+        word = current.control_generation << 3 | flags[key]
+        if current.control_generation > witness.control_generation:
+            error = _STALE_ERROR
+            disposition = None
+        else:
+            error = None
+            disposition = "already_terminal"
+        authorities.append(
+            actor_race_history.CleanupAuthority(
+                ordinal * 2 + 1,
+                ordinal * 2 + 2,
+                client_index,
+                witness.request_id,
+                error,
+                actor_race_history.ControlWitness(
+                    "cancel",
+                    True,
+                    witness.control_slot,
+                    witness.control_generation,
+                    f"{word:016x}",
+                    f"{word:016x}",
+                    disposition,
+                ),
+            )
+        )
+
+    receivers: list[actor_race_history.CleanupReceiver] = []
+    for receiver_ordinal, client_index in enumerate(live_clients):
+        witness = accepted[client_index]
+        sequence_ordinal = len(authorities) + receiver_ordinal
+        receivers.append(
+            actor_race_history.CleanupReceiver(
+                sequence_ordinal * 2 + 1,
+                sequence_ordinal * 2 + 2,
+                client_index,
+                witness.request_id,
+                actor_race_history.Terminal(
+                    witness.request_id,
+                    "cancelled",
+                    0,
+                    0,
+                ),
+                (),
+                True,
+                _probe_snapshot(len(live_clients) - receiver_ordinal - 1),
+            )
+        )
+
+    return SimpleNamespace(
+        actions=tuple(actions),
+        cleanup_authorities=tuple(authorities),
+        cleanup_receivers=tuple(receivers),
+        diagnostics=SimpleNamespace(
+            action_counter_final=(
+                actor_race_verify.EXPECTED_ACTION_COUNTER_FINAL
+            ),
+            cleanup_counter_final=2 * (len(authorities) + len(receivers)),
+        ),
+        pre_cleanup=_probe_snapshot(len(receivers)),
+        shutdown=repetition.shutdown,
+    )
+
+
+def _live_cleanup_requested_repetition() -> SimpleNamespace:
+    """Keep one submit unpublished until all of its script cancels miss."""
+
+    client_index = 16
+    repetition = _exact_submission_repetition(frozenset((client_index,)))
+    actions = list(repetition.actions)
+    submit_ordinal = next(
+        action.ordinal
+        for action in actions
+        if action.kind == "submit" and action.client_index == client_index
+    )
+    submit = actions[submit_ordinal]
+    release_after = max(
+        action.ordinal
+        for action in actions
+        if action.kind == "cancel" and action.client_index == client_index
+    )
+
+    boundaries: dict[tuple[int, str], int] = {}
+    counter = 1
+
+    def issue(ordinal: int, boundary: str) -> None:
+        nonlocal counter
+        boundaries[ordinal, boundary] = counter
+        counter += 1
+
+    for action in actions[:submit_ordinal]:
+        issue(action.ordinal, "invoke")
+        issue(action.ordinal, "respond")
+    issue(submit_ordinal, "invoke")
+    for action in actions[submit_ordinal + 1 : release_after + 1]:
+        if action.producer != submit.producer:
+            issue(action.ordinal, "invoke")
+            issue(action.ordinal, "respond")
+    issue(submit_ordinal, "respond")
+    for action in actions[submit_ordinal + 1 :]:
+        if (action.ordinal, "invoke") not in boundaries:
+            issue(action.ordinal, "invoke")
+            issue(action.ordinal, "respond")
+    assert counter == actor_race_verify.EXPECTED_ACTION_COUNTER_FINAL + 1
+
+    actions = [
+        replace(
+            action,
+            invocation=boundaries[action.ordinal, "invoke"],
+            response=boundaries[action.ordinal, "respond"],
+        )
+        for action in actions
+    ]
+    in_range_submits = sorted(
+        (
+            action
+            for action in actions
+            if action.kind == "submit"
+            and action.submit_attempt is not None
+            and action.submit_attempt
+            < actor_race_verify.EXPECTED_IN_RANGE_SUBMIT_COUNT
+        ),
+        key=lambda action: action.invocation,
+    )
+    ready_by_ordinal = {
+        action.ordinal: ready
+        for ready, action in enumerate(in_range_submits, start=1)
+    }
+    actions = [
+        replace(
+            action,
+            command=replace(
+                action.command,
+                ready_sequence=ready_by_ordinal[action.ordinal],
+            ),
+        )
+        if action.ordinal in ready_by_ordinal
+        else action
+        for action in actions
+    ]
+
+    submit = actions[submit_ordinal]
+    identity = submit.accepted
+    for ordinal, action in enumerate(actions):
+        if action.kind not in ("cancel", "receiver_drop", "drain"):
+            continue
+        if (
+            action.client_index == client_index
+            and submit.response < action.invocation
+        ):
+            assert action.kind == "drain"
+            actions[ordinal] = replace(
+                action,
+                result="drain_empty",
+                request_id=identity.request_id,
+                primary_pop=actor_race_history.PopWitness(
+                    "primary",
+                    True,
+                    identity.endpoint_slot,
+                    identity.endpoint_generation,
+                    0,
+                    0,
+                    None,
+                ),
+            )
+        else:
+            actions[ordinal] = replace(action, result="target_unavailable")
+
+    base_word = identity.control_generation << 3
+    authority = actor_race_history.CleanupAuthority(
+        1,
+        2,
+        client_index,
+        identity.request_id,
+        None,
+        actor_race_history.ControlWitness(
+            "cancel",
+            True,
+            identity.control_slot,
+            identity.control_generation,
+            f"{base_word:016x}",
+            f"{base_word | 1:016x}",
+            "requested",
+        ),
+    )
+    receiver = actor_race_history.CleanupReceiver(
+        3,
+        4,
+        client_index,
+        identity.request_id,
+        actor_race_history.Terminal(identity.request_id, "cancelled", 0, 0),
+        (),
+        True,
+        _probe_snapshot(0),
+    )
+    return SimpleNamespace(
+        actions=tuple(actions),
+        cleanup_authorities=(authority,),
+        cleanup_receivers=(receiver,),
+        diagnostics=SimpleNamespace(
+            action_counter_final=actor_race_verify.EXPECTED_ACTION_COUNTER_FINAL,
+            cleanup_counter_final=4,
+        ),
+        pre_cleanup=_probe_snapshot(1),
+        shutdown=repetition.shutdown,
+    )
+
+
 def _submit_by_attempt(repetition: SimpleNamespace, attempt: int) -> int:
     return next(
         action.ordinal
@@ -569,6 +974,45 @@ def _replace_repetition_action(
         actions=tuple(actions),
         diagnostics=repetition.diagnostics,
         shutdown=repetition.shutdown,
+    )
+
+
+def _replace_control_repetition(
+    repetition: SimpleNamespace,
+    **changes: object,
+) -> SimpleNamespace:
+    values = {
+        "actions": repetition.actions,
+        "cleanup_authorities": repetition.cleanup_authorities,
+        "cleanup_receivers": repetition.cleanup_receivers,
+        "diagnostics": repetition.diagnostics,
+        "pre_cleanup": repetition.pre_cleanup,
+        "shutdown": repetition.shutdown,
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def _replace_control_action(
+    repetition: SimpleNamespace,
+    ordinal: int,
+    action: actor_race_history.Action,
+) -> SimpleNamespace:
+    actions = list(repetition.actions)
+    actions[ordinal] = action
+    return _replace_control_repetition(repetition, actions=tuple(actions))
+
+
+def _replace_cleanup_authority(
+    repetition: SimpleNamespace,
+    ordinal: int,
+    authority: actor_race_history.CleanupAuthority,
+) -> SimpleNamespace:
+    authorities = list(repetition.cleanup_authorities)
+    authorities[ordinal] = authority
+    return _replace_control_repetition(
+        repetition,
+        cleanup_authorities=tuple(authorities),
     )
 
 
@@ -1048,6 +1492,1202 @@ class TargetAccessOrderTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             actor_race_verify.build_target_access_order(
                 self.repetition,
+                program=authenticate(),
+            )
+
+
+class ControlLifecycleOrderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repetition = _exact_control_repetition()
+        cls.order = actor_race_verify.build_control_lifecycle_order(
+            cls.repetition
+        )
+
+    def _script_target(
+        self,
+        observation: actor_race_verify.ControlWordObservation,
+    ) -> actor_race_verify.TargetActionEvent:
+        self.assertEqual(observation.source_kind, "script")
+        return next(
+            target
+            for target in self.order.target_order.targets.by_action
+            if target is not None and target.event.node == observation.node
+        )
+
+    def _replace_script_observation(
+        self,
+        observation: actor_race_verify.ControlWordObservation,
+        *,
+        loaded_word: int,
+        resulting_word: int,
+        disposition: str | None,
+        result: str,
+        error: actor_race_history.CapturedError | None,
+    ) -> SimpleNamespace:
+        target = self._script_target(observation)
+        action = self.repetition.actions[target.action_ordinal]
+        return _replace_control_action(
+            self.repetition,
+            target.action_ordinal,
+            replace(
+                action,
+                result=result,
+                error=error,
+                control=replace(
+                    action.control,
+                    loaded_word=f"{loaded_word:016x}",
+                    resulting_word=f"{resulting_word:016x}",
+                    disposition=disposition,
+                ),
+            ),
+        )
+
+    def test_exact_typed_mapping_budget_and_lifecycle_edges(self) -> None:
+        order = self.order
+        lifecycle = order.lifecycle
+        accepted_count = len(lifecycle.identities.by_request_id)
+        self.assertEqual(accepted_count, 17)
+        self.assertEqual(
+            order.graph.node_count,
+            order.target_order.graph.node_count + 5 * accepted_count + 1,
+        )
+        self.assertLessEqual(
+            order.graph.node_count,
+            actor_race_verify.MAX_CONTROL_LIFECYCLE_NODES,
+        )
+        self.assertEqual(
+            actor_race_verify.MAX_CONTROL_LIFECYCLE_NODES,
+            sum(
+                count
+                for _, count in actor_race_verify._CONTROL_LIFECYCLE_NODE_BUDGET
+            ),
+        )
+        self.assertEqual(
+            actor_race_verify.MAX_CONTROL_LIFECYCLE_EDGE_INPUTS,
+            10_048,
+        )
+        self.assertLessEqual(
+            actor_race_verify.MAX_CONTROL_LIFECYCLE_EDGE_INPUTS,
+            actor_race_verify.MAX_PROTOCOL_EDGE_INPUTS,
+        )
+        self.assertEqual(len(lifecycle.request_events), 2 * accepted_count)
+        self.assertEqual(len(lifecycle.cleanup_events), 3 * accepted_count)
+        self.assertEqual(len(lifecycle.phase_events), 1)
+        self.assertTrue(
+            all(
+                type(event) is actor_race_verify.RequestEvent
+                and not hasattr(event, "action_ordinal")
+                for event in lifecycle.request_events
+            )
+        )
+        self.assertTrue(
+            all(
+                type(event) is actor_race_verify.CleanupEvent
+                and not hasattr(event, "action_ordinal")
+                for event in lifecycle.cleanup_events
+            )
+        )
+        self.assertIs(
+            lifecycle.phase_events[0],
+            lifecycle.pre_cleanup,
+        )
+
+        for request in lifecycle.requests_by_request_id:
+            identity = request.identity
+            control_bind = identity.submission.control_bind
+            assert control_bind is not None
+            self.assertTrue(
+                order.graph.precedes(
+                    control_bind.node,
+                    request.control_terminal_publish.node,
+                )
+            )
+            self.assertTrue(
+                order.graph.precedes(
+                    request.control_terminal_publish.node,
+                    request.request_reap.node,
+                )
+            )
+            self.assertIs(
+                lifecycle.requests_by_client_index[identity.client_index],
+                request,
+            )
+
+        reused = lifecycle.control_by_slot[0]
+        self.assertEqual(len(reused), 2)
+        previous, current = reused
+        next_bind = current.identity.submission.control_bind
+        assert next_bind is not None
+        self.assertEqual(
+            order.graph.reasons(
+                previous.request.request_reap.node,
+                next_bind.node,
+            ),
+            ("control-slot-0-reap-before-rebind",),
+        )
+        for observation in previous.observations:
+            self.assertTrue(order.graph.precedes(observation.node, next_bind.node))
+
+    def test_script_nodes_are_reused_and_stale_maps_to_real_later_bind(self) -> None:
+        target_nodes = {
+            event.node for event in self.order.target_order.targets.target_events
+        }
+        stale_count = 0
+        for observation in self.order.lifecycle.observations:
+            if observation.source_kind == "script":
+                self.assertIn(observation.node, target_nodes)
+            if not observation.stale:
+                continue
+            stale_count += 1
+            self.assertGreater(
+                observation.observed_identity.control_generation,
+                observation.expected_generation,
+            )
+            slot = observation.expected_slot
+            generation = observation.loaded_word >> 3
+            self.assertIs(
+                self.order.lifecycle.identities.by_control_slot[slot][
+                    generation - 1
+                ],
+                observation.observed_identity,
+            )
+            bind = observation.observed_identity.submission.control_bind
+            assert bind is not None
+            self.assertTrue(self.order.graph.precedes(bind.node, observation.node))
+        self.assertGreater(stale_count, 0)
+
+    def test_pre_cleanup_partition_and_authority_sequence_are_exact(self) -> None:
+        lifecycle = self.order.lifecycle
+        gate = lifecycle.pre_cleanup
+        endpoints = self.order.target_order.submission_order.interval_order.endpoints
+        for producer in (0, 1):
+            tail = next(
+                item.response
+                for item in reversed(endpoints.by_action)
+                if item.producer == producer
+            )
+            self.assertTrue(self.order.graph.precedes(tail.node, gate.node))
+
+        cleanup = lifecycle.cleanup_in_order
+        self.assertEqual(len(cleanup), len(lifecycle.requests_by_request_id))
+        self.assertEqual(
+            self.order.graph.reasons(gate.node, cleanup[0].invocation.node),
+            ("pre-cleanup-before-first-authority",),
+        )
+        for previous, current in zip(cleanup, cleanup[1:]):
+            self.assertEqual(
+                self.order.graph.reasons(
+                    previous.response.node,
+                    current.invocation.node,
+                ),
+                ("cleanup-authority-counter-order",),
+            )
+        for events in cleanup:
+            self.assertTrue(
+                self.order.graph.precedes(
+                    events.invocation.node,
+                    events.control_decision.node,
+                )
+            )
+            self.assertTrue(
+                self.order.graph.precedes(
+                    events.control_decision.node,
+                    events.response.node,
+                )
+            )
+
+        for request in lifecycle.requests_by_request_id:
+            if request.receiver_state == "consumed":
+                self.assertTrue(
+                    self.order.graph.precedes(request.request_reap.node, gate.node)
+                )
+                assert request.successful_drop_action is not None
+                drop = self.order.target_order.targets.by_action[
+                    request.successful_drop_action
+                ]
+                assert drop is not None
+                self.assertTrue(
+                    self.order.graph.precedes(
+                        drop.event.node,
+                        request.request_reap.node,
+                    )
+                )
+            else:
+                self.assertTrue(
+                    self.order.graph.precedes(gate.node, request.request_reap.node)
+                )
+                authority = lifecycle.cleanup_by_client_index[
+                    request.identity.client_index
+                ]
+                assert authority is not None
+                self.assertTrue(
+                    self.order.graph.precedes(
+                        authority.response.node,
+                        request.request_reap.node,
+                    )
+                )
+
+    def test_cleanup_t_present_precedes_the_entire_authority_hold(self) -> None:
+        first_invocation = self.order.lifecycle.cleanup_in_order[0].invocation
+        bracketed = 0
+        for slot in self.order.lifecycle.control_by_slot:
+            for state in slot:
+                cleanup_observations = tuple(
+                    observation
+                    for observation in state.observations
+                    if observation.source_kind == "cleanup"
+                )
+                if not cleanup_observations or not any(
+                    (observation.loaded_word | observation.resulting_word) & 4
+                    for observation in cleanup_observations
+                ):
+                    continue
+                bracketed += 1
+                self.assertEqual(
+                    self.order.graph.reasons(
+                        state.request.control_terminal_publish.node,
+                        first_invocation.node,
+                    ),
+                    ("control-terminal-before-cleanup-hold",),
+                )
+        self.assertGreater(bracketed, 0)
+
+    def test_cleanup_t_absent_follows_the_entire_authority_hold(self) -> None:
+        identity = self.order.lifecycle.identities.by_request_id[0]
+        planner = actor_race_verify._ProtocolGraphPlanner(0)
+        terminal = planner.allocate_request(
+            identity.client_index,
+            identity.request_id,
+            "ControlTerminalPublish",
+        )
+        first = planner.allocate_cleanup(
+            0,
+            identity.client_index,
+            identity.request_id,
+            "CleanupInvoke",
+        )
+        last = planner.allocate_cleanup(
+            0,
+            identity.client_index,
+            identity.request_id,
+            "CleanupRespond",
+        )
+        word = identity.control_generation << 3 | 1
+        observation = actor_race_verify.ControlWordObservation(
+            first.node,
+            "cleanup",
+            identity.client_index,
+            identity.request_id,
+            "cancel",
+            identity.control_slot,
+            identity.control_generation,
+            identity,
+            word,
+            word,
+            "already_requested",
+            False,
+        )
+        actor_race_verify._add_cleanup_terminal_hold_brackets(
+            planner,
+            (observation,),
+            terminal.node,
+            first.node,
+            last.node,
+        )
+        graph = planner.build()
+        self.assertEqual(
+            graph.reasons(last.node, terminal.node),
+            ("cleanup-hold-before-control-terminal",),
+        )
+        self.assertEqual(graph.reasons(terminal.node, first.node), ())
+
+    def test_mixed_cleanup_t_state_cycles_across_the_pump_hold(self) -> None:
+        reused = self.order.lifecycle.control_by_slot[0][1]
+        stale = next(
+            observation
+            for observation in reused.observations
+            if observation.source_kind == "cleanup" and observation.stale
+        )
+        current = next(
+            observation
+            for observation in reused.observations
+            if observation.source_kind == "cleanup" and not observation.stale
+        )
+        self.assertTrue(stale.loaded_word & 4)
+        self.assertTrue(current.loaded_word & 4)
+        events = self.order.lifecycle.cleanup_by_client_index[
+            stale.owner_client_index
+        ]
+        assert events is not None
+        authority = self.repetition.cleanup_authorities[
+            events.cleanup_ordinal
+        ]
+        t_absent_word = reused.identity.control_generation << 3 | 1
+        forged = _replace_cleanup_authority(
+            self.repetition,
+            events.cleanup_ordinal,
+            replace(
+                authority,
+                control=replace(
+                    authority.control,
+                    loaded_word=f"{t_absent_word:016x}",
+                    resulting_word=f"{t_absent_word:016x}",
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "cycle detected",
+        ):
+            actor_race_verify.build_control_lifecycle_order(forged)
+
+    def test_cleanup_hold_brackets_add_at_most_two_edges_per_generation(self) -> None:
+        identity = self.order.lifecycle.identities.by_request_id[0]
+        planner = actor_race_verify._ProtocolGraphPlanner(0)
+        terminal = planner.allocate_request(
+            identity.client_index,
+            identity.request_id,
+            "ControlTerminalPublish",
+        )
+        first = planner.allocate_cleanup(
+            0,
+            identity.client_index,
+            identity.request_id,
+            "CleanupInvoke",
+        )
+        last = planner.allocate_cleanup(
+            0,
+            identity.client_index,
+            identity.request_id,
+            "CleanupRespond",
+        )
+        planner.edge(first.node, last.node, "authority-hold")
+        words = (1, 1, 5, 5)
+        observations = tuple(
+            actor_race_verify.ControlWordObservation(
+                first.node,
+                "cleanup",
+                identity.client_index,
+                identity.request_id,
+                "cancel",
+                identity.control_slot,
+                identity.control_generation,
+                identity,
+                identity.control_generation << 3 | flags,
+                identity.control_generation << 3 | flags,
+                "already_terminal" if flags & 4 else "already_requested",
+                False,
+            )
+            for flags in words
+        )
+        actor_race_verify._add_cleanup_terminal_hold_brackets(
+            planner,
+            observations,
+            terminal.node,
+            first.node,
+            last.node,
+        )
+        self.assertEqual(planner.edge_input_count, 3)
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "cycle detected",
+        ):
+            planner.build()
+
+    def test_control_word_algebra_rejects_invalid_flags_and_transitions(self) -> None:
+        requested_cancel = next(
+            observation
+            for observation in self.order.lifecycle.observations
+            if observation.source_kind == "script"
+            and observation.operation == "cancel"
+            and observation.disposition == "requested"
+        )
+        requested_disconnect = next(
+            observation
+            for observation in self.order.lifecycle.observations
+            if observation.source_kind == "script"
+            and observation.operation == "disconnect"
+            and observation.disposition == "requested"
+        )
+        stale = next(
+            observation
+            for observation in self.order.lifecycle.observations
+            if observation.source_kind == "script" and observation.stale
+        )
+        cancel_generation = requested_cancel.expected_generation
+        disconnect_generation = requested_disconnect.expected_generation
+        cases = (
+            (
+                "D-implies-C",
+                self._replace_script_observation(
+                    requested_cancel,
+                    loaded_word=cancel_generation << 3 | 2,
+                    resulting_word=cancel_generation << 3 | 3,
+                    disposition="requested",
+                    result="cancel_requested",
+                    error=None,
+                ),
+            ),
+            (
+                "changed the loaded control generation",
+                self._replace_script_observation(
+                    requested_cancel,
+                    loaded_word=cancel_generation << 3,
+                    resulting_word=(cancel_generation + 1) << 3 | 1,
+                    disposition="requested",
+                    result="cancel_requested",
+                    error=None,
+                ),
+            ),
+            (
+                "disposition disagrees",
+                self._replace_script_observation(
+                    requested_cancel,
+                    loaded_word=cancel_generation << 3 | 1,
+                    resulting_word=cancel_generation << 3 | 1,
+                    disposition="requested",
+                    result="cancel_requested",
+                    error=None,
+                ),
+            ),
+            (
+                "operation algebra",
+                self._replace_script_observation(
+                    requested_disconnect,
+                    loaded_word=disconnect_generation << 3 | 4,
+                    resulting_word=disconnect_generation << 3 | 4,
+                    disposition="already_terminal",
+                    result="receiver_dropped",
+                    error=None,
+                ),
+            ),
+            (
+                "stale control changed",
+                self._replace_script_observation(
+                    stale,
+                    loaded_word=stale.loaded_word,
+                    resulting_word=stale.loaded_word ^ 4,
+                    disposition=None,
+                    result="error",
+                    error=_STALE_ERROR,
+                ),
+            ),
+            (
+                "no accepted control bind",
+                self._replace_script_observation(
+                    stale,
+                    loaded_word=64 << 3,
+                    resulting_word=64 << 3,
+                    disposition=None,
+                    result="error",
+                    error=_STALE_ERROR,
+                ),
+            ),
+        )
+        for diagnostic, forged in cases:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    diagnostic,
+                ):
+                    actor_race_verify.build_control_lifecycle_order(forged)
+
+    def test_stale_spelling_cannot_hide_a_late_old_generation_observation(self) -> None:
+        stale = next(
+            observation
+            for observation in self.order.lifecycle.observations
+            if observation.source_kind == "script"
+            and observation.stale
+            and observation.expected_slot == 0
+        )
+        old_word = stale.expected_generation << 3 | 7
+        forged = self._replace_script_observation(
+            stale,
+            loaded_word=old_word,
+            resulting_word=old_word,
+            disposition="already_terminal",
+            result="cancel_already_terminal",
+            error=None,
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "cycle detected",
+        ):
+            actor_race_verify.build_control_lifecycle_order(forged)
+
+    def test_unique_publishers_and_word_lattice_fail_closed(self) -> None:
+        state = self.order.lifecycle.control_by_slot[0][0]
+        already_requested = next(
+            observation
+            for observation in state.observations
+            if observation.source_kind == "script"
+            and observation.disposition == "already_requested"
+        )
+        generation = state.identity.control_generation
+        duplicate = self._replace_script_observation(
+            already_requested,
+            loaded_word=generation << 3,
+            resulting_word=generation << 3 | 1,
+            disposition="requested",
+            result="cancel_requested",
+            error=None,
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "exactly one captured C publisher",
+        ):
+            actor_race_verify.build_control_lifecycle_order(duplicate)
+
+        state_without_prior_cancel = next(
+            state
+            for slot in self.order.lifecycle.control_by_slot
+            for state in slot
+            if state.cancel_publisher is state.disconnect_publisher
+            and state.disconnect_publisher is not None
+        )
+        publisher = state_without_prior_cancel.disconnect_publisher
+        assert publisher is not None
+        generation = state_without_prior_cancel.identity.control_generation
+        missing = self._replace_script_observation(
+            publisher,
+            loaded_word=generation << 3 | 3,
+            resulting_word=generation << 3 | 3,
+            disposition="already_requested",
+            result="receiver_dropped",
+            error=None,
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "exactly one captured C publisher",
+        ):
+            actor_race_verify.build_control_lifecycle_order(missing)
+
+        terminal_reader = next(
+            observation
+            for observation in state.observations
+            if observation.source_kind == "script"
+            and observation.disposition == "already_terminal"
+        )
+        impossible = self._replace_script_observation(
+            terminal_reader,
+            loaded_word=state.identity.control_generation << 3 | 4,
+            resulting_word=state.identity.control_generation << 3 | 4,
+            disposition="already_terminal",
+            result="cancel_already_terminal",
+            error=None,
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "cycle detected",
+        ):
+            actor_race_verify.build_control_lifecycle_order(impossible)
+
+    def test_equal_state_readers_remain_unordered_without_external_evidence(
+        self,
+    ) -> None:
+        identity = self.order.lifecycle.identities.by_request_id[0]
+        planner = actor_race_verify._ProtocolGraphPlanner(0)
+        publisher = planner.allocate(0, "ControlCancel")
+        left = planner.allocate(1, "ControlCancel")
+        right = planner.allocate(2, "ControlCancel")
+        for event in (publisher, left, right):
+            loaded = 0 if event is publisher else 1
+            observation = actor_race_verify.ControlWordObservation(
+                event.node,
+                "script",
+                identity.client_index,
+                identity.request_id,
+                "cancel",
+                identity.control_slot,
+                identity.control_generation,
+                identity,
+                identity.control_generation << 3 | loaded,
+                identity.control_generation << 3 | 1,
+                "requested" if event is publisher else "already_requested",
+                False,
+            )
+            actor_race_verify._word_bit_relation(
+                planner,
+                observation,
+                publisher.node,
+                1,
+                "C",
+            )
+        graph = planner.build()
+        self.assertTrue(graph.precedes(publisher.node, left.node))
+        self.assertTrue(graph.precedes(publisher.node, right.node))
+        self.assertFalse(graph.precedes(left.node, right.node))
+        self.assertFalse(graph.precedes(right.node, left.node))
+
+    def test_control_lattice_matches_every_bruteforce_must_order(self) -> None:
+        labels = ("C0", "C1", "D0", "D1", "T")
+
+        def transition(flags: int, label: str) -> tuple[int, int, str | None]:
+            if label.startswith("C"):
+                if flags & 4:
+                    return flags, flags, "already_terminal"
+                if flags & 1:
+                    return flags, flags, "already_requested"
+                return flags, flags | 1, "requested"
+            if label.startswith("D"):
+                disposition = (
+                    "already_terminal"
+                    if flags & 4
+                    else "already_requested" if flags & 2 else "requested"
+                )
+                return flags, flags if flags & 2 else flags | 3, disposition
+            return flags, flags | 4, None
+
+        histories = []
+        for schedule in permutations(labels):
+            flags = 0
+            witnesses = {}
+            for label in schedule:
+                loaded, flags, disposition = transition(flags, label)
+                if label != "T":
+                    witnesses[label] = (loaded, flags, disposition)
+            histories.append((schedule, witnesses))
+
+        identity = self.order.lifecycle.identities.by_request_id[0]
+        signatures = set()
+        for _, witnesses in histories:
+            signature = tuple(witnesses[label] for label in labels[:-1])
+            if signature in signatures:
+                continue
+            signatures.add(signature)
+            valid = [
+                schedule
+                for schedule, candidate in histories
+                if candidate == witnesses
+            ]
+            planner = actor_race_verify._ProtocolGraphPlanner(0)
+            events = {
+                "C0": planner.allocate(0, "ControlCancel"),
+                "C1": planner.allocate(1, "ControlCancel"),
+                "D0": planner.allocate(2, "ControlDisconnect"),
+                "D1": planner.allocate(3, "ControlDisconnect"),
+                "T": planner.allocate_request(
+                    identity.client_index,
+                    identity.request_id,
+                    "ControlTerminalPublish",
+                ),
+            }
+            base_word = identity.control_generation << 3
+            observations = {}
+            for label in labels[:-1]:
+                loaded, resulting, disposition = witnesses[label]
+                observations[label] = actor_race_verify.ControlWordObservation(
+                    events[label].node,
+                    "script",
+                    identity.client_index,
+                    identity.request_id,
+                    "cancel" if label.startswith("C") else "disconnect",
+                    identity.control_slot,
+                    identity.control_generation,
+                    identity,
+                    base_word | loaded,
+                    base_word | resulting,
+                    disposition,
+                    False,
+                )
+            cancel_publisher = next(
+                label
+                for label, observation in observations.items()
+                if not observation.loaded_word & 1 and observation.resulting_word & 1
+            )
+            disconnect_publisher = next(
+                label
+                for label, observation in observations.items()
+                if not observation.loaded_word & 2 and observation.resulting_word & 2
+            )
+            for observation in observations.values():
+                for publisher, bit, name in (
+                    ("T", 4, "T"),
+                    (cancel_publisher, 1, "C"),
+                    (disconnect_publisher, 2, "D"),
+                ):
+                    actor_race_verify._word_bit_relation(
+                        planner,
+                        observation,
+                        events[publisher].node,
+                        bit,
+                        name,
+                    )
+            graph = planner.build()
+            for before, after in permutations(labels, 2):
+                expected = all(
+                    schedule.index(before) < schedule.index(after)
+                    for schedule in valid
+                )
+                self.assertEqual(
+                    graph.precedes(events[before].node, events[after].node),
+                    expected,
+                    (signature, before, after),
+                )
+        self.assertEqual(len(histories), 120)
+        self.assertEqual(len(signatures), 60)
+
+    def test_live_cleanup_requested_waits_for_last_authority_response(self) -> None:
+        order = actor_race_verify.build_control_lifecycle_order(
+            _live_cleanup_requested_repetition()
+        )
+        request = order.lifecycle.requests_by_request_id[0]
+        cleanup = order.lifecycle.cleanup_in_order[0]
+        self.assertEqual(request.receiver_state, "live")
+        self.assertEqual(cleanup.observation.disposition, "requested")
+        self.assertFalse(
+            any(
+                observation.source_kind == "script"
+                for observation in order.lifecycle.observations
+            )
+        )
+        self.assertEqual(
+            order.graph.reasons(
+                cleanup.response.node,
+                request.control_terminal_publish.node,
+            ),
+            ("cleanup-hold-before-control-terminal",),
+        )
+
+    def test_stale_reader_cannot_invent_an_unreached_later_state(self) -> None:
+        later = self.order.lifecycle.control_by_slot[0][1]
+        stale = next(
+            observation
+            for observation in later.observations
+            if observation.source_kind == "script"
+            and observation.stale
+            and observation.loaded_word & 7 == 1
+        )
+        base_word = later.identity.control_generation << 3
+        for impossible_flags in (0, 5):
+            with self.subTest(impossible_flags=impossible_flags):
+                forged = self._replace_script_observation(
+                    stale,
+                    loaded_word=base_word | impossible_flags,
+                    resulting_word=base_word | impossible_flags,
+                    disposition=None,
+                    result="error",
+                    error=_STALE_ERROR,
+                )
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    "cycle detected",
+                ):
+                    actor_race_verify.build_control_lifecycle_order(forged)
+
+    def test_live_old_generation_cannot_survive_rebind(self) -> None:
+        actions = []
+        for action in self.repetition.actions:
+            if action.result == "submit_accepted" and action.client_index in (
+                4,
+                16,
+            ):
+                action = replace(
+                    action,
+                    accepted=replace(
+                        action.accepted,
+                        control_slot=12 if action.client_index == 4 else 0,
+                    ),
+                )
+            if action.request_id in (1, 13) and action.control.boundary:
+                control_slot = 12 if action.request_id == 1 else 0
+                control = replace(action.control, slot=control_slot)
+                if action.request_id == 1 and action.error == _STALE_ERROR:
+                    word = action.control.expected_generation << 3 | 7
+                    action = replace(
+                        action,
+                        result="cancel_already_terminal",
+                        error=None,
+                        control=replace(
+                            control,
+                            loaded_word=f"{word:016x}",
+                            resulting_word=f"{word:016x}",
+                            disposition="already_terminal",
+                        ),
+                    )
+                else:
+                    action = replace(action, control=control)
+            actions.append(action)
+
+        cleanup_authorities = []
+        for authority in self.repetition.cleanup_authorities:
+            if authority.request_id == 1:
+                word = authority.control.expected_generation << 3 | 7
+                authority = replace(
+                    authority,
+                    error=None,
+                    control=replace(
+                        authority.control,
+                        slot=12,
+                        loaded_word=f"{word:016x}",
+                        resulting_word=f"{word:016x}",
+                        disposition="already_terminal",
+                    ),
+                )
+            elif authority.request_id == 13:
+                authority = replace(
+                    authority,
+                    control=replace(authority.control, slot=0),
+                )
+            cleanup_authorities.append(authority)
+
+        forged = _replace_control_repetition(
+            self.repetition,
+            actions=tuple(actions),
+            cleanup_authorities=tuple(cleanup_authorities),
+        )
+        actor_race_verify.build_target_access_order(forged)
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "cycle detected",
+        ):
+            actor_race_verify.build_control_lifecycle_order(forged)
+
+    def test_malformed_cleanup_shells_fail_before_auth_or_graph_build(self) -> None:
+        class TupleSubclass(tuple):
+            pass
+
+        class CleanupAuthoritySubclass(actor_race_history.CleanupAuthority):
+            pass
+
+        class CleanupReceiverSubclass(actor_race_history.CleanupReceiver):
+            pass
+
+        authorities = self.repetition.cleanup_authorities
+        receivers = self.repetition.cleanup_receivers
+        authority_values = tuple(
+            getattr(authorities[0], field)
+            for field in authorities[0].__dataclass_fields__
+        )
+        receiver_values = tuple(
+            getattr(receivers[0], field)
+            for field in receivers[0].__dataclass_fields__
+        )
+        authority_items = list(authorities)
+        authority_items[0] = CleanupAuthoritySubclass(*authority_values)
+        receiver_items = list(receivers)
+        receiver_items[0] = CleanupReceiverSubclass(*receiver_values)
+        cases = (
+            _replace_control_repetition(
+                self.repetition,
+                cleanup_authorities=TupleSubclass(authorities),
+            ),
+            _replace_control_repetition(
+                self.repetition,
+                cleanup_authorities=tuple(authority_items),
+            ),
+            _replace_control_repetition(
+                self.repetition,
+                cleanup_receivers=TupleSubclass(receivers),
+            ),
+            _replace_control_repetition(
+                self.repetition,
+                cleanup_receivers=tuple(receiver_items),
+            ),
+            _replace_control_repetition(
+                self.repetition,
+                pre_cleanup=SimpleNamespace(
+                    outstanding_requests=len(receivers)
+                ),
+            ),
+            _replace_control_repetition(
+                self.repetition,
+                diagnostics=SimpleNamespace(
+                    action_counter_final=2_048,
+                    cleanup_counter_final=False,
+                ),
+            ),
+            _replace_control_repetition(
+                self.repetition,
+                cleanup_authorities=authorities
+                + (authorities[0],)
+                * (
+                    actor_race_verify.EXPECTED_IN_RANGE_SUBMIT_COUNT
+                    + 1
+                    - len(authorities)
+                ),
+            ),
+        )
+        for forged in cases:
+            with self.subTest(
+                authority_type=type(forged.cleanup_authorities).__name__,
+                receiver_type=type(forged.cleanup_receivers).__name__,
+            ):
+                with mock.patch.object(
+                    actor_race_verify.ReasonedDAG,
+                    "build",
+                ) as graph_build, mock.patch.object(
+                    actor_race_verify,
+                    "regenerate_authenticated_action_program",
+                ) as authenticate:
+                    with self.assertRaises(
+                        actor_race_verify.ActorRaceVerificationError
+                    ):
+                        actor_race_verify.build_control_lifecycle_order(forged)
+                graph_build.assert_not_called()
+                authenticate.assert_not_called()
+
+    def test_cleanup_identity_counter_and_partition_fail_closed(self) -> None:
+        class TupleSubclass(tuple):
+            pass
+
+        class CleanupAuthoritySubclass(actor_race_history.CleanupAuthority):
+            pass
+
+        authorities = self.repetition.cleanup_authorities
+        receivers = self.repetition.cleanup_receivers
+        first = authorities[0]
+        second = authorities[1]
+        subclass_values = tuple(
+            getattr(first, field)
+            for field in first.__dataclass_fields__
+        )
+        subclass_authorities = list(authorities)
+        subclass_authorities[0] = CleanupAuthoritySubclass(*subclass_values)
+        cases = (
+            (
+                "exact immutable tuple",
+                _replace_control_repetition(
+                    self.repetition,
+                    cleanup_authorities=TupleSubclass(authorities),
+                ),
+            ),
+            (
+                "invalid exact type",
+                _replace_control_repetition(
+                    self.repetition,
+                    cleanup_authorities=tuple(subclass_authorities),
+                ),
+            ),
+            (
+                "exactly cover",
+                _replace_control_repetition(
+                    self.repetition,
+                    cleanup_authorities=authorities[:-1],
+                    diagnostics=SimpleNamespace(
+                        action_counter_final=2_048,
+                        cleanup_counter_final=2
+                        * (len(authorities) - 1 + len(receivers)),
+                    ),
+                ),
+            ),
+            (
+                "invocation must be an integer",
+                _replace_cleanup_authority(
+                    self.repetition,
+                    0,
+                    replace(first, invocation=False),
+                ),
+            ),
+            (
+                "accepted request identity",
+                _replace_cleanup_authority(
+                    self.repetition,
+                    0,
+                    replace(
+                        first,
+                        client_index=second.client_index,
+                        request_id=second.request_id,
+                    ),
+                ),
+            ),
+            (
+                "cleanup_counter_final must be an integer",
+                _replace_control_repetition(
+                    self.repetition,
+                    diagnostics=SimpleNamespace(
+                        action_counter_final=2_048,
+                        cleanup_counter_final=False,
+                    ),
+                ),
+            ),
+            (
+                "pre_cleanup has an invalid exact type",
+                _replace_control_repetition(
+                    self.repetition,
+                    pre_cleanup=SimpleNamespace(
+                        outstanding_requests=len(receivers)
+                    ),
+                ),
+            ),
+        )
+        for diagnostic, forged in cases:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    diagnostic,
+                ):
+                    actor_race_verify.build_control_lifecycle_order(forged)
+
+        remaining = receivers[:-1]
+        missing_live = _replace_control_repetition(
+            self.repetition,
+            cleanup_receivers=remaining,
+            diagnostics=SimpleNamespace(
+                action_counter_final=2_048,
+                cleanup_counter_final=2 * (len(authorities) + len(remaining)),
+            ),
+            pre_cleanup=replace(
+                self.repetition.pre_cleanup,
+                outstanding_requests=len(remaining),
+            ),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "do not partition",
+        ):
+            actor_race_verify.build_control_lifecycle_order(missing_live)
+
+        consumed = next(
+            request
+            for request in self.order.lifecycle.requests_by_request_id
+            if request.receiver_state == "consumed"
+            and request.identity.client_index < receivers[1].client_index
+        )
+        overlap_receivers = list(receivers)
+        overlap_receivers[0] = replace(
+            overlap_receivers[0],
+            client_index=consumed.identity.client_index,
+            request_id=consumed.identity.request_id,
+        )
+        overlap = _replace_control_repetition(
+            self.repetition,
+            cleanup_receivers=tuple(overlap_receivers),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "ownership overlap",
+        ):
+            actor_race_verify.build_control_lifecycle_order(overlap)
+
+    def test_cleanup_result_matrix_rejects_invalid_live_and_consumed_words(self) -> None:
+        lifecycle = self.order.lifecycle
+        consumed_events = next(
+            events
+            for events in lifecycle.cleanup_in_order
+            if lifecycle.requests_by_client_index[
+                events.identity.client_index
+            ].receiver_state
+            == "consumed"
+            and not events.observation.stale
+        )
+        live_events = next(
+            events
+            for events in lifecycle.cleanup_in_order
+            if lifecycle.requests_by_client_index[
+                events.identity.client_index
+            ].receiver_state
+            == "live"
+        )
+        consumed = self.repetition.cleanup_authorities[
+            consumed_events.cleanup_ordinal
+        ]
+        live = self.repetition.cleanup_authorities[live_events.cleanup_ordinal]
+        consumed_word = consumed.control.expected_generation << 3 | 5
+        forged_consumed = _replace_cleanup_authority(
+            self.repetition,
+            consumed_events.cleanup_ordinal,
+            replace(
+                consumed,
+                control=replace(
+                    consumed.control,
+                    loaded_word=f"{consumed_word:016x}",
+                    resulting_word=f"{consumed_word:016x}",
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "consumed tombstone must be flags 7",
+        ):
+            actor_race_verify.build_control_lifecycle_order(forged_consumed)
+
+        live_word = live.control.expected_generation << 3 | 1
+        forged_live = _replace_cleanup_authority(
+            self.repetition,
+            live_events.cleanup_ordinal,
+            replace(
+                live,
+                control=replace(
+                    live.control,
+                    loaded_word=f"{live_word:016x}",
+                    resulting_word=f"{live_word:016x}",
+                    disposition="already_requested",
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "invalid live-request result",
+        ):
+            actor_race_verify.build_control_lifecycle_order(forged_live)
+
+    def test_non_action_allocator_validates_ownership_before_reserving(self) -> None:
+        planner = actor_race_verify._ProtocolGraphPlanner(0)
+        request = planner.allocate_request(0, 1, "ControlTerminalPublish")
+        cleanup = planner.allocate_cleanup(0, 0, 1, "CleanupInvoke")
+        phase = planner.allocate_phase("PreCleanupGate")
+        self.assertIs(type(request), actor_race_verify.RequestEvent)
+        self.assertIs(type(cleanup), actor_race_verify.CleanupEvent)
+        self.assertIs(type(phase), actor_race_verify.PhaseEvent)
+        node_count = planner.node_count
+        for call in (
+            lambda: planner.allocate_request(False, 1, "RequestReap"),
+            lambda: planner.allocate_request(0, 1, "Fake"),
+            lambda: planner.allocate_cleanup(False, 0, 1, "CleanupRespond"),
+            lambda: planner.allocate_phase("Fake"),
+        ):
+            with self.subTest(call=call):
+                with self.assertRaises(actor_race_verify.ActorRaceVerificationError):
+                    call()
+                self.assertEqual(planner.node_count, node_count)
+
+    def test_public_builder_snapshots_once_and_authenticates_locally(self) -> None:
+        source = self.repetition
+
+        class CountingRepetition:
+            def __init__(self) -> None:
+                self.reads: dict[str, int] = {}
+
+            def _read(self, name: str) -> object:
+                self.reads[name] = self.reads.get(name, 0) + 1
+                return getattr(source, name)
+
+            actions = property(lambda self: self._read("actions"))
+            cleanup_authorities = property(
+                lambda self: self._read("cleanup_authorities")
+            )
+            cleanup_receivers = property(
+                lambda self: self._read("cleanup_receivers")
+            )
+            diagnostics = property(lambda self: self._read("diagnostics"))
+            pre_cleanup = property(lambda self: self._read("pre_cleanup"))
+            shutdown = property(lambda self: self._read("shutdown"))
+
+        counting = CountingRepetition()
+        authenticate = actor_race_verify.regenerate_authenticated_action_program
+        with mock.patch.object(
+            actor_race_verify,
+            "regenerate_authenticated_action_program",
+            wraps=authenticate,
+        ) as authenticate_once:
+            actor_race_verify.build_control_lifecycle_order(counting)
+        authenticate_once.assert_called_once_with()
+        self.assertEqual(
+            counting.reads,
+            {
+                "actions": 1,
+                "cleanup_authorities": 1,
+                "cleanup_receivers": 1,
+                "diagnostics": 1,
+                "pre_cleanup": 1,
+                "shutdown": 1,
+            },
+        )
+        with self.assertRaises(TypeError):
+            actor_race_verify.build_control_lifecycle_order(
+                source,
                 program=authenticate(),
             )
 
