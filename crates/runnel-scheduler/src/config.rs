@@ -63,6 +63,9 @@ pub struct SchedulerLimits {
     /// Must be zero until a typed constructor can authenticate an attached
     /// cache snapshot; caller-provided cache-size estimates are not trusted.
     pub page_pool_partition_bytes: u64,
+    /// Shared semantic capacity for unpublished direct batch-admission
+    /// metadata. The adapter-typed minimum is available from
+    /// `SchedulerEngine::<A>::required_batch_admission_reserve_bytes`.
     pub admission_reserve_bytes: u64,
 }
 

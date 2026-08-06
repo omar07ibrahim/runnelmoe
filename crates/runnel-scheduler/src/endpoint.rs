@@ -700,6 +700,134 @@ pub(crate) struct PreparedEndpoint {
     logical_capacity: usize,
 }
 
+/// One fallibly allocated endpoint queue paired with a still-unpublished slot
+/// generation and accepted-offer ordinal.
+pub(crate) struct PreparedEndpointBinding {
+    prepared: PreparedEndpoint,
+    key: SlotKey,
+    ordinal: usize,
+    free_position: usize,
+}
+
+struct LockedEndpointBinding<'slot> {
+    prepared: PreparedEndpoint,
+    key: SlotKey,
+    ordinal: usize,
+    free_position: usize,
+    state: MutexGuard<'slot, EndpointState>,
+}
+
+pub(crate) const fn prepared_batch_endpoint_bytes(maximum_accepted: usize) -> Option<usize> {
+    maximum_accepted.checked_mul(size_of::<PreparedEndpointBinding>())
+}
+
+/// Semantic bytes for both endpoint permit Vecs. Per-request output queues
+/// belong to the provisional request-owned reservation.
+pub(crate) fn batch_endpoint_permit_bytes(maximum_accepted: usize) -> Option<usize> {
+    maximum_accepted
+        .checked_mul(size_of::<LockedEndpointBinding<'static>>())?
+        .checked_add(maximum_accepted.checked_mul(size_of::<CommittedEndpoint>())?)
+}
+
+pub(crate) struct CommittedEndpoint {
+    control: ControlBinding,
+    producer: EndpointProducer,
+    receiver: EndpointReceiver,
+}
+
+impl CommittedEndpoint {
+    pub(crate) fn into_parts(self) -> (ControlBinding, EndpointProducer, EndpointReceiver) {
+        (self.control, self.producer, self.receiver)
+    }
+}
+
+/// Fully validated vacant endpoint slots held across an atomic batch publish.
+/// Locks are acquired in slot order during preparation; entries are then
+/// restored to accepted-offer order. Dropping the permit publishes nothing.
+pub(crate) struct EndpointBatchBindPermit<'registry> {
+    free_slots: &'registry mut Vec<usize>,
+    locked: Vec<LockedEndpointBinding<'registry>>,
+    committed: Vec<CommittedEndpoint>,
+}
+
+impl fmt::Debug for EndpointBatchBindPermit<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EndpointBatchBindPermit")
+            .field("count", &self.locked.len())
+            .finish()
+    }
+}
+
+impl EndpointBatchBindPermit<'_> {
+    /// Publishes every endpoint in accepted-offer order. All queues, locks,
+    /// free-list membership, controls, identities, and output capacity were
+    /// prepared before this allocation-free boundary.
+    pub(crate) fn commit(
+        mut self,
+        controls: Vec<ControlBinding>,
+        request_ids: &[crate::RequestId],
+    ) -> Vec<CommittedEndpoint> {
+        debug_assert_eq!(self.locked.len(), controls.len());
+        debug_assert_eq!(self.locked.len(), request_ids.len());
+        for ((entry, control), request_id) in self
+            .locked
+            .drain(..)
+            .zip(controls)
+            .zip(request_ids.iter().copied())
+        {
+            let LockedEndpointBinding {
+                prepared,
+                key,
+                ordinal: _,
+                free_position,
+                mut state,
+            } = entry;
+            debug_assert!(state.key.is_none());
+            debug_assert_ne!(state.last_key, Some(key));
+            debug_assert!(prepared.output.capacity() >= prepared.logical_capacity);
+
+            state.key = Some(key);
+            state.request_id = Some(request_id);
+            state.output = prepared.output;
+            state.logical_capacity = prepared.logical_capacity;
+            state.terminal = None;
+            state.terminal_published = false;
+            state.terminal_acknowledged = false;
+            state.output_eof_acknowledged = false;
+            state.receiver_connected = true;
+            state.producer_open = true;
+            state.shutdown = false;
+            state.published_output_events = 0;
+            state.drained_output_events = 0;
+            state.discarded_output_events = 0;
+            state.discarded_terminal_results = 0;
+            drop(state);
+
+            let producer = EndpointProducer {
+                table: Arc::clone(&prepared.table),
+                key,
+                control: control.clone(),
+            };
+            let record_control = control.clone();
+            let receiver = EndpointReceiver {
+                table: prepared.table,
+                key,
+                control: Some(control),
+                locally_connected: true,
+            };
+            self.committed.push(CommittedEndpoint {
+                control: record_control,
+                producer,
+                receiver,
+            });
+            debug_assert_eq!(self.free_slots.get(free_position), Some(&key.index()));
+            self.free_slots.swap_remove(free_position);
+        }
+        self.committed
+    }
+}
+
 impl fmt::Debug for PreparedEndpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -943,6 +1071,102 @@ impl EndpointRegistry {
             table: Arc::clone(&self.table),
             output,
             logical_capacity: output_capacity,
+        })
+    }
+
+    /// Allocates one accepted offer's queue while retaining its unpublished
+    /// slot generation for later batch validation.
+    pub(crate) fn prepare_batch_binding(
+        &self,
+        output_capacity: usize,
+        key: SlotKey,
+        ordinal: usize,
+        free_position: usize,
+    ) -> SchedulerResult<PreparedEndpointBinding> {
+        Ok(PreparedEndpointBinding {
+            prepared: self.prepare(output_capacity)?,
+            key,
+            ordinal,
+            free_position,
+        })
+    }
+
+    /// Locks and validates every distinct vacant slot without publishing any
+    /// endpoint state. Every allocation occurs before the permit is returned.
+    pub(crate) fn begin_bind_batch(
+        &mut self,
+        mut prepared: Vec<PreparedEndpointBinding>,
+    ) -> SchedulerResult<EndpointBatchBindPermit<'_>> {
+        let mut previous_free_position = self.free_slots.len();
+        for entry in &prepared {
+            if entry.free_position >= previous_free_position {
+                return Err(SchedulerError::internal(
+                    "prepared batch request endpoint order is inconsistent",
+                ));
+            }
+            if self.free_slots.get(entry.free_position) != Some(&entry.key.index()) {
+                return Err(SchedulerError::internal(
+                    "prepared request endpoint slot is not free",
+                ));
+            }
+            previous_free_position = entry.free_position;
+        }
+        prepared.sort_unstable_by_key(|entry| entry.key.index());
+        for adjacent in prepared.windows(2) {
+            if adjacent[0].key.index() == adjacent[1].key.index() {
+                return Err(SchedulerError::internal(
+                    "prepared batch request endpoint slot is duplicated",
+                ));
+            }
+        }
+
+        let count = prepared.len();
+        let mut locked = Vec::new();
+        try_reserve_vec(&mut locked, count, "prepared batch endpoint bindings")?;
+        let mut committed = Vec::new();
+        try_reserve_vec(&mut committed, count, "committed batch endpoint bindings")?;
+
+        let Self { table, free_slots } = self;
+        let table: &Arc<EndpointTable> = table;
+        for entry in prepared {
+            if !Arc::ptr_eq(table, &entry.prepared.table) {
+                return Err(SchedulerError::internal(
+                    "prepared request endpoint belongs to another registry",
+                ));
+            }
+            let index = entry.key.index();
+            let slot = table.slots.get(index).ok_or_else(|| {
+                SchedulerError::internal("prepared request endpoint slot is out of range")
+            })?;
+            let state = lock_state(slot)?;
+            if state.key.is_some() {
+                return Err(SchedulerError::internal(
+                    "free request endpoint slot remains bound",
+                ));
+            }
+            if state.last_key == Some(entry.key) {
+                return Err(SchedulerError::internal(
+                    "request endpoint generation was reused",
+                ));
+            }
+            if entry.prepared.output.capacity() < entry.prepared.logical_capacity {
+                return Err(SchedulerError::internal(
+                    "prepared request endpoint lost reserved capacity",
+                ));
+            }
+            locked.push(LockedEndpointBinding {
+                prepared: entry.prepared,
+                key: entry.key,
+                ordinal: entry.ordinal,
+                free_position: entry.free_position,
+                state,
+            });
+        }
+        locked.sort_unstable_by_key(|entry| entry.ordinal);
+        Ok(EndpointBatchBindPermit {
+            free_slots,
+            locked,
+            committed,
         })
     }
 
@@ -3047,6 +3271,78 @@ mod tests {
                 .expect("wait result");
             assert_eq!(snapshot.buffered_output_events, 0);
         }
+    }
+
+    #[test]
+    fn batch_endpoint_permit_drop_is_inert_and_commit_restores_offer_order() {
+        let mut registry = EndpointRegistry::try_with_capacity(3).expect("registry");
+        registry.free_slots.clear();
+        registry.free_slots.extend([1, 0, 2]);
+        let initial_free_slots = registry.free_slots.clone();
+        let initial_capacity = registry.free_slots.capacity();
+
+        let prepare = |registry: &EndpointRegistry| {
+            vec![
+                registry
+                    .prepare_batch_binding(2, key(2, 1), 0, 2)
+                    .expect("prepare first offered endpoint"),
+                registry
+                    .prepare_batch_binding(2, key(0, 1), 1, 1)
+                    .expect("prepare second offered endpoint"),
+            ]
+        };
+        let permit = registry
+            .begin_bind_batch(prepare(&registry))
+            .expect("endpoint batch permit");
+        drop(permit);
+        assert_eq!(registry.free_slots, initial_free_slots);
+        assert_eq!(registry.free_slots.capacity(), initial_capacity);
+        for slot in registry.table.slots.iter() {
+            let state = slot.state.lock().expect("vacant endpoint state");
+            assert!(state.key.is_none());
+            assert!(state.request_id.is_none());
+            assert!(state.output.is_empty());
+            assert_eq!(state.logical_capacity, 0);
+        }
+
+        let mut controls = ControlRegistry::try_with_capacity(2).expect("controls");
+        let control_bindings = vec![
+            controls
+                .bind(controls.prepare().expect("first prepared control"))
+                .expect("first bound control"),
+            controls
+                .bind(controls.prepare().expect("second prepared control"))
+                .expect("second bound control"),
+        ];
+        let request_ids = [request_id_for_test(7), request_id_for_test(8)];
+        let committed = registry
+            .begin_bind_batch(prepare(&registry))
+            .expect("endpoint batch permit")
+            .commit(control_bindings, &request_ids);
+        assert_eq!(committed.len(), 2);
+        let identities = committed
+            .into_iter()
+            .map(|endpoint| endpoint.into_parts().2.stress_identity())
+            .collect::<Vec<_>>();
+        assert_eq!(identities, [(2, 1), (0, 1)]);
+        assert_eq!(registry.free_slots, [1]);
+        assert_eq!(registry.free_slots.capacity(), initial_capacity);
+        assert_eq!(
+            registry.table.slots[2]
+                .state
+                .lock()
+                .expect("first committed endpoint")
+                .request_id,
+            Some(request_ids[0])
+        );
+        assert_eq!(
+            registry.table.slots[0]
+                .state
+                .lock()
+                .expect("second committed endpoint")
+                .request_id,
+            Some(request_ids[1])
+        );
     }
 
     #[test]

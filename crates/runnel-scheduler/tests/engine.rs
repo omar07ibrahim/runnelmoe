@@ -6,8 +6,8 @@ use runnel_runtime::{
     RuntimeError, SamplingPolicy, StateLayoutAccounting,
 };
 use runnel_scheduler::{
-    CancelDisposition, ErrorCategory, RequestPhase, RequestSpec, SchedulerConfig, SchedulerEngine,
-    SchedulerLimits, StepReport, TerminalOutcome,
+    BatchRequestSpec, CancelDisposition, ErrorCategory, RequestPhase, RequestSpec, SchedulerConfig,
+    SchedulerEngine, SchedulerError, SchedulerLimits, StepReport, TerminalOutcome,
 };
 
 static NEXT_MODEL_ID: CheckedCounter = CheckedCounter::new(1);
@@ -511,6 +511,514 @@ fn construction_and_submission_are_public_and_accounted() {
     assert_eq!(submitted.queued_requests, 1);
     assert!(submitted.ledger_used_bytes > initial.ledger_used_bytes);
     assert!(submitted.ledger_peak_bytes >= submitted.ledger_used_bytes);
+}
+
+fn pressure_limits(max_outstanding: u64, max_queued: u64) -> SchedulerLimits {
+    let mut limits = SchedulerLimits::evidence();
+    limits.max_outstanding_requests = max_outstanding;
+    limits.max_active_requests = 16.min(max_outstanding);
+    limits.max_queued_requests = max_queued;
+    limits.max_retained_terminal_results = max_outstanding;
+    limits
+}
+
+#[test]
+fn prepared_batch_drop_is_exact_and_consumes_no_request_identity() {
+    let mut engine = tiny_engine();
+    let before_engine = engine.snapshot();
+    let before_ledger = engine.ledger_snapshot();
+    let prompt = [0_u32; 2];
+    let offers =
+        [BatchRequestSpec::release_relative(&prompt, 2, SamplingPolicy::Greedy, 20_000_000); 3];
+
+    let prepared = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare unpublished batch");
+    drop(prepared);
+
+    assert_eq!(engine.snapshot(), before_engine);
+    assert_eq!(engine.ledger_snapshot(), before_ledger);
+    let id = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("identity remains unconsumed");
+    assert_eq!(id.get(), 1);
+
+    let malformed = [
+        BatchRequestSpec::absolute(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None)),
+        BatchRequestSpec::absolute(RequestSpec::new(&[], 1, SamplingPolicy::Greedy, None)),
+    ];
+    let before = engine.snapshot();
+    let error = engine
+        .prepare_submit_batch(&malformed)
+        .expect_err("a malformed later offer aborts the complete prepare");
+    assert!(matches!(
+        error,
+        SchedulerError::InvalidRequest {
+            field: "prompt",
+            ..
+        }
+    ));
+    assert_eq!(engine.snapshot(), before);
+}
+
+#[test]
+fn deadline_pressure_16_commits_one_release_without_promotion() {
+    let mut engine = new_engine_with_limits(pressure_limits(16, 16));
+    let prompt = [0_u32; 16];
+    let offers =
+        [BatchRequestSpec::release_relative(&prompt, 8, SamplingPolicy::Greedy, 20_000_000); 16];
+    let release_ns = 1_000_000_u64;
+
+    let result = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare pressure-16")
+        .commit_prepared_batch(release_ns)
+        .expect("commit pressure-16");
+
+    assert_eq!(result.release_ns(), release_ns);
+    assert_eq!(result.offered_count(), 16);
+    assert_eq!(result.rejected_count(), 0);
+    assert_eq!(result.accepted_count(), 16);
+    for (index, accepted) in result.accepted().enumerate() {
+        assert_eq!(accepted.offered_index(), index);
+        assert_eq!(accepted.request_id().get(), index as u64 + 1);
+        assert_eq!(accepted.admitted_ns(), release_ns);
+        assert_eq!(
+            engine.admitted_ns(accepted.request_id()).unwrap(),
+            release_ns
+        );
+        assert_eq!(
+            engine.deadline_ns(accepted.request_id()).unwrap(),
+            Some(release_ns + 20_000_000)
+        );
+        assert_eq!(phase(&engine, accepted.request_id()), RequestPhase::Queued);
+    }
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.queued_requests, 16);
+    assert_eq!(snapshot.active_requests, 0);
+}
+
+#[test]
+fn deadline_pressure_24_accepts_fifo_prefix_and_rejects_suffix_exactly() {
+    let mut engine = new_engine_with_limits(pressure_limits(16, 16));
+    let prompt = [0_u32; 16];
+    let offers =
+        [BatchRequestSpec::release_relative(&prompt, 8, SamplingPolicy::Greedy, 20_000_000); 24];
+    let release_ns = 7_000_u64;
+
+    let result = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare pressure-24")
+        .commit_prepared_batch(release_ns)
+        .expect("commit pressure-24");
+
+    assert_eq!(result.accepted_count(), 16);
+    assert_eq!(result.rejected_count(), 8);
+    for (index, accepted) in result.accepted().enumerate() {
+        assert_eq!(accepted.offered_index(), index);
+        assert_eq!(accepted.request_id().get(), index as u64 + 1);
+        assert_eq!(accepted.admitted_ns(), release_ns);
+    }
+    for (offset, rejected) in result.rejected().enumerate() {
+        assert_eq!(rejected.offered_index(), 16 + offset);
+        match rejected.error() {
+            SchedulerError::ResourceExhausted {
+                resource,
+                required,
+                limit,
+            } => {
+                assert_eq!(*resource, "queued request count");
+                assert_eq!(*required, 17);
+                assert_eq!(*limit, 16);
+            }
+            error => panic!("unexpected pressure rejection: {error:?}"),
+        }
+    }
+    assert_eq!(engine.snapshot().queued_requests, 16);
+    assert_eq!(engine.snapshot().active_requests, 0);
+}
+
+#[test]
+fn pressure_rejections_and_failed_release_checks_leave_no_id_gaps() {
+    let mut engine = new_engine_with_limits(pressure_limits(24, 16));
+    let prompt = [0_u32; 2];
+    let offers =
+        [BatchRequestSpec::release_relative(&prompt, 2, SamplingPolicy::Greedy, 20_000_000); 24];
+    let result = engine
+        .prepare_submit_batch(&offers)
+        .unwrap()
+        .commit_prepared_batch(10)
+        .unwrap();
+    assert_eq!(result.accepted_count(), 16);
+    assert_eq!(result.rejected_count(), 8);
+    assert_eq!(engine.step().unwrap().promoted_requests, 16);
+    let next = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("rejected suffix consumed no identities");
+    assert_eq!(next.get(), 17);
+
+    let mut rejected_limits = SchedulerLimits::tiny();
+    rejected_limits.max_outstanding_requests = 1;
+    rejected_limits.max_active_requests = 1;
+    rejected_limits.max_queued_requests = 1;
+    rejected_limits.max_retained_terminal_results = 1;
+    let mut fresh = new_engine_with_limits(rejected_limits);
+    let rejected_suffix = [
+        BatchRequestSpec::absolute(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None)),
+        BatchRequestSpec::release_relative(&[1], 1, SamplingPolicy::Greedy, u64::MAX),
+    ];
+    let before = fresh.ledger_snapshot();
+    let error = fresh
+        .prepare_submit_batch(&rejected_suffix)
+        .unwrap()
+        .commit_prepared_batch(1)
+        .expect_err("relative deadline overflow is checked before publication");
+    assert!(matches!(
+        error,
+        SchedulerError::InvalidRequest {
+            field: "deadline",
+            ..
+        }
+    ));
+    assert_eq!(fresh.ledger_snapshot(), before);
+    let first = fresh
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .unwrap();
+    assert_eq!(first.get(), 1);
+}
+
+#[test]
+fn every_release_validation_failure_is_an_exact_prepublication_rollback() {
+    let request = RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None);
+
+    let mut backwards = tiny_engine();
+    backwards.advance_clock(10).expect("advance batch clock");
+    let before_engine = backwards.snapshot();
+    let before_ledger = backwards.ledger_snapshot();
+    let error = backwards
+        .prepare_submit_batch(&[BatchRequestSpec::absolute(request)])
+        .expect("prepare backwards-release batch")
+        .commit_prepared_batch(9)
+        .expect_err("release boundary cannot move backwards");
+    assert!(matches!(
+        error,
+        SchedulerError::InvalidRequest {
+            field: "release_ns",
+            ..
+        }
+    ));
+    assert_eq!(backwards.snapshot(), before_engine);
+    assert_eq!(backwards.ledger_snapshot(), before_ledger);
+    assert_eq!(backwards.try_submit(request).unwrap().get(), 1);
+
+    let mut absolute = tiny_engine();
+    let expiring =
+        BatchRequestSpec::absolute(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, Some(10)));
+    let before_engine = absolute.snapshot();
+    let before_ledger = absolute.ledger_snapshot();
+    let error = absolute
+        .prepare_submit_batch(&[expiring])
+        .expect("prepare not-yet-expired absolute deadline")
+        .commit_prepared_batch(10)
+        .expect_err("absolute deadline expires inclusively at release");
+    assert_eq!(error.category(), ErrorCategory::DeadlineExceeded);
+    assert_eq!(absolute.snapshot(), before_engine);
+    assert_eq!(absolute.ledger_snapshot(), before_ledger);
+    assert_eq!(absolute.try_submit(request).unwrap().get(), 1);
+
+    let mut zero_relative = tiny_engine();
+    let before_engine = zero_relative.snapshot();
+    let before_ledger = zero_relative.ledger_snapshot();
+    let error = zero_relative
+        .prepare_submit_batch(&[BatchRequestSpec::release_relative(
+            &[0],
+            1,
+            SamplingPolicy::Greedy,
+            0,
+        )])
+        .expect_err("zero release-relative duration is invalid");
+    assert!(matches!(
+        error,
+        SchedulerError::InvalidRequest {
+            field: "deadline",
+            ..
+        }
+    ));
+    assert_eq!(zero_relative.snapshot(), before_engine);
+    assert_eq!(zero_relative.ledger_snapshot(), before_ledger);
+    assert_eq!(zero_relative.try_submit(request).unwrap().get(), 1);
+
+    let mut overflowing = tiny_engine();
+    let before_engine = overflowing.snapshot();
+    let before_ledger = overflowing.ledger_snapshot();
+    let error = overflowing
+        .prepare_submit_batch(&[BatchRequestSpec::release_relative(
+            &[0],
+            1,
+            SamplingPolicy::Greedy,
+            u64::MAX,
+        )])
+        .expect("prepare overflowing relative deadline")
+        .commit_prepared_batch(1)
+        .expect_err("relative release deadline must not wrap");
+    assert!(matches!(
+        error,
+        SchedulerError::InvalidRequest {
+            field: "deadline",
+            ..
+        }
+    ));
+    assert_eq!(overflowing.snapshot(), before_engine);
+    assert_eq!(overflowing.ledger_snapshot(), before_ledger);
+    assert_eq!(overflowing.try_submit(request).unwrap().get(), 1);
+
+    let mut limits = SchedulerLimits::tiny();
+    limits.max_outstanding_requests = 2;
+    limits.max_active_requests = 1;
+    limits.max_queued_requests = 1;
+    limits.max_retained_terminal_results = 2;
+    let mut all_rejected = new_engine_with_limits(limits);
+    let first = all_rejected
+        .try_submit(request)
+        .expect("queued pressure owner");
+    let before_engine = all_rejected.snapshot();
+    let before_ledger = all_rejected.ledger_snapshot();
+    let error = all_rejected
+        .prepare_submit_batch(&[BatchRequestSpec::release_relative(
+            &[1],
+            1,
+            SamplingPolicy::Greedy,
+            u64::MAX,
+        )])
+        .expect("prepare all-rejected batch")
+        .commit_prepared_batch(1)
+        .expect_err("rejected offer deadline still validates at release");
+    assert!(matches!(
+        error,
+        SchedulerError::InvalidRequest {
+            field: "deadline",
+            ..
+        }
+    ));
+    assert_eq!(all_rejected.snapshot(), before_engine);
+    assert_eq!(all_rejected.ledger_snapshot(), before_ledger);
+    all_rejected.step().expect("promote pressure owner");
+    assert_eq!(
+        all_rejected.try_submit(request).unwrap().get(),
+        first.get() + 1
+    );
+}
+
+#[test]
+fn fifo_pressure_does_not_bypass_an_unfit_head_for_a_smaller_offer() {
+    let mut geometry = SchedulerLimits::tiny();
+    geometry.max_prompt_tokens = 17;
+    geometry.max_new_tokens = 1;
+    geometry.max_context_tokens = 17;
+
+    let mut probe = new_engine_with_limits(geometry);
+    let shared = probe.ledger_snapshot().total_used();
+    probe
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .unwrap();
+    let small_delta = probe.ledger_snapshot().total_used() - shared;
+    let minimum = probe.config().minimum_total_charge_bytes();
+    let target_limit = minimum.max(shared + small_delta * 2);
+
+    geometry.logical_memory_limit_bytes = target_limit;
+    let mut engine = new_engine_with_limits(geometry);
+    engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("filler request");
+    let large_prompt = [0_u32; 17];
+    let offers = [
+        BatchRequestSpec::absolute(RequestSpec::new(
+            &large_prompt,
+            1,
+            SamplingPolicy::Greedy,
+            None,
+        )),
+        BatchRequestSpec::absolute(RequestSpec::new(&[1], 1, SamplingPolicy::Greedy, None)),
+    ];
+    let result = engine
+        .prepare_submit_batch(&offers)
+        .expect("both descriptions are intrinsically valid")
+        .commit_prepared_batch(1)
+        .unwrap();
+    assert_eq!(result.accepted_count(), 0);
+    assert_eq!(result.rejected_count(), 2);
+    let mut rejected = result.rejected();
+    let first_rejection = rejected.next().expect("first rejection");
+    let second_rejection = rejected.next().expect("second rejection");
+    assert_eq!(
+        first_rejection.error().category(),
+        ErrorCategory::ResourceExhausted
+    );
+    assert_eq!(
+        format!("{:?}", first_rejection.error()),
+        format!("{:?}", second_rejection.error())
+    );
+    assert_eq!(engine.snapshot().queued_requests, 1);
+}
+
+#[test]
+fn atomic_batch_matches_the_incremental_fifo_admission_sequence() {
+    let limits = pressure_limits(24, 16);
+    let mut batch_engine = new_engine_with_limits(limits);
+    let mut incremental_engine = new_engine_with_limits(limits);
+    incremental_engine.advance_clock(42).unwrap();
+    let prompt = [0_u32; 2];
+    let requests = [RequestSpec::new(&prompt, 2, SamplingPolicy::Greedy, None); 24];
+    let offers = requests.map(BatchRequestSpec::absolute);
+
+    let batch = batch_engine
+        .prepare_submit_batch(&offers)
+        .unwrap()
+        .commit_prepared_batch(42)
+        .unwrap();
+    let incremental = requests.map(|request| incremental_engine.try_submit(request));
+
+    for (index, result) in incremental.iter().enumerate() {
+        if index < 16 {
+            let id = result.as_ref().expect("incremental accepted prefix");
+            let accepted = batch.accepted().nth(index).expect("batch accepted prefix");
+            assert_eq!(id.get(), accepted.request_id().get());
+            assert_eq!(accepted.offered_index(), index);
+        } else {
+            let error = result.as_ref().expect_err("incremental rejected suffix");
+            let rejected = batch
+                .rejected()
+                .nth(index - 16)
+                .expect("batch rejected suffix");
+            assert_eq!(format!("{error:?}"), format!("{:?}", rejected.error()));
+        }
+    }
+    assert_eq!(batch_engine.snapshot(), incremental_engine.snapshot());
+    assert_eq!(
+        batch_engine.ledger_snapshot(),
+        incremental_engine.ledger_snapshot()
+    );
+}
+
+#[test]
+fn batch_requests_complete_cancel_reap_and_reuse_every_registry_slot() {
+    let mut limits = SchedulerLimits::tiny();
+    limits.max_outstanding_requests = 2;
+    limits.max_active_requests = 2;
+    limits.max_queued_requests = 2;
+    limits.max_retained_terminal_results = 2;
+    limits.batch_width = 2;
+    limits.waves_per_step = 1;
+    let mut engine = new_engine_with_limits(limits);
+    let pristine = engine.ledger_snapshot();
+    let prompts = [[0_u32], [1_u32]];
+    let offers = [
+        BatchRequestSpec::absolute(RequestSpec::new(
+            &prompts[0],
+            2,
+            SamplingPolicy::Greedy,
+            None,
+        )),
+        BatchRequestSpec::absolute(RequestSpec::new(
+            &prompts[1],
+            3,
+            SamplingPolicy::Greedy,
+            None,
+        )),
+    ];
+    let first_batch = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare first lifecycle batch")
+        .commit_prepared_batch(11)
+        .expect("commit first lifecycle batch");
+    let first_ids = first_batch
+        .accepted()
+        .map(|accepted| accepted.request_id())
+        .collect::<Vec<_>>();
+    assert_eq!(first_ids.len(), 2);
+    assert_eq!(
+        engine.cancel(first_ids[1]).expect("cancel batch request"),
+        CancelDisposition::Requested
+    );
+
+    for _ in 0..8 {
+        if first_ids
+            .iter()
+            .copied()
+            .all(|id| phase(&engine, id) == RequestPhase::Terminal)
+        {
+            break;
+        }
+        engine.step().expect("first lifecycle batch step");
+    }
+    assert!(
+        first_ids
+            .iter()
+            .copied()
+            .all(|id| phase(&engine, id) == RequestPhase::Terminal)
+    );
+    assert_eq!(drain_tokens(&mut engine, first_ids[0]).len(), 2);
+    assert!(drain_tokens(&mut engine, first_ids[1]).is_empty());
+    let completed = engine
+        .take_terminal(first_ids[0])
+        .expect("completed batch terminal query")
+        .expect("completed batch terminal");
+    let cancelled = engine
+        .take_terminal(first_ids[1])
+        .expect("cancelled batch terminal query")
+        .expect("cancelled batch terminal");
+    assert_eq!(completed.outcome(), TerminalOutcome::Completed);
+    assert_eq!(cancelled.outcome(), TerminalOutcome::Cancelled);
+    let reaped = engine.ledger_snapshot();
+    assert_eq!(reaped.request_used(), 0);
+    assert_eq!(reaped.shared_used(), pristine.shared_used());
+    assert_eq!(reaped.total_used(), pristine.total_used());
+
+    let reused_batch = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare reused lifecycle batch")
+        .commit_prepared_batch(12)
+        .expect("commit reused lifecycle batch");
+    assert_eq!(
+        first_batch
+            .accepted()
+            .map(|accepted| accepted.request_id())
+            .collect::<Vec<_>>(),
+        first_ids,
+        "retained compact results remain independent of scratch reuse"
+    );
+    let reused_ids = reused_batch
+        .accepted()
+        .map(|accepted| accepted.request_id())
+        .collect::<Vec<_>>();
+    assert_eq!(reused_ids.len(), 2);
+    assert!(reused_ids[0] > first_ids[1]);
+    for _ in 0..8 {
+        if reused_ids
+            .iter()
+            .copied()
+            .all(|id| phase(&engine, id) == RequestPhase::Terminal)
+        {
+            break;
+        }
+        engine.step().expect("reused lifecycle batch step");
+    }
+    for id in reused_ids {
+        assert_eq!(phase(&engine, id), RequestPhase::Terminal);
+        assert!(!drain_tokens(&mut engine, id).is_empty());
+        assert_eq!(
+            engine
+                .take_terminal(id)
+                .expect("reused terminal query")
+                .expect("reused terminal")
+                .outcome(),
+            TerminalOutcome::Completed
+        );
+    }
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+    let shutdown = engine.shutdown().expect("batch lifecycle shutdown");
+    assert_eq!(shutdown.terminated_requests, 0);
+    assert_eq!(shutdown.remaining_shared_bytes, 0);
 }
 
 #[test]

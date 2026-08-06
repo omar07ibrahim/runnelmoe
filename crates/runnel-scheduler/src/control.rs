@@ -170,8 +170,113 @@ impl fmt::Debug for ControlTable {
 pub(crate) struct PreparedControl {
     table: Arc<ControlTable>,
     index: usize,
+    free_position: usize,
     previous_generation: u64,
     generation: NonZeroU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ControlPressure {
+    resource: &'static str,
+    required: u64,
+    limit: u64,
+}
+
+impl ControlPressure {
+    pub(crate) const fn error(self) -> SchedulerError {
+        SchedulerError::resource_exhausted(self.resource, self.required, self.limit)
+    }
+}
+
+pub(crate) struct AvailableControls {
+    prepared: Vec<PreparedControl>,
+    pressure: Option<ControlPressure>,
+}
+
+impl AvailableControls {
+    pub(crate) fn len(&self) -> usize {
+        self.prepared.len()
+    }
+
+    pub(crate) const fn pressure(&self) -> Option<ControlPressure> {
+        self.pressure
+    }
+
+    pub(crate) fn into_prefix(mut self, count: usize) -> Vec<PreparedControl> {
+        debug_assert!(count <= self.prepared.len());
+        self.prepared.truncate(count);
+        self.prepared
+    }
+}
+
+struct PreparedBatchControl {
+    prepared: PreparedControl,
+    published: u64,
+}
+
+pub(crate) const fn available_batch_control_bytes(maximum_offers: usize) -> Option<usize> {
+    maximum_offers.checked_mul(size_of::<PreparedControl>())
+}
+
+pub(crate) fn batch_control_permit_bytes(maximum_accepted: usize) -> Option<usize> {
+    maximum_accepted
+        .checked_mul(size_of::<PreparedBatchControl>())?
+        .checked_add(maximum_accepted.checked_mul(size_of::<ControlBinding>())?)
+}
+
+/// Exclusive, fully validated control bindings for an atomic batch publish.
+/// Dropping the permit leaves the registry unchanged.
+pub(crate) struct ControlBatchBindPermit<'registry> {
+    registry: &'registry mut ControlRegistry,
+    prepared: Vec<PreparedBatchControl>,
+    bindings: Vec<ControlBinding>,
+}
+
+impl fmt::Debug for ControlBatchBindPermit<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlBatchBindPermit")
+            .field("count", &self.prepared.len())
+            .finish()
+    }
+}
+
+impl ControlBatchBindPermit<'_> {
+    /// Publishes every prevalidated control in prepared order without an
+    /// allocation or error path.
+    pub(crate) fn commit(mut self) -> Vec<ControlBinding> {
+        for entry in self.prepared.drain(..) {
+            let prepared = entry.prepared;
+            let word = &self.registry.table.words[prepared.index];
+            loop {
+                let observed = word.load(Ordering::Acquire);
+                debug_assert_eq!(generation_from_word(observed), prepared.previous_generation);
+                debug_assert!(prepared.previous_generation == 0 || has_flag(observed, TERMINAL));
+                if word
+                    .compare_exchange(
+                        observed,
+                        entry.published,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            self.bindings.push(ControlBinding {
+                table: prepared.table,
+                index: prepared.index,
+                generation: prepared.generation,
+            });
+            debug_assert_eq!(
+                self.registry.free_slots.get(prepared.free_position),
+                Some(&prepared.index)
+            );
+            self.registry.free_slots.swap_remove(prepared.free_position);
+        }
+        self.bindings
+    }
 }
 
 impl fmt::Debug for PreparedControl {
@@ -528,7 +633,7 @@ impl ControlRegistry {
     /// consuming either one. Dropping the result is an exact rollback.
     pub(crate) fn prepare(&self) -> SchedulerResult<PreparedControl> {
         let mut saw_exhausted_generation = false;
-        for index in self.free_slots.iter().rev().copied() {
+        for (free_position, index) in self.free_slots.iter().copied().enumerate().rev() {
             let word = self
                 .table
                 .words
@@ -557,6 +662,7 @@ impl ControlRegistry {
             return Ok(PreparedControl {
                 table: Arc::clone(&self.table),
                 index,
+                free_position,
                 previous_generation,
                 generation,
             });
@@ -577,6 +683,125 @@ impl ControlRegistry {
         }
     }
 
+    /// Prepares distinct viable controls up to `maximum` without mutating the
+    /// registry. A short result carries the exact ordinary pressure class for
+    /// the first unpreparable FIFO offer.
+    pub(crate) fn prepare_available(&self, maximum: usize) -> SchedulerResult<AvailableControls> {
+        let mut prepared = Vec::new();
+        try_reserve_exact(&mut prepared, maximum, "prepared batch request controls")?;
+        let mut saw_exhausted_generation = false;
+        for (free_position, index) in self.free_slots.iter().copied().enumerate().rev() {
+            if prepared.len() == maximum {
+                break;
+            }
+            let word = self
+                .table
+                .words
+                .get(index)
+                .ok_or_else(|| SchedulerError::internal("free control slot is out of range"))?
+                .load(Ordering::Acquire);
+            let previous_generation = generation_from_word(word);
+            if previous_generation != 0 && !has_flag(word, TERMINAL) {
+                return Err(SchedulerError::internal(
+                    "free request control slot is not terminal",
+                ));
+            }
+            let Some(next) = previous_generation.checked_add(1) else {
+                saw_exhausted_generation = true;
+                continue;
+            };
+            let Some(generation) = NonZeroU64::new(next) else {
+                return Err(SchedulerError::internal(
+                    "request control generation became zero",
+                ));
+            };
+            if generation.get() > MAX_CONTROL_GENERATION {
+                saw_exhausted_generation = true;
+                continue;
+            }
+            prepared.push(PreparedControl {
+                table: Arc::clone(&self.table),
+                index,
+                free_position,
+                previous_generation,
+                generation,
+            });
+        }
+        let pressure = (prepared.len() < maximum).then(|| {
+            if saw_exhausted_generation {
+                ControlPressure {
+                    resource: "request control generation",
+                    required: MAX_CONTROL_GENERATION + 1,
+                    limit: MAX_CONTROL_GENERATION,
+                }
+            } else {
+                ControlPressure {
+                    resource: "request control slots",
+                    required: usize_to_u64(self.table.words.len()).saturating_add(1),
+                    limit: usize_to_u64(self.table.words.len()),
+                }
+            }
+        });
+        Ok(AvailableControls { prepared, pressure })
+    }
+
+    /// Validates a distinct prepared prefix and retains exclusive registry
+    /// ownership until it is either dropped or published.
+    pub(crate) fn begin_bind_batch(
+        &mut self,
+        prepared: Vec<PreparedControl>,
+    ) -> SchedulerResult<ControlBatchBindPermit<'_>> {
+        let count = prepared.len();
+        let mut entries = Vec::new();
+        try_reserve_exact(&mut entries, count, "prepared batch control bindings")?;
+        let mut bindings = Vec::new();
+        try_reserve_exact(&mut bindings, count, "committed batch control bindings")?;
+        let mut previous_free_position = self.free_slots.len();
+        for control in prepared {
+            if !Arc::ptr_eq(&self.table, &control.table) {
+                return Err(SchedulerError::internal(
+                    "prepared request control belongs to another registry",
+                ));
+            }
+            if control.free_position >= previous_free_position {
+                return Err(SchedulerError::internal(
+                    "prepared batch request control order is inconsistent",
+                ));
+            }
+            if self.free_slots.get(control.free_position) != Some(&control.index) {
+                return Err(SchedulerError::internal(
+                    "prepared request control is no longer free",
+                ));
+            }
+            previous_free_position = control.free_position;
+            let word = self
+                .table
+                .words
+                .get(control.index)
+                .ok_or_else(|| SchedulerError::internal("prepared control slot is out of range"))?
+                .load(Ordering::Acquire);
+            if generation_from_word(word) != control.previous_generation {
+                return Err(SchedulerError::internal(
+                    "prepared request control generation changed",
+                ));
+            }
+            if control.previous_generation != 0 && !has_flag(word, TERMINAL) {
+                return Err(SchedulerError::internal(
+                    "prepared request control slot is not terminal",
+                ));
+            }
+            entries.push(PreparedBatchControl {
+                published: pack_generation(control.generation)?,
+                prepared: control,
+            });
+        }
+        Ok(ControlBatchBindPermit {
+            registry: self,
+            prepared: entries,
+            bindings,
+        })
+    }
+
     /// Atomically publishes a prepared generation and consumes its free slot.
     pub(crate) fn bind(&mut self, prepared: PreparedControl) -> SchedulerResult<ControlBinding> {
         if !Arc::ptr_eq(&self.table, &prepared.table) {
@@ -584,13 +809,12 @@ impl ControlRegistry {
                 "prepared request control belongs to another registry",
             ));
         }
-        let free_position = self
-            .free_slots
-            .iter()
-            .rposition(|index| *index == prepared.index)
-            .ok_or_else(|| {
-                SchedulerError::internal("prepared request control is no longer free")
-            })?;
+        let free_position = prepared.free_position;
+        if self.free_slots.get(free_position) != Some(&prepared.index) {
+            return Err(SchedulerError::internal(
+                "prepared request control is no longer free",
+            ));
+        }
         let word = self
             .table
             .words
@@ -1260,6 +1484,93 @@ mod tests {
                 .expect("idempotent snapshot")
                 .terminal()
         );
+    }
+
+    #[test]
+    fn batch_bind_permit_drop_is_inert_and_commit_binds_distinct_lifo_slots() {
+        let mut registry = ControlRegistry::try_with_capacity(3).expect("registry");
+        let initial_free_slots = registry.free_slots.clone();
+        let initial_capacity = registry.free_slots.capacity();
+        let initial_words = registry
+            .table
+            .words
+            .iter()
+            .map(|word| word.load(Ordering::Acquire))
+            .collect::<Vec<_>>();
+
+        let available = registry.prepare_available(2).expect("available controls");
+        let permit = registry
+            .begin_bind_batch(available.into_prefix(2))
+            .expect("batch control permit");
+        drop(permit);
+        assert_eq!(registry.free_slots, initial_free_slots);
+        assert_eq!(registry.free_slots.capacity(), initial_capacity);
+        assert_eq!(
+            registry
+                .table
+                .words
+                .iter()
+                .map(|word| word.load(Ordering::Acquire))
+                .collect::<Vec<_>>(),
+            initial_words
+        );
+
+        let available = registry.prepare_available(2).expect("available controls");
+        let bindings = registry
+            .begin_bind_batch(available.into_prefix(2))
+            .expect("batch control permit")
+            .commit();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].stress_identity(), (0, 1));
+        assert_eq!(bindings[1].stress_identity(), (1, 1));
+        assert_eq!(registry.free_slots, [2]);
+        assert_eq!(registry.free_slots.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn stale_terminal_controls_racing_batch_rebind_never_mark_new_generation() {
+        let mut registry = ControlRegistry::try_with_capacity(1).expect("registry");
+        for _ in 0..256 {
+            let stale = bind_one(&mut registry);
+            stale.mark_terminal().expect("terminal publication");
+            registry.recycle(&stale).expect("recycle terminal control");
+            let available = registry.prepare_available(1).expect("available control");
+            let permit = registry
+                .begin_bind_batch(available.into_prefix(1))
+                .expect("batch control permit");
+            let raced = stale.clone();
+            let barrier = Arc::new(Barrier::new(2));
+            let worker_barrier = Arc::clone(&barrier);
+            let (current, race_results) = thread::scope(|scope| {
+                let worker = scope.spawn(move || {
+                    worker_barrier.wait();
+                    (raced.cancel(), raced.disconnect())
+                });
+                barrier.wait();
+                let current = permit.commit().pop().expect("current binding");
+                (current, worker.join().expect("stale control worker"))
+            });
+            assert!(
+                matches!(race_results.0, Ok(CancelDisposition::AlreadyTerminal))
+                    || matches!(
+                        race_results.0,
+                        Err(ref error) if error.category() == ErrorCategory::InvalidRequest
+                    )
+            );
+            assert!(
+                matches!(race_results.1, Ok(DisconnectDisposition::AlreadyTerminal))
+                    || matches!(
+                        race_results.1,
+                        Err(ref error) if error.category() == ErrorCategory::InvalidRequest
+                    )
+            );
+            assert_eq!(
+                current.fresh_snapshot().expect("new generation snapshot"),
+                ControlSnapshot::default()
+            );
+            current.mark_terminal().expect("current terminal");
+            registry.recycle(&current).expect("current recycle");
+        }
     }
 
     #[test]

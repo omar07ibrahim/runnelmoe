@@ -46,7 +46,7 @@ pub type SchedulerResult<T> = std::result::Result<T, SchedulerError>;
 /// contents, tokens, seeds, logits, adapter payloads, and request identities
 /// are deliberately absent. Adapter and sampler failures are classified at
 /// this boundary and their potentially sensitive source values are discarded.
-#[derive(Error)]
+#[derive(Clone, Error)]
 #[non_exhaustive]
 pub enum SchedulerError {
     #[error("invalid scheduler request field {field}: {problem}")]

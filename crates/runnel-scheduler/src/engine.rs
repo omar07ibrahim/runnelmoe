@@ -1,33 +1,255 @@
 use std::{collections::VecDeque, fmt, mem::size_of};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use runnel_runtime::{AdapterWorkIdentity, DecoderAdapter, SamplingWorkspace};
 
 use crate::{
     accounting::{
-        ChargePlan, active_plan, admission_base_plan, map_ledger_error, shared_static_plan,
+        ADMISSION_BASE_PLAN_LEN, ChargePlan, active_plan, admission_base_plan,
+        aggregate_admission_base_plans, map_ledger_error, shared_static_plan,
     },
     config::{MAX_BATCH_WIDTH, SchedulerConfig},
-    control::{ControlBinding, ControlRegistry, ControlSnapshot},
+    control::{
+        ControlBatchBindPermit, ControlBinding, ControlRegistry, ControlSnapshot,
+        available_batch_control_bytes, batch_control_permit_bytes,
+    },
     endpoint::{
-        EndpointDiscardReport, EndpointProducer, EndpointReapReport, EndpointReceiver,
-        EndpointRegistry, EndpointSnapshot, TerminalCommitGuard, TryPop,
-        ValidatedOutputCommitGuard,
+        EndpointBatchBindPermit, EndpointDiscardReport, EndpointProducer, EndpointReapReport,
+        EndpointReceiver, EndpointRegistry, EndpointSnapshot, PreparedEndpointBinding,
+        TerminalCommitGuard, TryPop, ValidatedOutputCommitGuard, batch_endpoint_permit_bytes,
+        prepared_batch_endpoint_bytes,
     },
     error::{ErrorCategory, SchedulerError, SchedulerResult},
     id::{
-        EngineTransactionIdIssuer, IdentityExhausted, RequestIdIssuer, SlotGenerationIssuer,
-        SlotKey,
+        EngineTransactionIdIssuer, IdentityExhausted, RequestIdIssuer, SlotGeneration,
+        SlotGenerationIssuer, SlotKey,
     },
-    ledger::{CapacityLedger, LEDGER_CATEGORY_COUNT, LedgerCategory, LedgerReservation},
+    ledger::{
+        CapacityLedger, ExactReservationPartitions, LEDGER_CATEGORY_COUNT, LedgerCategory,
+        LedgerReservation, ProvisionalLedgerPermit, ReservationPartition,
+    },
     request::{
-        CancelDisposition, EngineSnapshot, OutputEvent, RequestPhase, RequestSpec, ShutdownReport,
-        StepReport, TerminalOutcome, TerminalResult,
+        BatchAdmission, BatchDeadline, BatchRequestSpec, CancelDisposition, EngineSnapshot,
+        OutputEvent, RequestPhase, RequestSpec, ShutdownReport, StepReport, TerminalOutcome,
+        TerminalResult,
     },
     ring::{DrrRing, RingError},
     wave::{TaskEnvelope, WaveScratch, WaveScratchError, WaveSelection},
 };
 
 const ACTIVE_PLAN_LEN: usize = 2;
+
+#[cfg(test)]
+thread_local! {
+    static BATCH_ALLOCATION_FAILURE_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_batch_allocation_after_for_test(successful_checkpoints: usize) {
+    BATCH_ALLOCATION_FAILURE_AFTER.with(|remaining| remaining.set(Some(successful_checkpoints)));
+}
+
+#[cfg(test)]
+fn batch_allocation_checkpoint() -> SchedulerResult<()> {
+    BATCH_ALLOCATION_FAILURE_AFTER.with(|remaining| match remaining.get() {
+        None => Ok(()),
+        Some(0) => {
+            remaining.set(None);
+            Err(SchedulerError::allocation_failure(
+                "prepared batch request payload",
+                0,
+            ))
+        }
+        Some(value) => {
+            remaining.set(Some(value - 1));
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn batch_allocation_checkpoint() -> SchedulerResult<()> {
+    Ok(())
+}
+
+/// Unpublished two-phase direct-engine admission transaction.
+///
+/// Accepted offers are one strict FIFO prefix; the first capacity failure
+/// rejects the complete suffix, so a smaller later request cannot bypass it.
+/// The guard holds exclusive engine fields and all accepted endpoint locks,
+/// preventing scheduler progress or lifecycle reuse until commit or drop.
+/// Dropping it destroys charged prompts and endpoint queues before rolling the
+/// aggregate provisional ledger reservation and its peaks back exactly.
+#[must_use = "prepared admissions must be committed or deliberately dropped"]
+pub struct PreparedAdmission<'engine, A: DecoderAdapter> {
+    slots: &'engine mut Vec<RequestSlot<A>>,
+    free_slots: &'engine mut Vec<usize>,
+    controls: ControlBatchBindPermit<'engine>,
+    endpoints: EndpointBatchBindPermit<'engine>,
+    queued: &'engine mut VecDeque<SlotKey>,
+    request_ids: &'engine mut RequestIdIssuer,
+    monotonic_ns: &'engine mut u64,
+    partitions: ExactReservationPartitions,
+    prepared: Vec<PreparedBatchRequest<A>>,
+    prospective_ids: Vec<crate::RequestId>,
+    rejection: Option<SchedulerError>,
+    offered_deadlines: Vec<BatchDeadline>,
+    offered_count: usize,
+    // Keep the provisional charge last: Rust drops fields in declaration
+    // order, so every charged payload and endpoint queue is destroyed before
+    // rollback can make that capacity available again.
+    ledger: Option<ProvisionalLedgerPermit<'engine>>,
+}
+
+impl<A: DecoderAdapter> fmt::Debug for PreparedAdmission<'_, A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedAdmission")
+            .field("offered_count", &self.offered_count)
+            .field("publication", &"<unpublished>")
+            .finish()
+    }
+}
+
+impl<A: DecoderAdapter> PreparedAdmission<'_, A> {
+    /// Publishes all accepted requests at one monotonic release boundary.
+    ///
+    /// Absolute deadlines expire inclusively; release-relative deadlines are
+    /// resolved as `release_ns + offset` with checked arithmetic. Every offered
+    /// deadline is checked, including the capacity-rejected suffix. Timestamp
+    /// and deadline failures happen before mutation. After that boundary the
+    /// method allocates nothing, executes no model work, and has no error path;
+    /// transaction scratch is reclaimed after publication.
+    pub fn commit_prepared_batch(mut self, release_ns: u64) -> SchedulerResult<BatchAdmission> {
+        if release_ns < *self.monotonic_ns {
+            return Err(SchedulerError::invalid_request(
+                "release_ns",
+                "cannot move backwards",
+            ));
+        }
+        for deadline in self.offered_deadlines.iter().copied() {
+            match deadline {
+                BatchDeadline::None => {}
+                BatchDeadline::Absolute(deadline) => {
+                    if release_ns >= deadline {
+                        return Err(SchedulerError::deadline_exceeded());
+                    }
+                }
+                BatchDeadline::AfterRelease(offset) => {
+                    let deadline = release_ns.checked_add(offset).ok_or_else(|| {
+                        SchedulerError::invalid_request(
+                            "deadline",
+                            "release-relative deadline overflows",
+                        )
+                    })?;
+                    if release_ns >= deadline {
+                        return Err(SchedulerError::deadline_exceeded());
+                    }
+                }
+            }
+        }
+        for request in &mut self.prepared {
+            request.deadline_ns = match request.deadline {
+                BatchDeadline::None => None,
+                BatchDeadline::Absolute(deadline) => {
+                    if release_ns >= deadline {
+                        return Err(SchedulerError::deadline_exceeded());
+                    }
+                    Some(deadline)
+                }
+                BatchDeadline::AfterRelease(offset) => {
+                    let deadline = release_ns.checked_add(offset).ok_or_else(|| {
+                        SchedulerError::invalid_request(
+                            "deadline",
+                            "release-relative deadline overflows",
+                        )
+                    })?;
+                    if release_ns >= deadline {
+                        return Err(SchedulerError::deadline_exceeded());
+                    }
+                    Some(deadline)
+                }
+            };
+        }
+
+        // No fallible call is permitted after this publication boundary.
+        *self.monotonic_ns = release_ns;
+        let mut aggregate = self
+            .ledger
+            .take()
+            .map_or_else(LedgerReservation::empty, ProvisionalLedgerPermit::commit);
+        self.request_ids.commit_prevalidated(&self.prospective_ids);
+        for request in &self.prepared {
+            let issued = self.slots[request.slot_index]
+                .generations
+                .issue_prevalidated(request.generation);
+            debug_assert_eq!(issued, request.generation);
+        }
+        let controls = self.controls.commit();
+        let endpoints = self.endpoints.commit(controls, &self.prospective_ids);
+        debug_assert_eq!(endpoints.len(), self.prepared.len());
+        let first_accepted_id = self.prospective_ids.first().copied();
+        let accepted_count = self.prepared.len();
+
+        for ((request, endpoint), request_id) in self
+            .prepared
+            .into_iter()
+            .zip(endpoints)
+            .zip(self.prospective_ids.iter().copied())
+        {
+            let (base_reservation, remainder) = self.partitions.split_next(aggregate);
+            aggregate = remainder;
+            let (prompt_reservation, retained_reservation) =
+                base_reservation.split_category(LedgerCategory::PromptStorage);
+            let (control, endpoint, receiver) = endpoint.into_parts();
+            let key = request.key;
+            let record = RequestRecord {
+                request_id,
+                key,
+                phase: RequestPhase::Queued,
+                prompt: Some(request.prompt),
+                max_new_tokens: request.max_new_tokens,
+                total_positions: request.total_positions,
+                sampling: request.sampling,
+                deadline_ns: request.deadline_ns,
+                admitted_ns: release_ns,
+                control,
+                state_layout: request.state_layout,
+                state: None,
+                active_plan: request.active_plan,
+                active_reservation: None,
+                prompt_reservation: Some(prompt_reservation),
+                retained_reservation: Some(retained_reservation),
+                committed_positions: 0,
+                emitted_tokens: 0,
+                next_decode_token: None,
+                rng_state: None,
+                adapter_binding: None,
+                endpoint,
+                direct_receiver: Some(receiver),
+            };
+            self.slots[request.slot_index].key = Some(key);
+            self.slots[request.slot_index].record = Some(record);
+            self.queued.push_back(key);
+            debug_assert_eq!(
+                self.free_slots.get(request.free_position),
+                Some(&request.slot_index)
+            );
+            self.free_slots.swap_remove(request.free_position);
+        }
+        debug_assert!(aggregate.is_empty());
+        debug_assert!(self.partitions.is_complete());
+        Ok(BatchAdmission::new(
+            release_ns,
+            self.offered_count,
+            first_accepted_id,
+            accepted_count,
+            self.rejection,
+        ))
+    }
+}
 
 /// Pure, synchronously step-able owner of bounded decoder scheduling state.
 pub struct SchedulerEngine<A: DecoderAdapter> {
@@ -91,6 +313,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 "was validated for different adapter geometry",
             ));
         }
+        let required_batch_scratch = Self::required_batch_admission_reserve_bytes(&config)?;
+        if config.admission_reserve_bytes() < required_batch_scratch {
+            return Err(SchedulerError::resource_exhausted(
+                "batch admission scratch",
+                required_batch_scratch,
+                config.admission_reserve_bytes(),
+            ));
+        }
 
         let category_limits = [config.logical_memory_limit_bytes(); LEDGER_CATEGORY_COUNT];
         let mut ledger = CapacityLedger::new(config.logical_memory_limit_bytes(), category_limits);
@@ -152,6 +382,74 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     #[must_use]
     pub const fn config(&self) -> &SchedulerConfig {
         &self.config
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_slot_generation_for_test(&mut self, slot_index: usize) {
+        assert!(self.free_slots.contains(&slot_index));
+        assert!(self.slots[slot_index].record.is_none());
+        self.slots[slot_index].generations = SlotGenerationIssuer::from_next(0);
+    }
+
+    /// Returns the maximum checked semantic metadata footprint across payload,
+    /// control-permit, and endpoint-permit preparation phases.
+    ///
+    /// This is a logical `requested_count * size_of::<T>()` capacity bound, not
+    /// an allocator-overhead or RSS estimate. Prompt and output buffers are
+    /// covered separately by the provisional request-owned ledger. Engine
+    /// construction rejects a smaller raw `admission_reserve_bytes` value.
+    #[must_use = "the typed batch-admission reserve requirement must be checked"]
+    pub fn required_batch_admission_reserve_bytes(
+        config: &SchedulerConfig,
+    ) -> SchedulerResult<u64> {
+        let maximum_offers = config.command_capacity();
+        let maximum_accepted = maximum_offers
+            .min(config.max_queued_requests())
+            .min(config.max_outstanding_requests());
+        let deadlines = batch_vec_bytes::<BatchDeadline>(maximum_offers);
+        let controls = available_batch_control_bytes(maximum_offers);
+        let partitions = batch_vec_bytes::<ReservationPartition>(maximum_accepted);
+        let identities = batch_vec_bytes::<crate::RequestId>(maximum_accepted);
+        let requests = batch_vec_bytes::<PreparedBatchRequest<A>>(maximum_accepted);
+        let prepared_endpoints = prepared_batch_endpoint_bytes(maximum_accepted);
+        let control_permit = batch_control_permit_bytes(maximum_accepted);
+        let endpoint_permit = batch_endpoint_permit_bytes(maximum_accepted);
+        let payload_phase = checked_batch_scratch_sum(&[
+            batch_vec_bytes::<ValidatedBatchOffer<'static, A>>(maximum_offers),
+            deadlines,
+            controls,
+            batch_vec_bytes::<PreparedSlot>(maximum_offers),
+            partitions,
+            identities,
+            requests,
+            prepared_endpoints,
+        ])?;
+        let control_phase = checked_batch_scratch_sum(&[
+            deadlines,
+            controls,
+            partitions,
+            identities,
+            requests,
+            prepared_endpoints,
+            control_permit,
+        ])?;
+        let endpoint_phase = checked_batch_scratch_sum(&[
+            deadlines,
+            partitions,
+            identities,
+            requests,
+            prepared_endpoints,
+            control_permit,
+            endpoint_permit,
+        ])?;
+        let bytes = payload_phase.max(control_phase).max(endpoint_phase);
+        if bytes > isize::MAX as usize {
+            return Err(SchedulerError::allocation_failure(
+                "batch admission scratch",
+                usize_to_u64(bytes)?,
+            ));
+        }
+        usize_to_u64(bytes)
     }
 
     /// Installs a bounded endpoint semantic probe before the first admission.
@@ -272,6 +570,364 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         ))
     }
 
+    /// Validates every offered description and prepares one unpublished FIFO
+    /// admission prefix for the synchronous engine surface.
+    ///
+    /// The nonempty offer slice is capped by `command_capacity`. Intrinsic
+    /// validation covers the complete slice before resource pressure selects
+    /// a prefix, so a malformed rejected suffix cannot be hidden. The first
+    /// pressure point rejects every remaining offer with the same bounded
+    /// error. Preparation assigns no request identity and publishes no slot
+    /// generation, endpoint, control, queue entry, or runnable state. The
+    /// Tokio actor command API remains a separate single-request ingress.
+    pub fn prepare_submit_batch<'engine>(
+        &'engine mut self,
+        offers: &[BatchRequestSpec<'_>],
+    ) -> SchedulerResult<PreparedAdmission<'engine, A>> {
+        self.ensure_open()?;
+        if offers.is_empty() {
+            return Err(SchedulerError::invalid_request(
+                "batch offers",
+                "must be nonempty",
+            ));
+        }
+        if offers.len() > self.config.command_capacity() {
+            return Err(SchedulerError::invalid_request(
+                "batch offers",
+                "exceeds the configured direct-ingress ceiling",
+            ));
+        }
+
+        // Description validation is deliberately complete before pressure is
+        // considered, so a rejected suffix cannot hide a malformed offer.
+        let mut validated = Vec::new();
+        try_reserve_vec(
+            &mut validated,
+            offers.len(),
+            "validated batch admission offers",
+        )?;
+        for offer in offers.iter().copied() {
+            validated.push(self.validate_batch_offer(offer)?);
+        }
+        let mut offered_deadlines = Vec::new();
+        try_reserve_vec(
+            &mut offered_deadlines,
+            offers.len(),
+            "validated batch admission deadlines",
+        )?;
+        offered_deadlines.extend(validated.iter().map(|offer| offer.deadline));
+
+        let controls = self
+            .controls
+            .as_ref()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
+            .prepare_available(offers.len())?;
+
+        let mut slot_candidates = Vec::new();
+        try_reserve_vec(
+            &mut slot_candidates,
+            offers.len(),
+            "prepared batch request slots",
+        )?;
+        let mut exhausted_slot_pressure = None;
+        for (free_position, slot_index) in self.free_slots.iter().copied().enumerate().rev() {
+            if slot_candidates.len() == offers.len() {
+                break;
+            }
+            match self.slots[slot_index].generations.peek() {
+                Ok(generation) => slot_candidates.push(PreparedSlot {
+                    slot_index,
+                    free_position,
+                    generation,
+                    key: SlotKey::new(slot_index, generation),
+                }),
+                Err(error) => {
+                    if exhausted_slot_pressure.is_none() {
+                        exhausted_slot_pressure =
+                            Some(ResourcePressure::from_error(map_identity_error(error))?);
+                    }
+                }
+            }
+        }
+
+        let mut aggregate_plan = aggregate_admission_base_plans(&[])?;
+        let mut accepted_count = 0_usize;
+        let mut pressure = None;
+        for offer in &validated {
+            let queued_after = self
+                .queued
+                .len()
+                .checked_add(accepted_count)
+                .and_then(|queued| queued.checked_add(1))
+                .ok_or_else(|| SchedulerError::internal("queued request count overflows"))?;
+            if queued_after > self.config.max_queued_requests() {
+                pressure = Some(ResourcePressure::new(
+                    "queued request count",
+                    usize_to_u64(queued_after)?,
+                    usize_to_u64(self.config.max_queued_requests())?,
+                ));
+                break;
+            }
+            if accepted_count >= slot_candidates.len() {
+                pressure = Some(if let Some(pressure) = exhausted_slot_pressure {
+                    pressure
+                } else {
+                    let limit = usize_to_u64(self.slots.len())?;
+                    ResourcePressure::new("request slot count", limit, limit)
+                });
+                break;
+            }
+            if let Err(error) = self.request_ids.ensure_available(accepted_count + 1) {
+                pressure = Some(ResourcePressure::from_error(map_identity_error(error))?);
+                break;
+            }
+
+            let candidate_aggregate =
+                aggregate_admission_base_plans(&[aggregate_plan, offer.admission_plan])?;
+            match self.ledger.can_acquire(candidate_aggregate.as_slice()) {
+                Ok(()) => {}
+                Err(error) if error.is_resource_exhausted() => {
+                    pressure = Some(ResourcePressure::from_error(map_ledger_error(error))?);
+                    break;
+                }
+                Err(error) => return Err(map_ledger_error(error)),
+            }
+            if accepted_count >= controls.len() {
+                let control_pressure = controls.pressure().ok_or_else(|| {
+                    SchedulerError::internal("prepared control capacity is inconsistent")
+                })?;
+                pressure = Some(ResourcePressure::from_error(control_pressure.error())?);
+                break;
+            }
+            aggregate_plan = candidate_aggregate;
+            accepted_count += 1;
+        }
+
+        let rejection = pressure.map(ResourcePressure::error);
+        debug_assert_eq!(rejection.is_some(), accepted_count != offers.len());
+
+        slot_candidates.truncate(accepted_count);
+
+        let mut partition_descriptors = Vec::new();
+        try_reserve_vec(
+            &mut partition_descriptors,
+            accepted_count,
+            "batch ledger reservation partitions",
+        )?;
+        for offer in validated.iter().take(accepted_count) {
+            partition_descriptors.push(
+                ReservationPartition::from_charges(offer.admission_plan.as_slice())
+                    .map_err(map_ledger_error)?,
+            );
+        }
+
+        let mut prospective_ids = Vec::new();
+        try_reserve_vec(
+            &mut prospective_ids,
+            accepted_count,
+            "prospective batch request identities",
+        )?;
+        self.request_ids
+            .preview_into(accepted_count, &mut prospective_ids)
+            .map_err(map_identity_error)?;
+
+        let mut prepared_request_storage = Vec::new();
+        try_reserve_vec(
+            &mut prepared_request_storage,
+            accepted_count,
+            "prepared batch request records",
+        )?;
+        let mut prepared_endpoint_storage = Vec::<PreparedEndpointBinding>::new();
+        try_reserve_vec(
+            &mut prepared_endpoint_storage,
+            accepted_count,
+            "prepared batch endpoint offers",
+        )?;
+        let output_capacity = self.config.output_capacity_per_request();
+        let SchedulerEngine {
+            ledger,
+            slots,
+            free_slots,
+            controls: control_registry,
+            endpoints: endpoint_registry,
+            queued,
+            request_ids,
+            monotonic_ns,
+            ..
+        } = self;
+
+        let ledger_permit = if accepted_count == 0 {
+            None
+        } else {
+            Some(
+                ledger
+                    .acquire_provisional_permit(aggregate_plan.as_slice())
+                    .map_err(map_ledger_error)?,
+            )
+        };
+        let partitions = match &ledger_permit {
+            Some(permit) => permit
+                .prove_exact_partitions(partition_descriptors)
+                .map_err(map_ledger_error)?,
+            None => ExactReservationPartitions::empty(),
+        };
+
+        // These shadow bindings are deliberately declared after the permit.
+        // On every preparation error, Rust drops their charged payloads and
+        // endpoint queues before rolling the provisional ledger charge back.
+        let mut prepared_requests = prepared_request_storage;
+        let mut prepared_endpoints = prepared_endpoint_storage;
+
+        let endpoints = endpoint_registry
+            .as_ref()
+            .ok_or_else(|| SchedulerError::internal("request endpoints are unavailable"))?;
+        for (ordinal, (offer, slot)) in validated
+            .into_iter()
+            .take(accepted_count)
+            .zip(slot_candidates)
+            .enumerate()
+        {
+            batch_allocation_checkpoint()?;
+            let prompt = Self::try_allocate_request_payload(offer.request.prompt())?;
+            prepared_endpoints.push(endpoints.prepare_batch_binding(
+                output_capacity,
+                slot.key,
+                ordinal,
+                slot.free_position,
+            )?);
+            prepared_requests.push(PreparedBatchRequest {
+                slot_index: slot.slot_index,
+                free_position: slot.free_position,
+                generation: slot.generation,
+                key: slot.key,
+                prompt,
+                max_new_tokens: offer.request.max_new_tokens(),
+                total_positions: offer.total_positions,
+                sampling: offer.request.sampling(),
+                deadline: offer.deadline,
+                deadline_ns: None,
+                state_layout: offer.state_layout,
+                active_plan: offer.active_plan,
+            });
+        }
+
+        let control_registry = control_registry
+            .as_mut()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
+        let controls = control_registry.begin_bind_batch(controls.into_prefix(accepted_count))?;
+        let endpoint_registry = endpoint_registry
+            .as_mut()
+            .ok_or_else(|| SchedulerError::internal("request endpoints are unavailable"))?;
+        let endpoints = endpoint_registry.begin_bind_batch(prepared_endpoints)?;
+
+        Ok(PreparedAdmission {
+            slots,
+            free_slots,
+            controls,
+            endpoints,
+            queued,
+            request_ids,
+            monotonic_ns,
+            partitions,
+            prepared: prepared_requests,
+            prospective_ids,
+            rejection,
+            offered_deadlines,
+            offered_count: offers.len(),
+            ledger: ledger_permit,
+        })
+    }
+
+    fn validate_batch_offer<'request>(
+        &self,
+        offer: BatchRequestSpec<'request>,
+    ) -> SchedulerResult<ValidatedBatchOffer<'request, A>> {
+        let adapter = self
+            .adapter
+            .as_ref()
+            .ok_or_else(SchedulerError::scheduler_closed)?;
+        let request = offer.request();
+        let prompt = request.prompt();
+        if prompt.is_empty() {
+            return Err(SchedulerError::invalid_request(
+                "prompt",
+                "must be nonempty",
+            ));
+        }
+        if prompt.len() > self.config.max_prompt_tokens() {
+            return Err(SchedulerError::invalid_request(
+                "prompt",
+                "exceeds the configured token ceiling",
+            ));
+        }
+        if request.max_new_tokens() > self.config.max_new_tokens() {
+            return Err(SchedulerError::invalid_request(
+                "max_new_tokens",
+                "exceeds the configured ceiling",
+            ));
+        }
+        if prompt.iter().any(|token| {
+            usize::try_from(*token).map_or(true, |token| token >= self.config.vocabulary_size())
+        }) {
+            return Err(SchedulerError::invalid_request(
+                "prompt",
+                "contains a token outside the adapter vocabulary",
+            ));
+        }
+        request
+            .sampling()
+            .validate(self.config.vocabulary_size())
+            .map_err(|source| SchedulerError::sampling("validating request policy", source))?;
+        match offer.deadline() {
+            BatchDeadline::Absolute(deadline) if self.monotonic_ns >= deadline => {
+                return Err(SchedulerError::deadline_exceeded());
+            }
+            BatchDeadline::AfterRelease(0) => {
+                return Err(SchedulerError::invalid_request(
+                    "deadline",
+                    "release-relative deadline must be nonzero",
+                ));
+            }
+            BatchDeadline::None | BatchDeadline::Absolute(_) | BatchDeadline::AfterRelease(_) => {}
+        }
+
+        let total_positions = prompt
+            .len()
+            .checked_add(request.max_new_tokens().saturating_sub(1))
+            .ok_or_else(|| {
+                SchedulerError::invalid_request(
+                    "request length",
+                    "prompt plus generation positions overflow",
+                )
+            })?;
+        if total_positions > self.config.max_context_tokens() {
+            return Err(SchedulerError::invalid_request(
+                "request length",
+                "exceeds the configured context ceiling",
+            ));
+        }
+        let state_layout = adapter
+            .state_layout(total_positions, self.config.state_page_tokens())
+            .map_err(|source| {
+                SchedulerError::adapter_with_category(
+                    "validating request state layout",
+                    ErrorCategory::InvalidRequest,
+                    source,
+                )
+            })?;
+        let active_plan = active_plan(&self.config, state_layout)?;
+        let admission_plan = admission_base_plan(&self.config, prompt.len())?;
+        ensure_request_lifecycle_feasible(&self.config, admission_plan, active_plan)?;
+        Ok(ValidatedBatchOffer {
+            request,
+            deadline: offer.deadline(),
+            total_positions,
+            state_layout,
+            active_plan,
+            admission_plan,
+        })
+    }
+
     /// Validates and copies one request atomically before assigning its ID.
     pub fn try_submit(&mut self, request: RequestSpec<'_>) -> SchedulerResult<crate::RequestId> {
         self.try_submit_with(request, |request_id, _, receiver| {
@@ -385,13 +1041,25 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 usize_to_u64(self.config.max_queued_requests())?,
             ));
         }
+        let mut exhausted_generation = None;
         let free_position = self
             .free_slots
             .iter()
-            .rposition(|index| self.slots[*index].generations.peek().is_ok())
+            .rposition(|index| match self.slots[*index].generations.peek() {
+                Ok(_) => true,
+                Err(error) => {
+                    exhausted_generation = Some(error);
+                    false
+                }
+            })
             .ok_or_else(|| {
-                let limit = u64::try_from(self.slots.len()).unwrap_or(u64::MAX);
-                SchedulerError::resource_exhausted("request slot count", limit, limit)
+                exhausted_generation.map_or_else(
+                    || {
+                        let limit = u64::try_from(self.slots.len()).unwrap_or(u64::MAX);
+                        SchedulerError::resource_exhausted("request slot count", limit, limit)
+                    },
+                    map_identity_error,
+                )
             })?;
         let slot_index = self.free_slots[free_position];
         self.request_ids
@@ -497,6 +1165,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             total_positions,
             sampling: request.sampling(),
             deadline_ns: request.deadline_ns(),
+            admitted_ns: self.monotonic_ns,
             control,
             state_layout,
             state: None,
@@ -552,6 +1221,16 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
 
     pub fn request_phase(&self, id: crate::RequestId) -> SchedulerResult<RequestPhase> {
         Ok(self.record_by_id(id)?.phase)
+    }
+
+    /// Returns the exact engine admission boundary recorded for this request.
+    pub fn admitted_ns(&self, id: crate::RequestId) -> SchedulerResult<u64> {
+        Ok(self.record_by_id(id)?.admitted_ns)
+    }
+
+    /// Returns the resolved absolute deadline retained for this request.
+    pub fn deadline_ns(&self, id: crate::RequestId) -> SchedulerResult<Option<u64>> {
+        Ok(self.record_by_id(id)?.deadline_ns)
     }
 
     pub fn snapshot(&self) -> EngineSnapshot {
@@ -2005,6 +2684,70 @@ impl ActorAdmission {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ResourcePressure {
+    resource: &'static str,
+    required: u64,
+    limit: u64,
+}
+
+impl ResourcePressure {
+    const fn new(resource: &'static str, required: u64, limit: u64) -> Self {
+        Self {
+            resource,
+            required,
+            limit,
+        }
+    }
+
+    fn from_error(error: SchedulerError) -> SchedulerResult<Self> {
+        match error {
+            SchedulerError::ResourceExhausted {
+                resource,
+                required,
+                limit,
+            } => Ok(Self::new(resource, required, limit)),
+            error => Err(error),
+        }
+    }
+
+    const fn error(self) -> SchedulerError {
+        SchedulerError::resource_exhausted(self.resource, self.required, self.limit)
+    }
+}
+
+struct ValidatedBatchOffer<'request, A: DecoderAdapter> {
+    request: RequestSpec<'request>,
+    deadline: BatchDeadline,
+    total_positions: usize,
+    state_layout: A::StateLayout,
+    active_plan: ChargePlan<ACTIVE_PLAN_LEN>,
+    admission_plan: ChargePlan<ADMISSION_BASE_PLAN_LEN>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedSlot {
+    slot_index: usize,
+    free_position: usize,
+    generation: SlotGeneration,
+    key: SlotKey,
+}
+
+struct PreparedBatchRequest<A: DecoderAdapter> {
+    slot_index: usize,
+    free_position: usize,
+    generation: SlotGeneration,
+    key: SlotKey,
+    prompt: Vec<u32>,
+    max_new_tokens: usize,
+    total_positions: usize,
+    sampling: runnel_runtime::SamplingPolicy,
+    deadline: BatchDeadline,
+    deadline_ns: Option<u64>,
+    state_layout: A::StateLayout,
+    active_plan: ChargePlan<ACTIVE_PLAN_LEN>,
+}
+
 struct RequestSlot<A: DecoderAdapter> {
     generations: SlotGenerationIssuer,
     key: Option<SlotKey>,
@@ -2030,6 +2773,7 @@ struct RequestRecord<A: DecoderAdapter> {
     total_positions: usize,
     sampling: runnel_runtime::SamplingPolicy,
     deadline_ns: Option<u64>,
+    admitted_ns: u64,
     control: ControlBinding,
     state_layout: A::StateLayout,
     state: Option<A::State>,
@@ -2324,8 +3068,7 @@ fn try_reserve_vec<T>(
     count: usize,
     resource: &'static str,
 ) -> SchedulerResult<()> {
-    let bytes = count
-        .checked_mul(size_of::<T>())
+    let bytes = batch_vec_bytes::<T>(count)
         .ok_or_else(|| SchedulerError::internal("scheduler allocation size overflows"))?;
     if bytes > isize::MAX as usize {
         return Err(SchedulerError::allocation_failure(
@@ -2335,6 +3078,20 @@ fn try_reserve_vec<T>(
     }
     values.try_reserve_exact(count).map_err(|_| {
         SchedulerError::allocation_failure(resource, u64::try_from(bytes).unwrap_or(u64::MAX))
+    })
+}
+
+const fn batch_vec_bytes<T>(count: usize) -> Option<usize> {
+    count.checked_mul(size_of::<T>())
+}
+
+fn checked_batch_scratch_sum(contributions: &[Option<usize>]) -> SchedulerResult<usize> {
+    contributions.iter().try_fold(0_usize, |total, bytes| {
+        total
+            .checked_add(bytes.ok_or_else(|| {
+                SchedulerError::allocation_failure("batch admission scratch", u64::MAX)
+            })?)
+            .ok_or_else(|| SchedulerError::allocation_failure("batch admission scratch", u64::MAX))
     })
 }
 

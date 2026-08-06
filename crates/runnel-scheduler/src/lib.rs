@@ -46,13 +46,14 @@ pub use endpoint::{
     ActorSemanticObservation, ActorSemanticObservationKind, ActorStressRecorder,
     ActorStressRecorderStatus, ActorStressRecording, ActorTryPopKind, ActorTryPopWitness,
 };
-pub use engine::SchedulerEngine;
+pub use engine::{PreparedAdmission, SchedulerEngine};
 pub use error::{ErrorCategory, SchedulerError, SchedulerResult};
 pub use id::RequestId;
 pub use ledger::{
     CategorySnapshot, LEDGER_QUANTUM_BYTES, LedgerCategory, LedgerOwnership, LedgerSnapshot,
 };
 pub use request::{
-    CancelDisposition, EngineSnapshot, OutputEvent, RequestPhase, RequestSpec, ShutdownReport,
+    AcceptedAdmission, BatchAdmission, BatchDeadline, BatchRequestSpec, CancelDisposition,
+    EngineSnapshot, OutputEvent, RejectedAdmission, RequestPhase, RequestSpec, ShutdownReport,
     StepReport, TerminalOutcome, TerminalResult,
 };

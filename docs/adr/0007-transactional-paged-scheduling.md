@@ -521,7 +521,7 @@ The owner/lifetime transitions are closed:
 | trace capacity | shared static partition through shutdown at 128 bytes per bounded slot; draining changes occupancy, not capacity charge |
 | model resident partition | validated static partition present when the scheduler is constructed |
 | page-pool partition | exact configured M2 cache payload capacity when a cache is attached, otherwise zero |
-| admission reserve | shared unavailable headroom through scheduler lifetime |
+| admission reserve | shared semantic headroom through scheduler lifetime; typed construction requires the maximum requested Vec-payload peak across direct batch preparation phases, while allocator overhead and RSS remain separate observations |
 
 Fixed logical metadata charges are 64 bytes per command, actor-control,
 request, output-event, terminal, expert-task, and state-page slot; 128 bytes per
@@ -654,6 +654,24 @@ sequential staging delay. This evidence excludes pre-admission validation and
 Tokio command-delivery latency; both are recorded/tested separately and M6
 measures the complete surface. `P(n)` is the direct-token pattern defined above.
 Normal requests are greedy.
+
+The accepted set is a strict FIFO prefix. Complete-slice intrinsic validation
+precedes pressure selection, and the first pressure error describes the whole
+suffix; smaller later offers cannot bypass it. Commit rechecks absolute and
+release-relative deadlines for every offer, including that suffix, before its
+mutation boundary. Prepared request and endpoint payloads drop before an armed
+aggregate ledger permit rolls back. The compact result stores the first
+accepted ID, accepted count, and one suffix error, then synthesizes exact-size
+iterators without an escaping heap allocation.
+
+Typed engine construction computes the maximum semantic Vec-payload footprint
+across payload preparation, control-permit construction, and endpoint-permit
+construction. It rejects a raw `admission_reserve_bytes` value below that
+checked peak. The formula includes both `A::StateLayout` copies and all
+coexisting control/endpoint transaction buffers, while request-owned prompt and
+output buffers remain under the provisional request reservation. As elsewhere
+in the ledger, this is requested semantic capacity; allocator metadata,
+possible `try_reserve_exact` over-allocation, and RSS are not inferred.
 
 | Cell | Exact workload | Role |
 | --- | --- | --- |

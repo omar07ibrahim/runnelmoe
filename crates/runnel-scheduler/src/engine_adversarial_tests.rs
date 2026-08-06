@@ -15,8 +15,9 @@ use runnel_runtime::{
 use crate::control::ControlBinding;
 use crate::endpoint::TryPop;
 use crate::{
-    CancelDisposition, ErrorCategory, LedgerCategory, LedgerOwnership, RequestPhase, RequestSpec,
-    SchedulerConfig, SchedulerEngine, SchedulerLimits, StepReport, TerminalOutcome,
+    BatchRequestSpec, CancelDisposition, ErrorCategory, LedgerCategory, LedgerOwnership,
+    RequestPhase, RequestSpec, SchedulerConfig, SchedulerEngine, SchedulerError, SchedulerLimits,
+    StepReport, TerminalOutcome,
 };
 
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -892,4 +893,189 @@ fn recycled_engine_slot_rejects_stale_control_without_affecting_its_new_request(
     assert_eq!(terminal.committed_positions(), 1);
     assert_eq!(terminal.emitted_tokens(), 1);
     assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn batch_allocation_failure_after_provisional_charge_rolls_back_every_owner_and_identity() {
+    let gate = Arc::new(CommitGate::passthrough());
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let mut engine = new_engine(gate, apply_count, 2);
+    let before_engine = engine.snapshot();
+    let before_ledger = engine.ledger_snapshot();
+    let prompt = [0_u32; 2];
+    let offers =
+        [BatchRequestSpec::release_relative(&prompt, 1, SamplingPolicy::Greedy, 20_000_000); 2];
+
+    crate::engine::fail_batch_allocation_after_for_test(1);
+    let error = engine
+        .prepare_submit_batch(&offers)
+        .expect_err("second prepared payload allocation is injected to fail");
+    assert!(matches!(
+        error,
+        SchedulerError::AllocationFailure {
+            resource: "prepared batch request payload",
+            ..
+        }
+    ));
+    assert_eq!(engine.snapshot(), before_engine);
+    assert_eq!(engine.ledger_snapshot(), before_ledger);
+    let first = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("failed prepare consumed no request identity");
+    assert_eq!(first.get(), 1);
+}
+
+#[test]
+fn batch_admission_reserve_accepts_exact_fit_and_rejects_one_byte_short() {
+    let probe_adapter = GatedAdapter::new(
+        Arc::new(CommitGate::passthrough()),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let mut limits = SchedulerLimits::tiny();
+    limits.admission_reserve_bytes = 1024 * 1024;
+    let probe_config =
+        SchedulerConfig::new(&probe_adapter, limits).expect("batch scratch probe config");
+    let required =
+        SchedulerEngine::<GatedAdapter>::required_batch_admission_reserve_bytes(&probe_config)
+            .expect("checked batch scratch bound");
+    assert!(required > 1);
+
+    let exact_adapter = GatedAdapter::new(
+        Arc::new(CommitGate::passthrough()),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    limits.admission_reserve_bytes = required;
+    let exact_config =
+        SchedulerConfig::new(&exact_adapter, limits).expect("exact batch scratch config");
+    let _engine =
+        SchedulerEngine::new(exact_adapter, exact_config).expect("exact scratch reserve succeeds");
+
+    let short_adapter = GatedAdapter::new(
+        Arc::new(CommitGate::passthrough()),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    limits.admission_reserve_bytes = required - 1;
+    let short_config =
+        SchedulerConfig::new(&short_adapter, limits).expect("short batch scratch config");
+    let error = SchedulerEngine::new(short_adapter, short_config)
+        .expect_err("one-byte-short scratch reserve must fail before allocation");
+    assert!(matches!(
+        error,
+        SchedulerError::ResourceExhausted {
+            resource: "batch admission scratch",
+            required: observed_required,
+            limit,
+        } if observed_required == required && limit == required - 1
+    ));
+}
+
+#[test]
+fn descending_prevalidated_removals_match_repeated_value_lookup_with_holes() {
+    for length in 1_usize..=10 {
+        let free_slots = (0..length)
+            .map(|position| position.wrapping_mul(7).wrapping_add(3))
+            .collect::<Vec<_>>();
+        for selected_mask in 0_usize..(1_usize << length) {
+            let selections = (0..length)
+                .rev()
+                .filter(|position| selected_mask & (1 << position) != 0)
+                .map(|position| (position, free_slots[position]))
+                .collect::<Vec<_>>();
+
+            let mut lookup_baseline = free_slots.clone();
+            for (_, selected) in &selections {
+                let position = lookup_baseline
+                    .iter()
+                    .rposition(|candidate| candidate == selected)
+                    .expect("selected free-list value");
+                lookup_baseline.swap_remove(position);
+            }
+
+            let mut prevalidated = free_slots.clone();
+            for (position, selected) in &selections {
+                assert_eq!(prevalidated.get(*position), Some(selected));
+                prevalidated.swap_remove(*position);
+            }
+            assert_eq!(prevalidated, lookup_baseline);
+        }
+    }
+}
+
+#[test]
+fn batch_and_single_submission_report_identical_slot_pressure() {
+    fn single_slot_engine() -> SchedulerEngine<GatedAdapter> {
+        let adapter = GatedAdapter::new(
+            Arc::new(CommitGate::passthrough()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut limits = SchedulerLimits::tiny();
+        limits.max_outstanding_requests = 1;
+        limits.max_active_requests = 1;
+        limits.max_queued_requests = 1;
+        limits.max_retained_terminal_results = 1;
+        limits.batch_width = 1;
+        let config = SchedulerConfig::new(&adapter, limits).expect("single-slot config");
+        SchedulerEngine::new(adapter, config).expect("single-slot engine")
+    }
+
+    let request = RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None);
+    let mut ordinary_exhausted = single_slot_engine();
+    ordinary_exhausted.exhaust_slot_generation_for_test(0);
+    let ordinary_generation_error = ordinary_exhausted
+        .try_submit(request)
+        .expect_err("ordinary exhausted generation");
+    let mut batch_exhausted = single_slot_engine();
+    batch_exhausted.exhaust_slot_generation_for_test(0);
+    let generation_result = batch_exhausted
+        .prepare_submit_batch(&[BatchRequestSpec::absolute(request)])
+        .expect("prepare generation-pressure batch")
+        .commit_prepared_batch(0)
+        .expect("commit generation-pressure batch");
+    let batch_generation_error = generation_result
+        .rejected()
+        .next()
+        .expect("generation-pressure rejection");
+    assert_eq!(generation_result.accepted_count(), 0);
+    assert_eq!(
+        format!("{ordinary_generation_error:?}"),
+        format!("{:?}", batch_generation_error.error())
+    );
+
+    let active_request = RequestSpec::new(&[0], 2, SamplingPolicy::Greedy, None);
+    let mut ordinary_occupied = single_slot_engine();
+    ordinary_occupied
+        .try_submit(active_request)
+        .expect("ordinary first request");
+    ordinary_occupied.step().expect("ordinary first step");
+    let ordinary_slot_error = ordinary_occupied
+        .try_submit(request)
+        .expect_err("ordinary occupied slot");
+
+    let mut batch_occupied = single_slot_engine();
+    batch_occupied
+        .try_submit(active_request)
+        .expect("batch first request");
+    batch_occupied.step().expect("batch first step");
+    let slot_result = batch_occupied
+        .prepare_submit_batch(&[BatchRequestSpec::absolute(request)])
+        .expect("prepare occupied-slot batch")
+        .commit_prepared_batch(0)
+        .expect("commit occupied-slot batch");
+    let batch_slot_error = slot_result
+        .rejected()
+        .next()
+        .expect("occupied-slot rejection");
+    assert_eq!(slot_result.accepted_count(), 0);
+    assert_eq!(
+        format!("{ordinary_slot_error:?}"),
+        format!("{:?}", batch_slot_error.error())
+    );
+    assert!(matches!(
+        ordinary_slot_error,
+        SchedulerError::ResourceExhausted {
+            resource: "request slot count",
+            required: 1,
+            limit: 1,
+        }
+    ));
 }

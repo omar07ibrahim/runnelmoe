@@ -247,6 +247,30 @@ independent reviews, host caveats, and claim boundaries are in the
 figures. Preserve the implementation commit with a merge commit; squashing or
 rebasing would break historical harness custody.
 
+## M5 direct atomic batch-admission verification
+
+The direct synchronous engine batch API is not the Tokio actor command path.
+Its tests cover complete-slice validation, FIFO-prefix pressure parity,
+release-relative and absolute deadline rollback, exact ID/generation rollback,
+semantic reserve exact-fit/one-byte-short construction, holey free-list
+equivalence, stale-control races, inert permit drop, endpoint order, full
+completion/cancellation/reap, and slot/control/endpoint reuse. No command below
+downloads weights or records timing evidence:
+
+```console
+cargo fmt --all -- --check
+cargo clippy -p runnel-scheduler --all-targets --all-features --locked --offline -- -D warnings
+cargo test -p runnel-scheduler --all-targets --all-features --locked --offline
+cargo clippy -p runnel-scheduler --all-targets --no-default-features --locked --offline -- -D warnings
+cargo test -p runnel-scheduler --all-targets --no-default-features --locked --offline
+RUSTDOCFLAGS="-D warnings" cargo doc -p runnel-scheduler --no-deps --locked --offline
+```
+
+`SchedulerEngine::<A>::required_batch_admission_reserve_bytes` reports the
+adapter-typed semantic Vec-payload requirement. It intentionally excludes
+allocator metadata and over-allocation; whole-process RSS remains an observed
+quantity. A smaller raw reserve is rejected before shared engine allocation.
+
 ## M5 genuine actor-race verification
 
 The feature-gated scheduler race runs exactly 32 fresh two-producer

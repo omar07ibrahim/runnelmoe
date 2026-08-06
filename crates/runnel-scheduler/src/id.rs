@@ -21,6 +21,17 @@ impl RequestId {
         self.0.get()
     }
 
+    pub(crate) const fn first() -> Self {
+        Self(NonZeroU64::MIN)
+    }
+
+    pub(crate) fn prevalidated_offset(self, offset: usize) -> Self {
+        let offset = u64::try_from(offset).unwrap_or(u64::MAX);
+        debug_assert!(self.get().checked_add(offset).is_some());
+        let value = self.get().saturating_add(offset);
+        NonZeroU64::new(value).map_or(self, Self)
+    }
+
     #[cfg(test)]
     pub(crate) fn try_from_raw_for_test(value: u64) -> Result<Self, &'static str> {
         NonZeroU64::new(value)
@@ -112,6 +123,12 @@ impl NonZeroIssuer {
             None => Err(IdentityExhausted::new(kind)),
         }
     }
+
+    fn issue_prevalidated(&mut self, expected: NonZeroU64) -> NonZeroU64 {
+        debug_assert_eq!(self.next, Some(expected));
+        self.next = expected.get().checked_add(1).and_then(NonZeroU64::new);
+        expected
+    }
 }
 
 macro_rules! checked_identity {
@@ -164,6 +181,11 @@ macro_rules! checked_identity {
             pub(crate) fn ensure_available(&self, count: usize) -> Result<(), IdentityExhausted> {
                 self.0.ensure_available(count, IdentityKind::$kind)
             }
+
+            #[allow(dead_code, reason = "used by prevalidated batch-capable issuer kinds")]
+            pub(crate) fn issue_prevalidated(&mut self, expected: $identity) -> $identity {
+                $identity(self.0.issue_prevalidated(expected.0))
+            }
         }
     };
 }
@@ -196,6 +218,46 @@ impl RequestIdIssuer {
 
     pub(crate) fn ensure_available(&self, count: usize) -> Result<(), IdentityExhausted> {
         self.0.ensure_available(count, IdentityKind::Request)
+    }
+
+    /// Writes a contiguous prospective block without advancing the issuer.
+    /// The caller must reserve `output` capacity before invoking this helper.
+    pub(crate) fn preview_into(
+        &self,
+        count: usize,
+        output: &mut Vec<RequestId>,
+    ) -> Result<(), IdentityExhausted> {
+        self.ensure_available(count)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let first = self.0.peek(IdentityKind::Request)?.get();
+        for offset in 0..count {
+            let raw = first
+                + u64::try_from(offset)
+                    .map_err(|_| IdentityExhausted::new(IdentityKind::Request))?;
+            let Some(raw) = NonZeroU64::new(raw) else {
+                return Err(IdentityExhausted::new(IdentityKind::Request));
+            };
+            output.push(RequestId(raw));
+        }
+        Ok(())
+    }
+
+    /// Advances through a previously previewed contiguous block without an
+    /// allocation or error path.
+    pub(crate) fn commit_prevalidated(&mut self, identities: &[RequestId]) {
+        if identities.is_empty() {
+            return;
+        }
+        debug_assert_eq!(self.0.next, Some(identities[0].0));
+        debug_assert!(
+            identities
+                .windows(2)
+                .all(|pair| pair[0].get().checked_add(1) == Some(pair[1].get()))
+        );
+        let last = identities[identities.len() - 1].0;
+        self.0.next = last.get().checked_add(1).and_then(NonZeroU64::new);
     }
 }
 

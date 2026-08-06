@@ -31,6 +31,18 @@ deadline wakeups, and cooperative shutdown. The full preregistered
 stress/differential matrix and performance evidence are not complete, so this
 is not an M5 closure or performance claim.
 
+The direct synchronous engine also has a two-phase atomic batch-admission
+surface. It validates every offer before pressure selection, reserves one
+strict FIFO prefix without publishing identities, and commits all accepted
+requests at one caller-supplied monotonic release timestamp. Release-relative
+deadlines are resolved from that exact boundary; rejected suffixes receive no
+IDs and cannot hide malformed or expired offers. Prepared drop restores ledger
+usage and peaks, lifecycle slots, and identities, while commit publishes only
+queued records and performs no model work. The compact result allocates no
+escaping vectors, and engine construction checks the adapter-typed semantic
+metadata peak against `admission_reserve_bytes`. This surface is not yet wired
+through the actor as a batch command and carries no latency claim.
+
 The runtime's central contract is simple: a configured
 resident-memory ceiling
 must remain enforceable while expert tensors move between an immutable

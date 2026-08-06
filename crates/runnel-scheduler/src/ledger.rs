@@ -171,6 +171,9 @@ pub enum LedgerError {
 
     #[error("ledger mutation identity space is exhausted")]
     MutationIdentityExhausted,
+
+    #[error("ledger reservation partitions do not exactly cover the aggregate")]
+    ReservationPartitionMismatch,
 }
 
 impl LedgerError {
@@ -311,6 +314,15 @@ pub struct LedgerReservation {
 }
 
 impl LedgerReservation {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            bytes: [0; LEDGER_CATEGORY_COUNT],
+            request_bytes: 0,
+            shared_bytes: 0,
+            total_bytes: 0,
+        }
+    }
+
     #[must_use]
     #[cfg(test)]
     pub const fn bytes(&self, category: LedgerCategory) -> u64 {
@@ -409,6 +421,99 @@ impl LedgerReservation {
         };
         (selected_reservation, remainder_reservation)
     }
+
+    /// Splits an already validated exact partition without allocation or a
+    /// second ledger mutation. Batch admission constructs every partition
+    /// before its publication boundary and proves that their sum is this
+    /// reservation.
+    fn split_prevalidated(
+        self,
+        selected: ReservationPartition,
+    ) -> (LedgerReservation, LedgerReservation) {
+        debug_assert!(
+            LedgerCategory::ALL
+                .iter()
+                .all(|category| selected.bytes[category.index()] <= self.bytes[category.index()])
+        );
+        debug_assert!(selected.request_bytes <= self.request_bytes);
+        debug_assert!(selected.shared_bytes <= self.shared_bytes);
+        debug_assert!(selected.total_bytes <= self.total_bytes);
+
+        let remainder_bytes =
+            std::array::from_fn(|index| self.bytes[index] - selected.bytes[index]);
+        let selected_reservation = LedgerReservation {
+            bytes: selected.bytes,
+            request_bytes: selected.request_bytes,
+            shared_bytes: selected.shared_bytes,
+            total_bytes: selected.total_bytes,
+        };
+        let remainder_reservation = LedgerReservation {
+            bytes: remainder_bytes,
+            request_bytes: self.request_bytes - selected.request_bytes,
+            shared_bytes: self.shared_bytes - selected.shared_bytes,
+            total_bytes: self.total_bytes - selected.total_bytes,
+        };
+        (selected_reservation, remainder_reservation)
+    }
+
+    #[must_use]
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.total_bytes == 0
+    }
+}
+
+/// Fixed-size descriptor for one prevalidated partition of a committed
+/// reservation. It carries no ownership until `split_prevalidated` consumes
+/// the aggregate reservation at publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReservationPartition {
+    bytes: [u64; LEDGER_CATEGORY_COUNT],
+    request_bytes: u64,
+    shared_bytes: u64,
+    total_bytes: u64,
+}
+
+/// Proof-carrying ordered partitions whose checked sum exactly equals one
+/// aggregate provisional reservation.
+pub(crate) struct ExactReservationPartitions {
+    partitions: Vec<ReservationPartition>,
+    next: usize,
+}
+
+impl ExactReservationPartitions {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            partitions: Vec::new(),
+            next: 0,
+        }
+    }
+
+    pub(crate) fn split_next(
+        &mut self,
+        aggregate: LedgerReservation,
+    ) -> (LedgerReservation, LedgerReservation) {
+        debug_assert!(self.next < self.partitions.len());
+        let partition = self.partitions[self.next];
+        self.next += 1;
+        aggregate.split_prevalidated(partition)
+    }
+
+    #[must_use]
+    pub(crate) fn is_complete(&self) -> bool {
+        self.next == self.partitions.len()
+    }
+}
+
+impl ReservationPartition {
+    pub(crate) fn from_charges(charges: &[LedgerCharge]) -> Result<Self, LedgerError> {
+        let plan = aggregate_plan(charges)?;
+        Ok(Self {
+            bytes: plan.bytes,
+            request_bytes: plan.request,
+            shared_bytes: plan.shared,
+            total_bytes: plan.total,
+        })
+    }
 }
 
 /// A just-acquired charge which may still be rolled back after allocation
@@ -422,6 +527,95 @@ pub struct ProvisionalAcquisition {
     previous_request_peak: u64,
     previous_shared_peak: u64,
     previous_total_peak: u64,
+}
+
+/// An exclusively borrowed provisional acquisition with exact RAII rollback.
+///
+/// Both the acquire and inverse transition are validated before the acquire
+/// is applied. The exclusive ledger borrow prevents an intervening mutation,
+/// so dropping an armed permit restores current usage and every prior peak
+/// without an allocation or error path.
+#[must_use = "provisional ledger permits must be committed or dropped"]
+pub(crate) struct ProvisionalLedgerPermit<'ledger> {
+    ledger: &'ledger mut CapacityLedger,
+    reservation: LedgerReservation,
+    armed: bool,
+    rollback: Projection,
+    rollback_mutation: u64,
+    previous_category_peaks: [u64; LEDGER_CATEGORY_COUNT],
+    previous_request_peak: u64,
+    previous_shared_peak: u64,
+    previous_total_peak: u64,
+}
+
+impl fmt::Debug for ProvisionalLedgerPermit<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProvisionalLedgerPermit")
+            .field("armed", &self.armed)
+            .finish()
+    }
+}
+
+impl ProvisionalLedgerPermit<'_> {
+    /// Makes the provisional bytes durable. This changes neither usage nor
+    /// high-water accounting and cannot fail while the exclusive borrow is
+    /// retained.
+    pub(crate) fn commit(mut self) -> LedgerReservation {
+        self.armed = false;
+        std::mem::replace(&mut self.reservation, LedgerReservation::empty())
+    }
+
+    /// Consumes checked partition descriptors only after proving their sum is
+    /// exactly the held aggregate reservation.
+    pub(crate) fn prove_exact_partitions(
+        &self,
+        partitions: Vec<ReservationPartition>,
+    ) -> Result<ExactReservationPartitions, LedgerError> {
+        let mut bytes = [0_u64; LEDGER_CATEGORY_COUNT];
+        for partition in &partitions {
+            for category in LedgerCategory::ALL {
+                let index = category.index();
+                bytes[index] = bytes[index].checked_add(partition.bytes[index]).ok_or(
+                    LedgerError::ArithmeticOverflow {
+                        scope: LedgerScope::Category(category),
+                    },
+                )?;
+            }
+        }
+        let summary = summarize_bytes(bytes)?;
+        if summary.bytes != self.reservation.bytes
+            || summary.request != self.reservation.request_bytes
+            || summary.shared != self.reservation.shared_bytes
+            || summary.total != self.reservation.total_bytes
+        {
+            return Err(LedgerError::ReservationPartitionMismatch);
+        }
+        Ok(ExactReservationPartitions {
+            partitions,
+            next: 0,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> LedgerSnapshot {
+        self.ledger.snapshot()
+    }
+}
+
+impl Drop for ProvisionalLedgerPermit<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        self.ledger
+            .apply_release(&self.rollback, self.rollback_mutation);
+        self.ledger.peaks = self.previous_category_peaks;
+        self.ledger.request_peak = self.previous_request_peak;
+        self.ledger.shared_peak = self.previous_shared_peak;
+        self.ledger.total_peak = self.previous_total_peak;
+    }
 }
 
 /// An exclusively borrowed, prevalidated ledger release.
@@ -541,6 +735,41 @@ impl CapacityLedger {
         };
         self.apply_acquire(&projection, mutation);
         Ok(provisional)
+    }
+
+    /// Acquires one aggregate plan and holds an exact, infallible rollback
+    /// transition behind an exclusive borrow.
+    pub(crate) fn acquire_provisional_permit(
+        &mut self,
+        charges: &[LedgerCharge],
+    ) -> Result<ProvisionalLedgerPermit<'_>, LedgerError> {
+        let plan = aggregate_plan(charges)?;
+        let projection = self.project_state(&plan)?;
+        let mutation = self
+            .mutation
+            .checked_add(1)
+            .filter(|mutation| mutation.checked_add(1).is_some())
+            .ok_or(LedgerError::MutationIdentityExhausted)?;
+        let rollback_mutation = mutation + 1;
+        let rollback = Projection {
+            categories: self.used,
+            request: self.request_used,
+            shared: self.shared_used,
+            total: self.total_used,
+        };
+        let permit = ProvisionalLedgerPermit {
+            reservation: reservation_from_plan(&plan),
+            armed: true,
+            rollback,
+            rollback_mutation,
+            previous_category_peaks: self.peaks,
+            previous_request_peak: self.request_peak,
+            previous_shared_peak: self.shared_peak,
+            previous_total_peak: self.total_peak,
+            ledger: self,
+        };
+        permit.ledger.apply_acquire(&projection, mutation);
+        Ok(permit)
     }
 
     /// Makes a provisional charge durable after its physical allocation is
@@ -862,7 +1091,7 @@ fn round_up(bytes: u64) -> Option<u64> {
 mod tests {
     use super::{
         CapacityLedger, LEDGER_CATEGORY_COUNT, LEDGER_QUANTUM_BYTES, LedgerCategory, LedgerCharge,
-        LedgerError, LedgerOwnership, LedgerReservation, LedgerScope,
+        LedgerError, LedgerOwnership, LedgerReservation, LedgerScope, ReservationPartition,
     };
 
     const MAX_ALIGNED: u64 = u64::MAX - (LEDGER_QUANTUM_BYTES - 1);
@@ -1128,6 +1357,58 @@ mod tests {
             snapshot.category(LedgerCategory::SamplingScratch).peak(),
             128
         );
+    }
+
+    #[test]
+    fn exclusive_provisional_permit_drop_restores_every_current_and_peak_value() {
+        let mut ledger = CapacityLedger::new(512, unlimited_categories());
+        let retained = ledger
+            .acquire(&[charge(LedgerCategory::PromptStorage, 64)])
+            .unwrap();
+        let before = ledger.snapshot();
+        {
+            let permit = ledger
+                .acquire_provisional_permit(&[
+                    charge(LedgerCategory::RequestRecord, 128),
+                    charge(LedgerCategory::Output, 64),
+                ])
+                .unwrap();
+            assert_eq!(permit.snapshot().total_used(), before.total_used() + 192);
+            assert_eq!(permit.snapshot().total_peak(), before.total_used() + 192);
+        }
+        assert_eq!(ledger.snapshot(), before);
+        ledger.release(retained).unwrap();
+    }
+
+    #[test]
+    fn exact_partition_proof_conserves_one_aggregate_reservation() {
+        let mut ledger = CapacityLedger::new(1024, unlimited_categories());
+        let first = [
+            charge(LedgerCategory::PromptStorage, 64),
+            charge(LedgerCategory::Output, 128),
+        ];
+        let second = [
+            charge(LedgerCategory::PromptStorage, 128),
+            charge(LedgerCategory::Terminal, 64),
+        ];
+        let aggregate = [first[0], first[1], second[0], second[1]];
+        let permit = ledger.acquire_provisional_permit(&aggregate).unwrap();
+        let mut proof = permit
+            .prove_exact_partitions(vec![
+                ReservationPartition::from_charges(&first).unwrap(),
+                ReservationPartition::from_charges(&second).unwrap(),
+            ])
+            .unwrap();
+        let aggregate = permit.commit();
+        let (first_reservation, remainder) = proof.split_next(aggregate);
+        let (second_reservation, remainder) = proof.split_next(remainder);
+        assert!(proof.is_complete());
+        assert!(remainder.is_empty());
+        assert_eq!(first_reservation.total_bytes(), 192);
+        assert_eq!(second_reservation.total_bytes(), 192);
+        ledger.release(first_reservation).unwrap();
+        ledger.release(second_reservation).unwrap();
+        assert_eq!(ledger.snapshot().total_used(), 0);
     }
 
     #[test]

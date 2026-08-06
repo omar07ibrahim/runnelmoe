@@ -272,6 +272,22 @@ evidence remain incomplete until the rest of M5 lands. Weights remain eagerly
 resident in M5, so live cache-leased expert execution remains an explicit
 system gap.
 
+Direct multi-request ingress is a separate two-phase engine transaction. It
+validates the full nonempty offer slice before resource selection, admits only
+the maximal FIFO prefix, and holds exclusive engine fields plus accepted
+endpoint locks while unpublished. Prompt and output allocations are owned by
+one aggregate provisional request reservation; metadata Vec payloads are
+bounded by the maximum of the payload, control-permit, and endpoint-permit
+phases and checked against the raw admission reserve at typed engine
+construction. This is semantic requested capacity, not allocator overhead or
+RSS. Dropping the guard destroys charged physical payloads before ledger
+rollback. Commit first checks the monotonic release timestamp and every offer's
+deadline, then has no allocation or error path while assigning contiguous IDs,
+publishing generation-bound controls/endpoints and queued records, and stamping
+one `admitted_ns`. A compact first-ID/count/single-error result reconstructs
+accepted and rejected iterators without retaining heap buffers. This API does
+not promote work and is not an actor batch command.
+
 ## Error model
 
 Public operations return stable categories. Internal source chains are retained

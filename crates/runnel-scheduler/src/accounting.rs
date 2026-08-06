@@ -133,6 +133,35 @@ pub(crate) fn admission_base_plan(
     Ok(plan)
 }
 
+/// Checked category-wise sum of accepted admission plans for one provisional
+/// batch ledger transaction.
+pub(crate) fn aggregate_admission_base_plans(
+    plans: &[ChargePlan<ADMISSION_BASE_PLAN_LEN>],
+) -> SchedulerResult<ChargePlan<ADMISSION_BASE_PLAN_LEN>> {
+    let mut totals = [0_u64; ADMISSION_BASE_PLAN_LEN];
+    let categories = [
+        LedgerCategory::PromptStorage,
+        LedgerCategory::RequestRecord,
+        LedgerCategory::RequestSlot,
+        LedgerCategory::Output,
+        LedgerCategory::Terminal,
+    ];
+    for plan in plans {
+        for (index, category) in categories.iter().copied().enumerate() {
+            totals[index] = totals[index]
+                .checked_add(plan.category_bytes(category))
+                .ok_or_else(|| SchedulerError::internal("batch admission ledger plan overflows"))?;
+        }
+    }
+    ChargePlan::new([
+        aligned_charge(LedgerCategory::PromptStorage, totals[0])?,
+        aligned_charge(LedgerCategory::RequestRecord, totals[1])?,
+        aligned_charge(LedgerCategory::RequestSlot, totals[2])?,
+        aligned_charge(LedgerCategory::Output, totals[3])?,
+        aligned_charge(LedgerCategory::Terminal, totals[4])?,
+    ])
+}
+
 /// Produces the state and transaction-buffer reservation acquired atomically
 /// at FIFO promotion. The actual adapter state layout must remain within the
 /// layout envelope authenticated by [`SchedulerConfig`].
@@ -191,6 +220,9 @@ pub(crate) fn map_ledger_error(error: LedgerError) -> SchedulerError {
         }
         LedgerError::MutationIdentityExhausted => {
             SchedulerError::internal("ledger mutation identity space is exhausted")
+        }
+        LedgerError::ReservationPartitionMismatch => {
+            SchedulerError::internal("ledger reservation partitions do not match aggregate")
         }
     }
 }
