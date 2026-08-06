@@ -278,7 +278,10 @@ policy. `with_scheduling_policy` immutably selects the FIFO run-to-completion
 comparison baseline without changing geometry, preallocated wave capacity, or
 logical charges. Focused tests prove exact first-service order, blocked-head
 behavior, non-head cancellation cleanup, atomic common-release admission, and
-greedy/seeded output parity:
+greedy/seeded output parity. Closed-round cursor normalization prevents a
+mid-round arrival from occupying the rollover cursor while a member of the
+closed snapshot survives, including through terminal and cancellation removals
+before the next round opens:
 
 ```console
 cargo test -p runnel-scheduler --lib ring::tests --locked --offline
@@ -291,10 +294,22 @@ cargo test -p runnel-scheduler --test engine \
 cargo test -p runnel-scheduler --test engine \
   fifo_output_blocking_holds_the_head_while_non_head_cancellation_cleans_up \
   --locked --offline -- --exact
+cargo test -p runnel-scheduler --test policy_replay \
+  direct_first_sixteen_trace_replays_frozen_policy_fairness \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test policy_replay \
+  continuous_arrival_1000_has_no_starvation_or_cleanup_service \
+  --locked --offline -- --exact
 ```
 
-These are policy/correctness gates, not performance evidence. The M5 capture
-harness, full service replay workloads, and ledger stream remain outstanding.
+The replay target forces the real tiny-v3 scalar backend. It checks the exact
+candidate and FIFO 16-event prefixes plus integer lag/gap/Jain arithmetic. The
+continuous test uses the frozen 1,000-turn admission and sink schedule, checks
+every request/position/phase event against an independent formula, reconciles a
+final origin read, and proves cancellation cleanup adds no service before both
+request and shared ownership reach zero. These are policy/correctness gates,
+not performance evidence. The timed M5 capture harness, measured service rows,
+and ledger stream remain outstanding.
 
 ## M5 bounded service-trace verification
 

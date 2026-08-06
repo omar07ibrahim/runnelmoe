@@ -48,8 +48,10 @@ metadata peak against `admission_reserve_bytes`. This surface is not yet wired
 through the actor as a batch command and carries no latency claim.
 
 The preregistered scheduling variants are now explicit immutable engine
-policies. `deficit-continuous-expert-coalesce-v1` remains the default and keeps
-the existing retained-round DRR behavior. The comparison-only
+policies. `deficit-continuous-expert-coalesce-v1` remains the default. At
+rollover it starts at the first cyclic survivor of the just-closed membership
+snapshot, if one remains, so a request admitted during that round cannot take
+the rollover cursor. The comparison-only
 `fifo-single-request-run-to-completion-v1` promotes the same bounded active
 FIFO prefix and uses the same preallocated scratch and logical charges, but
 each one-member policy round repeatedly selects the oldest active request
@@ -57,6 +59,10 @@ until removal and never bypasses that head while it is blocked. Tests
 distinguish their first-service order, prove output-blocked head behavior and
 non-head cancellation cleanup, and preserve greedy and seeded per-request
 output parity. No timing result has yet been recorded for either policy.
+The real tiny-v3 scalar integration independently replays the first 16 service
+events and their integer fairness metrics, then runs the preregistered
+1,000-turn continuous-arrival schedule with exact request, position, phase,
+starvation, output, terminal, trace-health, and zero-ledger cleanup checks.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling

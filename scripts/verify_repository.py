@@ -105,6 +105,7 @@ REQUIRED = {
     "crates/runnel-scheduler/tests/actor_script/race/cleanup.rs",
     "crates/runnel-scheduler/tests/actor_script/race/execution.rs",
     "crates/runnel-scheduler/tests/engine.rs",
+    "crates/runnel-scheduler/tests/policy_replay.rs",
     "crates/runnel-sim/Cargo.toml",
     "crates/runnel-sim/README.md",
     "crates/runnel-sim/src/engine.rs",

@@ -261,8 +261,15 @@ or terminal failure removes the member and its reservation, with the cursor
 continuing at the removed member's successor. A recoverable failure before
 commit restores the one reserved credit but cannot select that request twice in
 the same round. When every epoch member has been visited, the round closes and
-the next scan starts at the retained cursor. These rules, rather than a fresh
-request-ID sort per wave, are the independently replayed policy.
+the next scan starts at the first cyclic survivor from that closed membership
+snapshot. A request appended during the round cannot itself occupy the
+rollover cursor while such a survivor remains. After that first due survivor,
+the scan follows ordinary cyclic membership order and need not place every
+survivor before every arrival. The closed-snapshot cursor is re-normalized
+after terminal or cancellation removal until the next round successfully
+opens. If no snapshot member survives, the ordinary physical successor remains
+authoritative. These rules, rather than a fresh request-ID sort per wave, are
+the independently replayed policy.
 
 One token wave selects at most eight distinct sequences and at most one
 position from each while continuing the current ring scan. A scheduler `step`
@@ -289,6 +296,22 @@ same maximal active FIFO prefix remains promoted and charged; repeated rounds
 therefore target that head until removal and never bypass it while blocked,
 without a second execution or commit path. This note records implementation of
 the frozen comparison and does not amend its workload, metrics, or claim rules.
+The continuous implementation also retains a bounded closed-snapshot epoch
+marker so mid-round arrivals cannot add a second rotation to a survivor's
+service gap. The real tiny-v3 scalar integration independently replays the
+first 16 events and exact integer fairness metrics, then verifies the complete
+`continuous-arrival-1000` event formula and cleanup contract. No timing enters
+either gate and no performance result is implied.
+
+Pre-measurement fairness clarification (2026-08-06): a raw physical cursor at
+round closure allowed members appended during that round to run before the
+first-due surviving snapshot member. Under the already frozen
+continuous-arrival input, the anchor's first recurrence would then be turn 31,
+with 30 intervening commits, contradicting the hard maximum of 15 below. The
+closed-snapshot normalization above prevents an arrival from occupying that
+rollover cursor and resolves the contradiction before any M5 timing, service
+golden, or performance conclusion. It changes no workload, bound, numeric
+path, FIFO baseline, or claim rule.
 
 ### Request state machine and token transaction
 

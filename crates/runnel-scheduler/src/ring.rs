@@ -105,6 +105,7 @@ impl ServiceCommitPermit<'_> {
         }
         self.ring.members.remove(self.member_index);
         self.ring.retain_cursor_after_removal(self.member_index);
+        self.ring.normalize_closed_snapshot_cursor();
         self.removed = true;
     }
 }
@@ -183,6 +184,7 @@ pub(crate) struct DrrRing {
     cursor: usize,
     epochs: RoundEpochIssuer,
     open_round: Option<OpenRound>,
+    closed_snapshot_epoch: Option<RoundEpoch>,
     pending_visit: Option<PendingVisit>,
     last_inserted_request: Option<RequestId>,
 }
@@ -202,6 +204,10 @@ impl fmt::Debug for DrrRing {
             .field(
                 "round_remaining",
                 &self.open_round.map(|round| round.remaining),
+            )
+            .field(
+                "closed_snapshot_epoch",
+                &self.closed_snapshot_epoch.map(RoundEpoch::get),
             )
             .field("visit_pending", &self.pending_visit.is_some())
             .field(
@@ -245,6 +251,7 @@ impl DrrRing {
             cursor: 0,
             epochs: RoundEpochIssuer::new(),
             open_round: None,
+            closed_snapshot_epoch: None,
             pending_visit: None,
             last_inserted_request: None,
         })
@@ -363,6 +370,7 @@ impl DrrRing {
             return Err(RingError::InternalInvariant);
         }
         self.open_round = Some(OpenRound { epoch, remaining });
+        self.closed_snapshot_epoch = None;
         Ok(Some(epoch))
     }
 
@@ -541,12 +549,13 @@ impl DrrRing {
 
         let closed_round = if let Some(open) = self.open_round {
             if open.remaining == 0 && self.pending_visit.is_none() {
-                self.open_round = None;
+                self.record_round_closed(open.epoch);
                 Some(open.epoch)
             } else {
                 None
             }
         } else {
+            self.normalize_closed_snapshot_cursor();
             None
         };
 
@@ -605,7 +614,7 @@ impl DrrRing {
         self.pending_visit = None;
         let round = self.open_round.ok_or(RingError::InternalInvariant)?;
         if round.remaining == 0 {
-            self.open_round = None;
+            self.record_round_closed(round.epoch);
             Ok(RoundProgress::Closed { epoch: round.epoch })
         } else {
             Ok(RoundProgress::Open {
@@ -653,6 +662,46 @@ impl DrrRing {
             self.cursor = 0;
         }
     }
+
+    /// Retains the just-closed membership snapshot until the next continuous
+    /// round opens. Later terminal/cancellation removals re-run normalization,
+    /// so a newcomer cannot occupy the rollover cursor while any member of
+    /// that snapshot still survives.
+    fn record_round_closed(&mut self, epoch: RoundEpoch) {
+        self.open_round = None;
+        if self.policy == SchedulingPolicy::DeficitContinuousExpertCoalesce {
+            self.closed_snapshot_epoch = Some(epoch);
+            self.normalize_closed_snapshot_cursor();
+        }
+    }
+
+    /// Points at the first cyclic survivor from the retained closed snapshot.
+    /// The bounded scan performs no dynamic allocation. Once no such member
+    /// remains, future insertions cannot belong to the old epoch, so the normal
+    /// physical successor is final and the marker can be cleared.
+    fn normalize_closed_snapshot_cursor(&mut self) {
+        let Some(closed_epoch) = self.closed_snapshot_epoch else {
+            return;
+        };
+        if self.policy != SchedulingPolicy::DeficitContinuousExpertCoalesce {
+            self.closed_snapshot_epoch = None;
+            return;
+        }
+        if self.members.is_empty() {
+            self.cursor = 0;
+            self.closed_snapshot_epoch = None;
+            return;
+        }
+        debug_assert!(self.cursor < self.members.len());
+        if let Some(index) = (0..self.members.len())
+            .map(|offset| wrapped_index(self.cursor, offset, self.members.len()))
+            .find(|&index| self.members[index].join_epoch <= closed_epoch)
+        {
+            self.cursor = index;
+        } else {
+            self.closed_snapshot_epoch = None;
+        }
+    }
 }
 
 fn successor_index(index: usize, length: usize) -> usize {
@@ -695,6 +744,23 @@ mod tests {
         (request_id, progress)
     }
 
+    fn select_commit_and_maybe_remove(
+        ring: &mut DrrRing,
+        remove: bool,
+    ) -> (RequestId, RoundProgress) {
+        let visit = ring.next_visit().expect("next visit");
+        let request_id = visit.request_id();
+        let (reservation, progress) = ring.mark_selected(visit).expect("selection");
+        ring.with_validated_credit_commit(reservation, |mut permit| {
+            permit.apply();
+            if remove {
+                permit.remove_member();
+            }
+        })
+        .expect("commit credit");
+        (request_id, progress)
+    }
+
     #[test]
     fn fifo_round_reselects_the_oldest_member_until_removal() {
         let mut ring = fifo_ring(3);
@@ -707,6 +773,7 @@ mod tests {
             let (selected, progress) = select_and_commit(&mut ring);
             assert_eq!(selected.get(), 1);
             assert!(progress.is_closed());
+            assert_eq!(ring.closed_snapshot_epoch, None);
         }
 
         ring.remove(key(1)).expect("remove completed FIFO head");
@@ -813,6 +880,8 @@ mod tests {
     #[test]
     fn member_joining_open_round_waits_until_next_epoch() {
         let mut ring = DrrRing::try_with_capacity(3).expect("ring");
+        let allocation = ring.members.as_ptr();
+        let allocation_capacity = ring.members.capacity();
         add(&mut ring, 1);
         add(&mut ring, 2);
         let first_epoch = ring.open_round().expect("round").expect("epoch");
@@ -833,9 +902,188 @@ mod tests {
                 break;
             }
         }
-        // The appended member is the retained cursor's successor, but it did
-        // not enter the epoch-one membership snapshot.
-        assert_eq!(trace, [3, 1, 2]);
+        // Snapshot survivors retain their cyclic order ahead of a member that
+        // joined while the prior epoch was open.
+        assert_eq!(trace, [1, 2, 3]);
+        assert_eq!(ring.members.as_ptr(), allocation);
+        assert_eq!(ring.members.capacity(), allocation_capacity);
+    }
+
+    #[test]
+    fn selected_terminal_removal_renormalizes_across_a_newcomer_wrap_point() {
+        let mut ring = DrrRing::try_with_capacity(4).expect("ring");
+        for request_id in 1..=3 {
+            add(&mut ring, request_id);
+        }
+        ring.cursor = 2;
+        ring.open_round().expect("rotated round").expect("epoch");
+
+        let visit = ring.next_visit().expect("rotated member visit");
+        assert_eq!(visit.request_id().get(), 3);
+        let (terminal_reservation, progress) = ring.mark_selected(visit).expect("selection");
+        assert!(!progress.is_closed());
+        add(&mut ring, 4);
+        assert_eq!(select_and_commit(&mut ring).0.get(), 1);
+        let (selected, progress) = select_and_commit(&mut ring);
+        assert_eq!(selected.get(), 2);
+        assert!(progress.is_closed());
+        assert_eq!(ring.cursor, 2);
+        assert_eq!(ring.members[ring.cursor].request_id.get(), 3);
+
+        ring.with_validated_credit_commit(terminal_reservation, |mut permit| {
+            permit.apply();
+            permit.remove_member();
+        })
+        .expect("terminal removal");
+        assert_eq!(ring.members[ring.cursor].request_id.get(), 1);
+        ring.open_round()
+            .expect("post-terminal round")
+            .expect("epoch");
+        assert_eq!(select_and_commit(&mut ring).0.get(), 1);
+    }
+
+    #[test]
+    fn closed_round_cancellation_renormalizes_across_a_newcomer_wrap_point() {
+        let mut ring = DrrRing::try_with_capacity(4).expect("ring");
+        for request_id in 1..=3 {
+            add(&mut ring, request_id);
+        }
+        ring.cursor = 2;
+        ring.open_round().expect("rotated round").expect("epoch");
+
+        let visit = ring.next_visit().expect("member three visit");
+        assert_eq!(visit.request_id().get(), 3);
+        assert!(!ring.mark_blocked(visit).expect("blocked three").is_closed());
+        add(&mut ring, 4);
+        for request_id in [1, 2] {
+            let visit = ring.next_visit().expect("snapshot visit");
+            assert_eq!(visit.request_id().get(), request_id);
+            let progress = ring.mark_blocked(visit).expect("blocked snapshot member");
+            assert_eq!(progress.is_closed(), request_id == 2);
+        }
+        assert_eq!(ring.members[ring.cursor].request_id.get(), 3);
+
+        ring.remove(key(3)).expect("cancel normalized survivor");
+        assert_eq!(ring.members[ring.cursor].request_id.get(), 1);
+        ring.open_round()
+            .expect("post-cancellation round")
+            .expect("epoch");
+        assert_eq!(select_and_commit(&mut ring).0.get(), 1);
+    }
+
+    #[test]
+    fn recovered_credit_survivor_stays_ahead_of_mid_round_arrival() {
+        let mut ring = DrrRing::try_with_capacity(3).expect("ring");
+        add(&mut ring, 1);
+        add(&mut ring, 2);
+        ring.open_round().expect("initial round").expect("epoch");
+        let visit = ring.next_visit().expect("recoverable visit");
+        let (reservation, progress) = ring.mark_selected(visit).expect("selection");
+        assert!(!progress.is_closed());
+        ring.recover_credit(reservation).expect("recover credit");
+        add(&mut ring, 3);
+        let visit = ring.next_visit().expect("closing blocked visit");
+        assert_eq!(visit.request_id().get(), 2);
+        assert!(ring.mark_blocked(visit).expect("blocked close").is_closed());
+
+        ring.open_round().expect("recovery round").expect("epoch");
+        assert_eq!(select_and_commit(&mut ring).0.get(), 1);
+    }
+
+    #[test]
+    fn final_epoch_rollover_preserves_survivor_order_and_failed_open_keeps_marker() {
+        let mut ring =
+            DrrRing::try_with_capacity_and_next_epoch(2, u64::MAX - 1).expect("near-final ring");
+        add(&mut ring, 1);
+        let penultimate = ring
+            .open_round()
+            .expect("penultimate round")
+            .expect("epoch");
+        assert_eq!(penultimate.get(), u64::MAX - 1);
+        add(&mut ring, 2);
+        let visit = ring.next_visit().expect("penultimate survivor visit");
+        assert_eq!(visit.request_id().get(), 1);
+        assert!(
+            ring.mark_blocked(visit)
+                .expect("close penultimate")
+                .is_closed()
+        );
+
+        let final_epoch = ring.open_round().expect("final round").expect("epoch");
+        assert_eq!(final_epoch.get(), u64::MAX);
+        assert_eq!(ring.closed_snapshot_epoch, None);
+        assert_eq!(select_and_commit(&mut ring).0.get(), 1);
+        let (newcomer, progress) = select_and_commit(&mut ring);
+        assert_eq!(newcomer.get(), 2);
+        assert!(progress.is_closed());
+        assert_eq!(ring.closed_snapshot_epoch, Some(final_epoch));
+
+        for _ in 0..2 {
+            assert_eq!(
+                ring.open_round().expect_err("epoch space exhausted"),
+                RingError::EpochExhausted
+            );
+            assert_eq!(ring.closed_snapshot_epoch, Some(final_epoch));
+        }
+    }
+
+    #[test]
+    fn terminal_churn_cannot_put_mid_round_arrivals_ahead_of_a_survivor() {
+        let mut ring = DrrRing::try_with_capacity(32).expect("ring");
+        for request_id in 1..=16 {
+            add(&mut ring, request_id);
+        }
+        ring.open_round().expect("initial round").expect("epoch");
+
+        for request_id in 1..=16 {
+            let (selected, progress) = select_commit_and_maybe_remove(&mut ring, request_id != 1);
+            assert_eq!(selected.get(), request_id);
+            assert_eq!(progress.is_closed(), request_id == 16);
+            if request_id < 16 {
+                add(&mut ring, 16 + request_id);
+            }
+        }
+
+        assert_eq!(ring.len(), 16);
+        assert_eq!(
+            ring.members
+                .iter()
+                .map(|member| member.request_id.get())
+                .collect::<Vec<_>>(),
+            (std::iter::once(1).chain(17..=31)).collect::<Vec<_>>()
+        );
+        ring.open_round().expect("post-churn round").expect("epoch");
+        assert_eq!(select_and_commit(&mut ring).0.get(), 1);
+    }
+
+    #[test]
+    fn removal_driven_round_close_retains_a_snapshot_survivor_before_newcomers() {
+        let mut ring = DrrRing::try_with_capacity(3).expect("ring");
+        add(&mut ring, 1);
+        add(&mut ring, 2);
+        ring.open_round().expect("initial round").expect("epoch");
+        assert_eq!(select_and_commit(&mut ring).0.get(), 1);
+        add(&mut ring, 3);
+
+        let removed = ring.remove(key(2)).expect("remove final unvisited member");
+        assert!(removed.closed_round().is_some());
+        ring.open_round()
+            .expect("post-removal round")
+            .expect("epoch");
+        assert_eq!(select_and_commit(&mut ring).0.get(), 1);
+    }
+
+    #[test]
+    fn removal_driven_close_keeps_physical_successor_when_no_snapshot_member_survives() {
+        let mut ring = DrrRing::try_with_capacity(2).expect("ring");
+        add(&mut ring, 1);
+        ring.open_round().expect("initial round").expect("epoch");
+        add(&mut ring, 2);
+
+        let removed = ring.remove(key(1)).expect("remove sole snapshot member");
+        assert!(removed.closed_round().is_some());
+        ring.open_round().expect("newcomer round").expect("epoch");
+        assert_eq!(select_and_commit(&mut ring).0.get(), 2);
     }
 
     #[test]

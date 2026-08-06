@@ -289,13 +289,28 @@ must finish before shutdown.
 Two versioned policies share that one transaction path and one validated
 resource envelope. `deficit-continuous-expert-coalesce-v1` is the default: a
 round contains every eligible member and may select up to the configured wave
-width. `fifo-single-request-run-to-completion-v1` is the M5 measurement
+width. When a round closes, a bounded rollover marker points the next scan at
+the first cyclic survivor from that membership snapshot, if one remains. It is
+re-normalized through terminal and cancellation removals before the next round
+opens, so a mid-round arrival cannot occupy the rollover cursor. The scan then
+follows ordinary cyclic membership order; the marker performs no dynamic
+allocation.
+`fifo-single-request-run-to-completion-v1` is the M5 measurement
 baseline: a round contains only the oldest active FIFO member, so reopening
 rounds repeatedly selects that request until removal, while other accepted
 requests remain promoted and charged. An output-blocked head is intentionally
 not bypassed by this baseline; cancellation and deadline resolution still scan
 and terminalize non-head records without giving them model service. Policy
 selection changes neither validated geometry nor static logical charges.
+
+The synchronous tiny-v3 scalar policy replay checks the exact first-16 traces
+and recomputes lag, runnable gap, and Jain arithmetic without floating point.
+Its separate 1,000-turn continuous-arrival test admits one new churner per
+turn, requires exactly one healthy service event, reconciles the final full
+trace from origin, and proves the anchor completes at turn 352 with no gap over
+15 other commits. Ordered endpoint acknowledgement and cancellation cleanup
+perform no extra model service and return request and shared ownership to zero.
+This is a deterministic correctness gate, not timing evidence.
 
 Direct multi-request ingress is a separate two-phase engine transaction. It
 validates the full nonempty offer slice before resource selection, admits only
