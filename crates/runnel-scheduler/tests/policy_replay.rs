@@ -2,9 +2,9 @@ use runnel_fixture::FixtureArtifact;
 use runnel_format::{Artifact, Limits};
 use runnel_runtime::{BackendRequest, SamplingPolicy, TinyModel};
 use runnel_scheduler::{
-    BatchRequestSpec, CancelDisposition, ErrorCategory, RequestId, RequestPhase, RequestSpec,
-    SchedulerConfig, SchedulerEngine, SchedulerError, SchedulerLimits, SchedulingPolicy,
-    ServicePhase, ServiceTraceCursor, StepReport, TerminalOutcome,
+    BatchRequestSpec, CancelDisposition, ErrorCategory, LedgerTraceCursor, RequestId, RequestPhase,
+    RequestSpec, SchedulerConfig, SchedulerEngine, SchedulerError, SchedulerLimits,
+    SchedulingPolicy, ServicePhase, ServiceTraceCursor, StepReport, TerminalOutcome,
 };
 
 const REQUEST_COUNT: usize = 16;
@@ -442,6 +442,21 @@ fn continuous_arrival_1000_has_no_starvation_or_cleanup_service() {
     }
     drop(complete);
 
+    let ledger_before_cleanup = engine
+        .ledger_trace_since(LedgerTraceCursor::origin())
+        .expect("continuous ledger trace");
+    assert_eq!(
+        ledger_before_cleanup.initial_snapshot().ledger_snapshot(),
+        pristine_ledger
+    );
+    assert_eq!(ledger_before_cleanup.status().event_limit(), 1_024);
+    assert!(ledger_before_cleanup.status().retained_events() <= 1_024);
+    assert!(ledger_before_cleanup.status().retained_events() > 0);
+    assert!(ledger_before_cleanup.status().overflowed());
+    let ledger_cursor = ledger_before_cleanup.next_cursor();
+    let ledger_status = ledger_before_cleanup.status();
+    drop(ledger_before_cleanup);
+
     for id in live.iter().copied() {
         assert_eq!(
             engine.cancel(id).expect("cancel final live request"),
@@ -466,6 +481,13 @@ fn continuous_arrival_1000_has_no_starvation_or_cleanup_service() {
     );
     assert!(post_cleanup_trace.status().healthy());
     drop(post_cleanup_trace);
+    let post_cleanup_ledger = engine
+        .ledger_trace_since(ledger_cursor)
+        .expect("cleanup ledger frontier");
+    assert!(post_cleanup_ledger.events().is_empty());
+    assert_eq!(post_cleanup_ledger.status(), ledger_status);
+    assert!(post_cleanup_ledger.status().overflowed());
+    drop(post_cleanup_ledger);
 
     for id in live.iter().copied() {
         let terminal = engine

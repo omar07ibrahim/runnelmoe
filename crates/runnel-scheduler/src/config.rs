@@ -9,7 +9,7 @@ use runnel_runtime::{
 
 use crate::{
     error::{ErrorCategory, SchedulerError, SchedulerResult},
-    trace::SERVICE_TRACE_EVENT_CHARGE_BYTES,
+    trace::TRACE_SLOT_CHARGE_BYTES,
 };
 
 pub const LEDGER_ALIGNMENT_BYTES: u64 = 64;
@@ -88,6 +88,8 @@ pub struct SchedulerLimits {
     pub output_capacity_per_request: u64,
     pub batch_width: u64,
     pub waves_per_step: u64,
+    /// Independent service- and ledger-event capacities under one paired
+    /// `128 * trace_capacity` semantic charge.
     pub trace_capacity: u64,
     pub logical_memory_limit_bytes: u64,
     /// Must be zero until a typed constructor can authenticate an attached
@@ -1028,7 +1030,7 @@ fn shared_static_charges(
 
     let trace = checked_mul(
         limits.trace_capacity,
-        SERVICE_TRACE_EVENT_CHARGE_BYTES,
+        TRACE_SLOT_CHARGE_BYTES,
         "trace capacity",
     )?;
     ensure_host_allocation(trace, "trace capacity")?;

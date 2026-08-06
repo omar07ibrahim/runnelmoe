@@ -2,7 +2,7 @@
 
 - Status: accepted; implementation in progress; measurement pending
 - Date: 2026-08-03
-- Last amended: 2026-08-06 (policy, service-trace, and stress-evidence clarifications)
+- Last amended: 2026-08-06 (policy, paired-trace, and stress-evidence clarifications)
 - Milestone: M5
 
 ## Context
@@ -282,11 +282,13 @@ indivisible fairness unit. Blocked-on-output, terminal, canceled, expired, and
 otherwise non-runnable requests consume no service.
 
 The named baseline uses the identical v3 scalar model, paged state, streaming
-attention, sampling, workspace, memory budget, and output sink but runs one
-request to completion in accepted FIFO order with batch width one and no
-cross-request expert grouping. The named candidate uses the DRR/coalesced
-policy above. The comparison isolates scheduling and grouping rather than
-numeric representation, ISA, or storage.
+attention, sampling, configured batch width eight, preallocated workspace,
+memory budget, and output sink. Its one-member policy rounds make effective
+wave occupancy one and run the accepted FIFO head to completion, so no
+cross-request expert grouping occurs. The named candidate uses the same
+configured geometry with the DRR/coalesced policy above. The comparison
+isolates scheduling and grouping rather than numeric representation, scratch
+capacity, ISA, or storage.
 
 Implementation mapping (2026-08-06): `SchedulerConfig` now binds one immutable
 versioned policy without changing validated geometry or shared charges. The
@@ -550,14 +552,15 @@ The owner/lifetime transitions are closed:
 | worker scratch | shared static partition through scheduler shutdown; worker ownership changes do not remove its charge |
 | sampling scratch | shared static partition through scheduler shutdown; logits and sampling workspace occupancy change without changing its reserved capacity |
 | coalesced batch capacity | shared static partition through shutdown; includes 64 bytes per task identity plus adapter contribution buffers and is charged once, never per participating request |
-| trace capacity | shared static partition through shutdown at 128 bytes per bounded slot; borrowed cursor reads leave both append-only occupancy and capacity charge unchanged, and successful shutdown discards the storage |
+| trace capacity | shared static partition through shutdown at 128 bytes per configured paired index: one independent 64-byte service-event slot and one independent 64-byte ledger-event slot; borrowed cursor reads leave both append-only occupancies and the combined capacity charge unchanged, and successful shutdown discards both arrays |
 | model resident partition | validated static partition present when the scheduler is constructed |
 | page-pool partition | exact configured M2 cache payload capacity when a cache is attached, otherwise zero |
 | admission reserve | shared semantic headroom through scheduler lifetime; typed construction requires the maximum requested Vec-payload peak across direct batch preparation phases, while allocator overhead and RSS remain separate observations |
 
 Fixed logical metadata charges are 64 bytes per command, actor-control,
-request, output-event, terminal, expert-task, and state-page slot; 128 bytes per
-trace slot; and 512 bytes per retained request record. Each actor command also
+request, output-event, terminal, expert-task, state-page, service-event, and
+ledger-event slot; each paired trace index therefore remains 128 bytes; and
+each retained request record is 512 bytes. Each actor command also
 includes the configured maximum offered-prompt payload before its per-slot
 charge is rounded. Actor control adds one 64-byte accepted-control/deadline slot
 per maximum outstanding request to a separate 64-byte global wake/lifecycle
@@ -582,7 +585,7 @@ one as the other.
 Implementation-wide configuration ceilings are 64 workers, 65,536 ordinary
 command slots, 65,536 total outstanding request slots, 4,096 active requests,
 65,536 retained terminal results, 8 sequences per batch, 4 waves per step,
-65,536 output events per request, 1,048,576 trace events, 65,536 tokens
+65,536 output events per request, 1,048,576 paired trace indices, 65,536 tokens
 per state page, 262,144 expert tasks per wave, and 1 TiB of logical ledger
 capacity. Adapter context and vocabulary limits remain independently enforced.
 Zero, exact-ceiling, ceiling-plus-one, multiplication overflow, and host-`usize`
@@ -593,7 +596,9 @@ The frozen evidence configuration has an 8 MiB scheduler-accounted ceiling,
 a 256 MiB address-space ceiling, one worker, ordinary command capacity 32,
 normal total-outstanding/active/retained caps 32/16/32, and pressure-cell caps
 16/16/16. It uses batch width 8, four waves per step, 16-token state pages,
-64 output events per normal request, and 8,192 trace events. Configuration
+64 output events per normal request, and 8,192 paired trace indices, providing
+independent capacities of 8,192 service events and 8,192 ledger events.
+Configuration
 sets `model_resident_partition = 5,632` bytes (the 5,600-byte v3 semantic tensor
 payload rounded once to 64), `page_pool_partition = 0`, and
 `admission_reserve = 1,048,576` bytes. The eager authenticated `Artifact` and
@@ -602,6 +607,86 @@ the model's declared tensor-buffer payload remains in the logical partition.
 Fresh-child `VmHWM` still records any larger initialization peak. Configuration
 fails if one minimum executable request plus all fixed shared partitions cannot
 fit.
+
+#### Bounded ledger evidence clarification (2026-08-06)
+
+This clarification was fixed before the ledger-recorder implementation and any
+M5 capture. It does not change the logical-memory formula, evidence
+configuration, workload, or claim rule. The existing `trace_capacity * 128`
+shared charge is a paired static allocation: one pre-reserved service-event
+array and one pre-reserved ledger-event array each have exactly
+`trace_capacity` elements and a 64-byte logical payload charge per element.
+Their cursors, retained lengths, and sticky overflow states are independent;
+unused capacity in one array cannot be transferred to the other. Both concrete
+event types must satisfy `size_of(event) <= 64`.
+
+Every ledger row starts from the immutable `LedgerSnapshot` taken immediately
+after successful engine construction and static shared acquisition, before any
+request admission. That snapshot is sequence zero. The stable category IDs are
+the following closed mapping:
+
+```text
+0  prompt_storage       1  request_record
+2  request_slot         3  active_state
+4  pending_transaction  5  output
+6  terminal             7  worker_scratch
+8  sampling_scratch     9  coalesced_batch
+10 model_resident       11 page_pool
+12 trace                13 admission_reserve
+14 actor_command        15 actor_control
+```
+
+Owner ID zero is the shared scheduler owner. A nonzero owner ID is exactly the
+opaque engine-local `RequestId::get()` value and is valid only for a
+request-owned category. Each retained delta is a nonzero `i64` multiple of 64
+bytes. Durable post-construction mutations receive contiguous sequence numbers
+starting at one. Every `(owner_id, category_id, signed_delta)` belonging to one
+atomic ledger mutation repeats that sequence number and is stored in canonical
+`(owner_id, category_id)` order. Replay applies a complete sequence as one
+unit. If every delta in the next mutation does not fit, the recorder appends
+none of it, marks overflow sticky, and never changes scheduling or accounting.
+Sequence exhaustion has the same evidence-only overflow result.
+
+Only durable request-owner byte changes enter the stream. Successful single
+or batch publication and active promotion append positive deltas; terminal
+resource release and retained-result reap append negative deltas. Atomic batch
+publication uses one sequence across every accepted owner. Fit projections,
+reservation splits, owner transfers, prepare-only permits, provisional
+attempts, dropped permits, allocation rollbacks, and per-token buffer occupancy
+append nothing. A provisional charge linearizes in evidence only when it
+becomes durable; an exact rollback restores usage and peaks and remains absent
+from the stream. This makes independent replay reproduce both current and peak
+category, request, shared, and aggregate totals.
+
+The observable ledger interval ends only after request-owned usage has returned
+to zero and immediately before successful scheduler teardown. Static shared
+bytes exist in sequence zero and do not change during that interval. Successful
+shutdown destroys both trace arrays before applying the final static shared
+release, so that all-negative teardown is deliberately outside `ledger.jsonl`;
+the pre-shutdown replay must equal the live shared-only snapshot, and the
+`ShutdownReport` plus post-shutdown ledger snapshot separately prove shared and
+aggregate zero. Excluding a final all-negative transition cannot change a
+peak. Any fallible shutdown path precedes trace destruction and retains both
+readable prefixes.
+
+Service and ledger completeness are separate gates. Every measured M5 run
+requires both 8,192-capacity streams to remain healthy. The standalone
+`continuous-arrival-1000` correctness check retains its frozen capacity of
+1,024 and requires only its exactly 1,000-event service stream to be healthy;
+its more than 14,000 category deltas intentionally overflow the independent
+ledger recorder. That overflow must be sticky and behavior-neutral and does
+not create a measured ledger row.
+
+Implementation mapping (2026-08-06): `CapacityLedger` owns the preallocated
+recorder and emits through request-bound acquisition/release permits;
+`SchedulerEngine::ledger_trace_since` exposes only borrowed complete-mutation
+suffixes and rejects an ordinal that bisects a mutation. Constructor and
+shutdown paths destroy physical payloads before rolling back or releasing
+their logical owners. Public integration tests independently replay category,
+request-owner, shared, and aggregate current/peak totals; exercise atomic batch
+ordering, rollback neutrality, exact-full/overflow stream independence, foreign
+cursors, and shutdown; the frozen continuous-arrival test separately proves
+its expected ledger overflow alongside a healthy service stream.
 
 ### Fairness contract
 
@@ -886,9 +971,10 @@ JSON object per token. The phase mapping is frozen as `0=prefill` and
 prompt length, so the final prompt position remains prefill when it publishes
 the first output. The direct engine exposes this append-only prefix through a
 borrowed cursor view. Exact capacity is healthy until another successful commit
-sets sticky overflow; reads never drain or reset it. Each `ledger` row contains
-initial category totals and
-compact arrays of `(sequence, category_id, owner_id, signed_delta)`; static
+sets sticky overflow; reads never drain or reset it. Each `ledger` row follows
+the bounded ledger-evidence contract above: it contains sequence-zero category
+totals and compact arrays of
+`(sequence, category_id, owner_id, signed_delta)`; static
 preallocated token buffers avoid per-token byte transitions. Parent and child
 flush framed canonical records after every request or bounded event chunk. A
 crash, timeout, signal, malformed output, migration, invariant failure, or cap
@@ -960,7 +1046,7 @@ producer tasks and one scheduler actor. The exact limits are one compute worker,
 ordinary-command capacity eight, outstanding/active/queued/retained-terminal
 caps 16/8/16/16, prompt/generation/context ceilings 4/16/19, four-token state
 pages, two output events per request, batch width eight, four waves per step,
-1,024 trace events, an 8,388,608-byte logical-memory limit, no page-pool
+1,024 paired trace indices, an 8,388,608-byte logical-memory limit, no page-pool
 partition, and a 1,048,576-byte admission reserve. The global context envelope
 is 19 because configuration validates `4 + 16 - 1`; every derived request below
 still has at most 16 model positions.

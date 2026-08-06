@@ -18,11 +18,14 @@ M5 is in progress. Its published synchronous slice now includes paged
 transactional decoder state, deterministic sampling, bounded FIFO admission,
 equal-weight token-quantum DRR, expert-sorted continuous batches, exact logical
 ownership accounting, output backpressure, deadlines, cancellation, and
-failure-atomic cleanup. The direct engine now exposes its already charged
-service history as an allocation-free, append-only cursor view: its fixed
-prefix records only opaque request identity, position, and the frozen
-prefill/decode bit, while sticky overflow invalidates evidence without changing
-execution. Generation-bound atomic controls and a live
+failure-atomic cleanup. The direct engine now exposes independently bounded,
+allocation-free cursor views over its service and logical-memory histories.
+The service prefix records only opaque request identity, position, and the
+frozen prefill/decode bit. The ledger prefix starts from a shared-only snapshot
+and records complete, canonically ordered request-owner acquire/release
+mutations. Each stream has its own sticky overflow flag; evidence loss changes
+neither execution nor accounting, and the existing paired 128-byte trace-slot
+charge is unchanged. Generation-bound atomic controls and a live
 cancel/deadline check inside the adapter's validated commit callback prevent a
 late signal from partially publishing model state, RNG, output, or service
 credit. Each admitted request now has one generation-tagged, pre-reserved
@@ -63,6 +66,16 @@ The real tiny-v3 scalar integration independently replays the first 16 service
 events and their integer fairness metrics, then runs the preregistered
 1,000-turn continuous-arrival schedule with exact request, position, phase,
 starvation, output, terminal, trace-health, and zero-ledger cleanup checks.
+
+The ledger stream assigns sequence zero to the immutable post-construction
+snapshot and one repeated positive or negative sequence to each durable
+request mutation. Single admission, atomic batch publication, active promotion,
+terminal cleanup, and retained-result reap are owner-attributed; provisional
+attempts, dropped admission permits, reservation splits, and per-token buffer
+occupancy emit nothing. A mutation that cannot fit is discarded as a whole and
+makes only the ledger stream incomplete. Capture reads the final request-zero,
+shared-only prefix before shutdown destroys both trace arrays; the ordinary
+post-shutdown snapshot separately proves all shared ownership reached zero.
 
 The runtime's central contract is simple: a configured
 resident-memory ceiling

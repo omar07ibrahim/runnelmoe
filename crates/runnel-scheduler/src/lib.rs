@@ -18,6 +18,7 @@ mod engine_adversarial_tests;
 mod error;
 mod id;
 mod ledger;
+mod ledger_trace;
 mod request;
 mod ring;
 mod trace;
@@ -53,6 +54,10 @@ pub use id::RequestId;
 pub use ledger::{
     CategorySnapshot, LEDGER_QUANTUM_BYTES, LedgerCategory, LedgerOwnership, LedgerSnapshot,
 };
+pub use ledger_trace::{
+    LedgerMutationKind, LedgerTraceCursor, LedgerTraceEvent, LedgerTraceInitialSnapshot,
+    LedgerTraceOwner, LedgerTraceRead, LedgerTraceStatus,
+};
 pub use request::{
     AcceptedAdmission, BatchAdmission, BatchDeadline, BatchRequestSpec, CancelDisposition,
     EngineSnapshot, OutputEvent, RejectedAdmission, RequestPhase, RequestSpec, ShutdownReport,
@@ -60,4 +65,5 @@ pub use request::{
 };
 pub use trace::{
     ServicePhase, ServiceTraceCursor, ServiceTraceEvent, ServiceTraceRead, ServiceTraceStatus,
+    TRACE_SLOT_CHARGE_BYTES,
 };

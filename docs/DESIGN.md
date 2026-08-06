@@ -252,8 +252,11 @@ publication at one non-yielding boundary. It uses bounded FIFO admission, an
 immutable retained-round scheduling policy, expert-sorted waves, per-request
 output backpressure, exact category ownership,
 generation-bound atomic request controls, and prevalidated release permits for
-terminal/reap/shutdown cleanup. A live monotonic-clock and control snapshot is
-taken inside the adapter's validated commit callback; suppression drops both
+terminal/reap/shutdown cleanup. Durable request acquisition and release permits
+also publish one owner-attributed ledger-evidence mutation at those lifecycle
+boundaries; provisional rollback restores historical peaks and remains absent
+from the evidence stream. A live monotonic-clock and control snapshot is taken
+inside the adapter's validated commit callback; suppression drops both
 unapplied permits before terminal cleanup, so that position publishes no state,
 RNG, output, trace, or service-credit debit. A generation-tagged endpoint lock
 is acquired before sampling and remains held across that callback. After the
@@ -268,8 +271,8 @@ FIFO, direct request controls/endpoints, origin-relative Tokio deadlines, and
 one awaited blocking engine pump at a time. Responded commands retain their
 slots until consumed or abandoned, and cooperative shutdown waits for command
 claims and live endpoint ownership before destructive teardown. The full
-adversarial interleaving matrix, independent trace/fairness replay, and accepted
-evidence remain incomplete until the rest of M5 lands. Weights remain eagerly
+checkpoint/deadline matrix, run-level timing observer, and accepted evidence
+remain incomplete until the rest of M5 lands. Weights remain eagerly
 resident in M5, so live cache-leased expert execution remains an explicit
 system gap.
 
@@ -283,8 +286,25 @@ only the opaque request ID, zero-based position, and stable phase bit
 publishes the first output. Exact capacity remains a complete prefix until one
 more successful commit cannot be retained; that event makes overflow sticky,
 invalidates evidence completeness, and never changes model behavior. Successful
-shutdown destroys the trace and releases its fixed shared charge, so capture
-must finish before shutdown.
+shutdown destroys both independently bounded trace arrays and releases their
+combined fixed shared charge, so capture must finish before shutdown.
+
+The paired ledger trace is an independently bounded semantic ownership log.
+Sequence zero contains the exact post-construction shared snapshot. Later
+sequences contain every nonzero category delta in one durable request-owned
+acquire or release, canonically ordered by numeric request owner and the closed
+category ID. Atomic batch publication repeats one sequence across all accepted
+owners; active promotion, terminal cleanup, and reap each produce their own
+sequence. Reservation splits, fit checks, provisional attempts, exact
+rollbacks, and per-position occupancy are not ledger mutations. Reads borrow
+an immutable suffix and include both the initial snapshot and independent
+health metadata. If the next complete mutation does not fit, none of its events
+are retained and ledger overflow becomes sticky without changing accounting or
+the service trace. Each configured trace index retains one 64-byte service slot
+and one 64-byte ledger slot under the unchanged combined 128-byte logical
+charge. Capture must replay request ownership to zero before shutdown; shutdown
+then drops both arrays before releasing static shared ownership, whose final
+zero is proven by the ordinary ledger snapshot.
 
 Two versioned policies share that one transaction path and one validated
 resource envelope. `deficit-continuous-expert-coalesce-v1` is the default: a

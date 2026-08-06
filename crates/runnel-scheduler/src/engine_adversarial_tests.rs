@@ -16,8 +16,8 @@ use crate::control::ControlBinding;
 use crate::endpoint::TryPop;
 use crate::{
     BatchRequestSpec, CancelDisposition, ErrorCategory, LedgerCategory, LedgerOwnership,
-    RequestPhase, RequestSpec, SchedulerConfig, SchedulerEngine, SchedulerError, SchedulerLimits,
-    StepReport, TerminalOutcome,
+    LedgerTraceCursor, RequestPhase, RequestSpec, SchedulerConfig, SchedulerEngine, SchedulerError,
+    SchedulerLimits, ServiceTraceCursor, StepReport, TerminalOutcome,
 };
 
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -919,10 +919,97 @@ fn batch_allocation_failure_after_provisional_charge_rolls_back_every_owner_and_
     ));
     assert_eq!(engine.snapshot(), before_engine);
     assert_eq!(engine.ledger_snapshot(), before_ledger);
+    let trace = engine
+        .ledger_trace_since(LedgerTraceCursor::origin())
+        .expect("ledger trace after injected allocation rollback");
+    assert!(trace.events().is_empty());
+    assert!(trace.status().healthy());
+    assert_eq!(trace.initial_snapshot().ledger_snapshot(), before_ledger);
     let first = engine
         .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
         .expect("failed prepare consumed no request identity");
     assert_eq!(first.get(), 1);
+}
+
+#[test]
+fn failed_shutdown_retains_both_trace_prefixes_and_can_be_retried() {
+    let gate = Arc::new(CommitGate::passthrough());
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let mut engine = new_engine(gate, apply_count, 1);
+    let request_id = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("shutdown test admission");
+    let report = engine.step().expect("shutdown test service");
+    assert_eq!(report.committed_positions, 1);
+    assert_eq!(report.terminal_decisions, 1);
+    assert_eq!(
+        engine
+            .drain_events(request_id, usize::MAX)
+            .expect("shutdown test output")
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .take_terminal(request_id)
+            .expect("shutdown test terminal query")
+            .expect("shutdown test terminal")
+            .outcome(),
+        TerminalOutcome::Completed
+    );
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+
+    let service_before = engine
+        .service_trace_since(ServiceTraceCursor::origin())
+        .expect("service trace before failed shutdown");
+    let service_events = service_before.events().to_vec();
+    let service_status = service_before.status();
+    drop(service_before);
+    let ledger_before = engine
+        .ledger_trace_since(LedgerTraceCursor::origin())
+        .expect("ledger trace before failed shutdown");
+    let initial = ledger_before.initial_snapshot();
+    let ledger_events = ledger_before.events().to_vec();
+    let ledger_status = ledger_before.status();
+    drop(ledger_before);
+    let snapshot = engine.ledger_snapshot();
+
+    crate::engine::fail_next_shutdown_release_for_test();
+    let error = engine
+        .shutdown()
+        .expect_err("injected shutdown release failure");
+    assert!(matches!(
+        error,
+        SchedulerError::AllocationFailure {
+            resource: "shutdown release checkpoint",
+            ..
+        }
+    ));
+    assert!(engine.snapshot().closed);
+    assert_eq!(engine.ledger_snapshot(), snapshot);
+
+    let service_after = engine
+        .service_trace_since(ServiceTraceCursor::origin())
+        .expect("service trace retained after failed shutdown");
+    assert_eq!(service_after.events(), service_events);
+    assert_eq!(service_after.status(), service_status);
+    drop(service_after);
+    let ledger_after = engine
+        .ledger_trace_since(LedgerTraceCursor::origin())
+        .expect("ledger trace retained after failed shutdown");
+    assert_eq!(ledger_after.initial_snapshot(), initial);
+    assert_eq!(ledger_after.events(), ledger_events);
+    assert_eq!(ledger_after.status(), ledger_status);
+    drop(ledger_after);
+
+    assert_eq!(
+        engine
+            .shutdown()
+            .expect("retry successful shutdown")
+            .remaining_shared_bytes,
+        0
+    );
+    assert!(engine.ledger_snapshot().current_is_zero());
 }
 
 #[test]

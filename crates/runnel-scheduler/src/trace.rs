@@ -10,10 +10,15 @@ use std::{fmt, mem::size_of};
 
 use crate::RequestId;
 
-/// Logical ledger charge retained for every configured service-trace slot.
+/// Total logical ledger charge retained for every configured trace slot.
 ///
-/// This is a semantic capacity charge rather than `size_of` or allocator RSS.
-pub(crate) const SERVICE_TRACE_EVENT_CHARGE_BYTES: u64 = 128;
+/// One slot independently reserves up to 64 bytes for a service event and up
+/// to 64 bytes for a ledger event. This is a semantic capacity charge rather
+/// than `size_of` or allocator RSS.
+pub const TRACE_SLOT_CHARGE_BYTES: u64 = 128;
+
+/// Maximum in-memory representation reserved for one service evidence event.
+pub(crate) const SERVICE_TRACE_EVENT_CAPACITY_BYTES: u64 = 64;
 
 /// The model-position phase frozen by the M5 evidence contract.
 ///
@@ -95,8 +100,8 @@ impl fmt::Debug for ServiceTraceEvent {
 }
 
 const _: () = assert!(
-    size_of::<ServiceTraceEvent>() <= SERVICE_TRACE_EVENT_CHARGE_BYTES as usize,
-    "service trace event exceeds its semantic slot charge"
+    size_of::<ServiceTraceEvent>() <= SERVICE_TRACE_EVENT_CAPACITY_BYTES as usize,
+    "service trace event exceeds its independent slot capacity"
 );
 
 /// An opaque ordinal into a retained service-trace prefix.

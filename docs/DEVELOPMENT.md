@@ -309,7 +309,7 @@ every request/position/phase event against an independent formula, reconciles a
 final origin read, and proves cancellation cleanup adds no service before both
 request and shared ownership reach zero. These are policy/correctness gates,
 not performance evidence. The timed M5 capture harness, measured service rows,
-and ledger stream remain outstanding.
+measured ledger rows, and run-level observer remain outstanding.
 
 ## M5 bounded service-trace verification
 
@@ -343,6 +343,46 @@ cargo test -p runnel-scheduler --test engine \
 This is semantic scheduler evidence, not a wall-clock timing source. It omits
 tokens, prompts, sampling state, routes, deadlines, adapter identities, and
 timestamps.
+
+## M5 bounded ledger-trace verification
+
+`SchedulerEngine::ledger_trace_since` returns an allocation-free borrowed
+suffix coupled to the immutable sequence-zero ledger snapshot. Each later
+sequence is one complete, canonically ordered request-owned mutation. Owner
+zero is reserved for the shared initial state; accepted request IDs own every
+positive admission/promotion and negative terminal/reap delta. Exact rollback,
+prepared-admission drop, fit checks, reservation splits, and per-token
+occupancy emit no events and cannot change replayed peaks.
+
+Read from `LedgerTraceCursor::origin()` for a self-contained replay. An
+incremental consumer must keep every returned cursor and the state produced by
+the preceding suffix with the same engine; the repeated initial snapshot does
+not reconstruct events intentionally skipped by a later cursor. A foreign
+ordinal inside a repeated-sequence mutation is rejected rather than returning
+a partial mutation.
+
+The ledger and service arrays each retain `trace_capacity` entries under the
+existing `trace_capacity * 128` combined charge. Their cursors and sticky
+overflow states are independent. A ledger mutation is all-or-nothing: an
+insufficient suffix appends no partial category group and has no effect on
+execution, accounting, or the service prefix. Capture must serialize the final
+request-zero, shared-only replay before successful shutdown destroys both
+arrays; the post-shutdown ordinary snapshot then proves shared and aggregate
+zero.
+
+Run the focused public replay/lifecycle gate with:
+
+```console
+cargo test -p runnel-scheduler --test ledger_trace --locked --offline
+cargo test -p runnel-scheduler --test policy_replay \
+  continuous_arrival_1000_has_no_starvation_or_cleanup_service \
+  --locked --offline -- --exact
+```
+
+The continuous-arrival correctness configuration deliberately has only 1,024
+ledger slots and more than 14,000 durable category deltas, so ledger overflow
+is expected there while its exactly 1,000-event service stream remains healthy.
+Measured M5 rows instead require both 8,192-slot streams to be complete.
 
 ## M5 genuine actor-race verification
 

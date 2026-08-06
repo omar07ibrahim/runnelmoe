@@ -30,6 +30,7 @@ use crate::{
         CapacityLedger, ExactReservationPartitions, LEDGER_CATEGORY_COUNT, LedgerCategory,
         LedgerReservation, ProvisionalLedgerPermit, ReservationPartition,
     },
+    ledger_trace::{LedgerTraceCursor, LedgerTraceRead},
     request::{
         BatchAdmission, BatchDeadline, BatchRequestSpec, CancelDisposition, EngineSnapshot,
         OutputEvent, RequestPhase, RequestSpec, ShutdownReport, StepReport, TerminalOutcome,
@@ -47,6 +48,7 @@ const ACTIVE_PLAN_LEN: usize = 2;
 #[cfg(test)]
 thread_local! {
     static BATCH_ALLOCATION_FAILURE_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    static SHUTDOWN_RELEASE_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -74,6 +76,30 @@ fn batch_allocation_checkpoint() -> SchedulerResult<()> {
 
 #[cfg(not(test))]
 fn batch_allocation_checkpoint() -> SchedulerResult<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_shutdown_release_for_test() {
+    SHUTDOWN_RELEASE_FAILURE.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+fn shutdown_release_checkpoint() -> SchedulerResult<()> {
+    SHUTDOWN_RELEASE_FAILURE.with(|failure| {
+        if failure.replace(false) {
+            Err(SchedulerError::allocation_failure(
+                "shutdown release checkpoint",
+                0,
+            ))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn shutdown_release_checkpoint() -> SchedulerResult<()> {
     Ok(())
 }
 
@@ -179,10 +205,10 @@ impl<A: DecoderAdapter> PreparedAdmission<'_, A> {
 
         // No fallible call is permitted after this publication boundary.
         *self.monotonic_ns = release_ns;
-        let mut aggregate = self
-            .ledger
-            .take()
-            .map_or_else(LedgerReservation::empty, ProvisionalLedgerPermit::commit);
+        let mut aggregate = match self.ledger.take() {
+            Some(permit) => permit.commit_for_requests(&self.prospective_ids, &self.partitions),
+            None => LedgerReservation::empty(),
+        };
         self.request_ids.commit_prevalidated(&self.prospective_ids);
         for request in &self.prepared {
             let issued = self.slots[request.slot_index]
@@ -333,6 +359,26 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .acquire_provisional(shared_plan.as_slice())
             .map_err(map_ledger_error)?;
 
+        // Preallocate the second half of every paired trace slot before
+        // allocating any other scheduler-owned payload. If this fails, destroy
+        // the transferred adapter before rolling back its model-resident and
+        // other static logical ownership.
+        let ledger_trace = match ledger.prepare_trace_recorder(config.trace_capacity()) {
+            Ok(trace) => trace,
+            Err(_) => {
+                drop(adapter);
+                ledger
+                    .rollback_provisional(provisional)
+                    .map_err(map_ledger_error)?;
+                return Err(SchedulerError::allocation_failure(
+                    "ledger trace capacity",
+                    u64::try_from(config.trace_capacity())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(64),
+                ));
+            }
+        };
+
         let allocation = Self::try_allocate_shared(&adapter, &config);
         let (
             slots,
@@ -348,6 +394,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         ) = match allocation {
             Ok(parts) => parts,
             Err(error) => {
+                drop(ledger_trace);
+                drop(adapter);
                 ledger
                     .rollback_provisional(provisional)
                     .map_err(map_ledger_error)?;
@@ -357,6 +405,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let shared_reservation = ledger
             .commit_provisional(provisional)
             .map_err(map_ledger_error)?;
+        ledger.install_preallocated_trace(ledger_trace);
 
         Ok(Self {
             adapter: Some(adapter),
@@ -778,6 +827,9 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 .map_err(map_ledger_error)?,
             None => ExactReservationPartitions::empty(),
         };
+        partitions
+            .validate_trace_request_owners(&prospective_ids)
+            .map_err(map_ledger_error)?;
 
         // These shadow bindings are deliberately declared after the permit.
         // On every preparation error, Rust drops their charged payloads and
@@ -1085,82 +1137,68 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
             .prepare()?;
 
-        let provisional = self
-            .ledger
-            .acquire_provisional(admission_plan.as_slice())
-            .map_err(map_ledger_error)?;
-        let allocation = (|| {
+        let output_capacity = self.config.output_capacity_per_request();
+        let (
+            prompt,
+            request_id,
+            key,
+            control,
+            endpoint,
+            receiver,
+            prompt_reservation,
+            retained_reservation,
+        ) = {
+            let SchedulerEngine {
+                ledger,
+                request_ids,
+                slots,
+                controls,
+                endpoints,
+                ..
+            } = self;
+            // Every fallible ownership transfer stays behind this permit. Its
+            // drop path removes the provisional bytes and restores historical
+            // peaks exactly, so failed admissions emit no durable evidence.
+            let ledger_permit = ledger
+                .acquire_provisional_permit(admission_plan.as_slice())
+                .map_err(map_ledger_error)?;
             let prompt = Self::try_allocate_request_payload(prompt)?;
-            let endpoint = self
-                .endpoints
+            let prepared_endpoint = endpoints
                 .as_ref()
                 .ok_or_else(|| SchedulerError::internal("request endpoints are unavailable"))?
-                .prepare(self.config.output_capacity_per_request())?;
-            Ok((prompt, endpoint))
-        })();
-        let (prompt, prepared_endpoint) = match allocation {
-            Ok(payload) => payload,
-            Err(error) => {
-                self.ledger
-                    .rollback_provisional(provisional)
-                    .map_err(map_ledger_error)?;
-                return Err(error);
-            }
-        };
-        let base_reservation = self
-            .ledger
-            .commit_provisional(provisional)
-            .map_err(map_ledger_error)?;
-        let (prompt_reservation, retained_reservation) =
-            base_reservation.split_category(LedgerCategory::PromptStorage);
-
-        let request_id = match self.request_ids.issue() {
-            Ok(identity) => identity,
-            Err(error) => {
-                let release = self
-                    .ledger
-                    .prepare_release([&prompt_reservation, &retained_reservation])
-                    .map_err(map_ledger_error)?;
-                release.apply();
-                return Err(map_identity_error(error));
-            }
-        };
-        let generation = match self.slots[slot_index].generations.issue() {
-            Ok(generation) => generation,
-            Err(error) => {
-                let release = self
-                    .ledger
-                    .prepare_release([&prompt_reservation, &retained_reservation])
-                    .map_err(map_ledger_error)?;
-                release.apply();
-                return Err(map_identity_error(error));
-            }
-        };
-        let key = SlotKey::new(slot_index, generation);
-        let binding = (|| {
-            let endpoints = self
-                .endpoints
+                .prepare(output_capacity)?;
+            let request_id = request_ids.issue().map_err(map_identity_error)?;
+            let generation = slots[slot_index]
+                .generations
+                .issue()
+                .map_err(map_identity_error)?;
+            let key = SlotKey::new(slot_index, generation);
+            let endpoints = endpoints
                 .as_mut()
                 .ok_or_else(|| SchedulerError::internal("request endpoints are unavailable"))?;
-            let controls = self
-                .controls
+            let controls = controls
                 .as_mut()
                 .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
             let endpoint = endpoints.begin_bind(prepared_endpoint, key)?;
             let control = controls.bind(prepared_control)?;
             let (producer, receiver) = endpoint.commit(control.clone(), request_id);
-            Ok((control, producer, receiver))
-        })();
-        let (control, endpoint, receiver) = match binding {
-            Ok(binding) => binding,
-            Err(error) => {
-                let release = self
-                    .ledger
-                    .prepare_release([&prompt_reservation, &retained_reservation])
-                    .map_err(map_ledger_error)?;
-                release.apply();
-                return Err(error);
-            }
+
+            // This is the first infallible boundary at which every accepted
+            // owner is public. Recording and disarming the rollback happen as
+            // one allocation-free operation behind the exclusive borrow.
+            let base_reservation = ledger_permit.commit_for_request(request_id);
+            let (prompt_reservation, retained_reservation) =
+                base_reservation.split_category(LedgerCategory::PromptStorage);
+            (
+                prompt,
+                request_id,
+                key,
+                control,
+                producer,
+                receiver,
+                prompt_reservation,
+                retained_reservation,
+            )
         };
         let (direct_receiver, result) = finish(request_id, &control, receiver);
         let record = RequestRecord {
@@ -1280,6 +1318,33 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     #[must_use]
     pub fn ledger_snapshot(&self) -> crate::LedgerSnapshot {
         self.ledger.snapshot()
+    }
+
+    /// Borrows the append-only logical-ledger suffix beginning at `cursor`.
+    ///
+    /// The immutable sequence-zero snapshot captures static shared ownership
+    /// after construction. Later complete sequences contain only durable
+    /// request-owned acquisitions and releases. Reads allocate nothing and do
+    /// not affect accounting. Read from origin for a self-contained replay, or
+    /// retain each returned cursor and applied state with this same engine for
+    /// incremental replay. A whole mutation that cannot fit makes ledger
+    /// overflow sticky without affecting the independently bounded service
+    /// trace or scheduler behavior. Capture the final request-zero prefix
+    /// before successful shutdown destroys both trace allocations.
+    pub fn ledger_trace_since(
+        &self,
+        cursor: LedgerTraceCursor,
+    ) -> SchedulerResult<LedgerTraceRead<'_>> {
+        if let Some(read) = self.ledger.ledger_trace_since(cursor) {
+            return Ok(read);
+        }
+        if self.ledger.has_ledger_trace() {
+            return Err(SchedulerError::invalid_request(
+                "ledger_trace_cursor",
+                "does not identify a complete retained mutation boundary",
+            ));
+        }
+        Err(SchedulerError::scheduler_closed())
     }
 
     /// Borrows the append-only service-trace suffix beginning at `cursor`.
@@ -1515,17 +1580,16 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 Err(error) if error.is_resource_exhausted() => break,
                 Err(error) => return Err(map_ledger_error(error)),
             }
-            let provisional = self
-                .ledger
-                .acquire_provisional(plan.as_slice())
-                .map_err(map_ledger_error)?;
             let layout = self.record_for_key(key)?.state_layout;
+            let request_id = self.record_for_key(key)?.request_id;
+            let ledger_permit = self
+                .ledger
+                .acquire_provisional_permit(plan.as_slice())
+                .map_err(map_ledger_error)?;
             let state = match adapter.new_state(layout) {
                 Ok(state) => state,
                 Err(source) => {
-                    self.ledger
-                        .rollback_provisional(provisional)
-                        .map_err(map_ledger_error)?;
+                    drop(ledger_permit);
                     let category =
                         SchedulerError::adapter("allocating request state", source).category();
                     self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
@@ -1533,22 +1597,30 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                     continue;
                 }
             };
-            let reservation = self
-                .ledger
-                .commit_provisional(provisional)
-                .map_err(map_ledger_error)?;
-            let request_id = self.record_for_key(key)?.request_id;
+            let slot = self
+                .slots
+                .get_mut(key.index())
+                .ok_or_else(|| SchedulerError::internal("promotion slot index is out of range"))?;
+            if slot.key != Some(key) {
+                return Err(SchedulerError::internal(
+                    "promotion slot generation is stale",
+                ));
+            }
+            let record = slot
+                .record
+                .as_mut()
+                .ok_or_else(|| SchedulerError::internal("promotion request record is missing"))?;
+            if record.request_id != request_id || record.phase != RequestPhase::Queued {
+                return Err(SchedulerError::internal(
+                    "promotion request identity or phase changed",
+                ));
+            }
             if let Err(error) = ring.insert(key, request_id) {
-                let release = self
-                    .ledger
-                    .prepare_release([&reservation])
-                    .map_err(map_ledger_error)?;
                 drop(state);
-                drop(reservation);
-                release.apply();
+                drop(ledger_permit);
                 return Err(map_ring_error(error));
             }
-            let record = self.record_mut_for_key(key)?;
+            let reservation = ledger_permit.commit_for_request(request_id);
             record.state = Some(state);
             record.active_reservation = Some(reservation);
             record.phase = RequestPhase::Ready;
@@ -2162,8 +2234,10 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 "service trace capacity changed before commit",
             ));
         }
+        let request_id = record.request_id;
         let release = ledger
-            .prepare_release(
+            .prepare_request_release(
+                request_id,
                 record
                     .active_reservation
                     .iter()
@@ -2174,7 +2248,6 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .state
             .take()
             .ok_or_else(|| SchedulerError::internal("commit adapter state is missing"))?;
-        let request_id = record.request_id;
         let service_event = ServiceTraceEvent::new(request_id, position, service_phase);
         let deadline_ns = record.deadline_ns;
         let control = &record.control;
@@ -2236,10 +2309,12 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                     let _ = record.prompt.take();
                     let _ = record.active_reservation.take();
                     let _ = record.prompt_reservation.take();
+                    // Active-state ownership ends only after its numerical
+                    // payload is destroyed; the trace/release follows it.
+                    drop(state);
                     if let Some(release) = release.take() {
                         release.apply();
                     }
-                    drop(state);
                 } else {
                     record.state = Some(state);
                 }
@@ -2342,7 +2417,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let control_snapshot = record.control.fresh_snapshot()?;
         let release = self
             .ledger
-            .prepare_release(
+            .prepare_request_release(
+                record.request_id,
                 record
                     .active_reservation
                     .iter()
@@ -2495,6 +2571,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .as_ref()
             .ok_or_else(|| SchedulerError::internal("reap request record is missing"))?;
         validate_terminal_resources_released(record)?;
+        let request_id = record.request_id;
         let emitted_tokens = record.emitted_tokens;
         let endpoint_snapshot = record.endpoint.snapshot()?;
         let reservation = record
@@ -2503,7 +2580,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .ok_or_else(|| SchedulerError::internal("retained request reservation is missing"))?;
         let release = self
             .ledger
-            .prepare_release([reservation])
+            .prepare_request_release(request_id, [reservation])
             .map_err(map_ledger_error)?;
         let endpoint = self
             .endpoints
@@ -2549,6 +2626,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 && self.sampling.is_none()
                 && self.wave.is_none()
                 && self.service_trace.is_none()
+                && !self.ledger.has_ledger_trace()
                 && self.controls.is_none()
                 && self.endpoints.is_none()
             {
@@ -2623,14 +2701,31 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             return Err(error);
         }
 
+        if let Err(error) = shutdown_release_checkpoint() {
+            self.ring = Some(ring);
+            return Err(error);
+        }
+
         let snapshot = self.ledger.snapshot();
-        let released_request_bytes = request_bytes_before
-            .checked_sub(snapshot.request_used())
-            .ok_or_else(|| SchedulerError::internal("released request byte count underflows"))?;
-        let shared = self
-            .shared_reservation
-            .as_ref()
-            .ok_or_else(|| SchedulerError::internal("shared scheduler reservation is missing"))?;
+        let released_request_bytes = match request_bytes_before.checked_sub(snapshot.request_used())
+        {
+            Some(bytes) => bytes,
+            None => {
+                self.ring = Some(ring);
+                return Err(SchedulerError::internal(
+                    "released request byte count underflows",
+                ));
+            }
+        };
+        let shared = match self.shared_reservation.as_ref() {
+            Some(shared) => shared,
+            None => {
+                self.ring = Some(ring);
+                return Err(SchedulerError::internal(
+                    "shared scheduler reservation is missing",
+                ));
+            }
+        };
         let release = match self.ledger.prepare_release([shared]) {
             Ok(release) => release,
             Err(error) => {
@@ -2651,7 +2746,10 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         self.free_slots = Vec::new();
         self.queued = VecDeque::new();
         let _ = self.shared_reservation.take();
-        release.apply();
+        // The final observable trace prefix proves request ownership reached
+        // zero. Shared teardown is proven by the post-shutdown ledger snapshot:
+        // destroy the recorder before releasing its own static shared charge.
+        release.drop_trace_and_apply();
         let snapshot = self.ledger.snapshot();
         Ok(ShutdownReport {
             terminated_requests,

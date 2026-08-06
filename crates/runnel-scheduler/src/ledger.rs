@@ -4,9 +4,18 @@
 //! to estimate allocator metadata or resident set size. Every charge is rounded
 //! independently to [`LEDGER_QUANTUM_BYTES`] before it enters an acquire plan.
 
+use std::collections::TryReserveError;
 use std::fmt;
 
 use thiserror::Error;
+
+use crate::{
+    RequestId,
+    ledger_trace::{
+        LedgerMutationKind, LedgerTraceChange, LedgerTraceCursor, LedgerTraceOwner,
+        LedgerTraceRead, LedgerTraceRecorder,
+    },
+};
 
 /// Logical accounting quantum used by every scheduler charge.
 pub const LEDGER_QUANTUM_BYTES: u64 = 64;
@@ -64,6 +73,12 @@ impl LedgerCategory {
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
+    }
+
+    /// Returns the stable compact evidence identifier (`0..=15`).
+    #[must_use]
+    pub const fn evidence_id(self) -> u8 {
+        self as u8
     }
 
     #[must_use]
@@ -502,6 +517,30 @@ impl ExactReservationPartitions {
     pub(crate) fn is_complete(&self) -> bool {
         self.next == self.partitions.len()
     }
+
+    /// Validates the request identities which will own these exact partitions
+    /// before the batch publication boundary.
+    pub(crate) fn validate_trace_request_owners(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<(), LedgerError> {
+        if self.next != 0
+            || request_ids.len() != self.partitions.len()
+            || !request_ids
+                .windows(2)
+                .all(|pair| pair[0].get() < pair[1].get())
+            || self.partitions.iter().any(|partition| {
+                partition.shared_bytes != 0
+                    || LedgerCategory::ALL.iter().any(|category| {
+                        category.ownership() == LedgerOwnership::Shared
+                            && partition.bytes[category.index()] != 0
+                    })
+            })
+        {
+            return Err(LedgerError::ReservationPartitionMismatch);
+        }
+        Ok(())
+    }
 }
 
 impl ReservationPartition {
@@ -561,7 +600,39 @@ impl ProvisionalLedgerPermit<'_> {
     /// Makes the provisional bytes durable. This changes neither usage nor
     /// high-water accounting and cannot fail while the exclusive borrow is
     /// retained.
+    #[cfg(test)]
     pub(crate) fn commit(mut self) -> LedgerReservation {
+        self.armed = false;
+        std::mem::replace(&mut self.reservation, LedgerReservation::empty())
+    }
+
+    /// Makes one request-owned acquisition durable and records it at the
+    /// infallible publication boundary retained behind this exclusive borrow.
+    pub(crate) fn commit_for_request(mut self, request_id: RequestId) -> LedgerReservation {
+        debug_assert_eq!(self.reservation.shared_bytes, 0);
+        self.ledger
+            .record_committed_request_acquire(request_id, &self.reservation);
+        self.armed = false;
+        std::mem::replace(&mut self.reservation, LedgerReservation::empty())
+    }
+
+    /// Makes an exact batch acquisition durable and records every request
+    /// owner under one repeated mutation sequence.
+    ///
+    /// [`ExactReservationPartitions::validate_trace_request_owners`] must be
+    /// called before entering an infallible publication boundary.
+    pub(crate) fn commit_for_requests(
+        mut self,
+        request_ids: &[RequestId],
+        partitions: &ExactReservationPartitions,
+    ) -> LedgerReservation {
+        debug_assert!(
+            partitions
+                .validate_trace_request_owners(request_ids)
+                .is_ok()
+        );
+        self.ledger
+            .record_request_partition_acquire(request_ids, &partitions.partitions);
         self.armed = false;
         std::mem::replace(&mut self.reservation, LedgerReservation::empty())
     }
@@ -625,18 +696,47 @@ impl Drop for ProvisionalLedgerPermit<'_> {
 /// from invalidating the prepared projection. Applying the permit is therefore
 /// infallible; dropping it without applying it leaves the ledger unchanged.
 #[must_use = "prepared ledger releases must be applied or deliberately abandoned"]
-#[derive(Debug)]
 pub struct ReleasePermit<'ledger> {
     ledger: &'ledger mut CapacityLedger,
     projection: Projection,
     mutation: u64,
+    trace_mutation: Option<PreparedLedgerTraceMutation>,
+}
+
+impl fmt::Debug for ReleasePermit<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReleasePermit")
+            .field("trace_evidence", &self.trace_mutation.is_some())
+            .finish()
+    }
 }
 
 impl ReleasePermit<'_> {
     /// Commits the already validated release as one ledger mutation.
     pub fn apply(self) {
+        if let Some(trace_mutation) = self.trace_mutation {
+            self.ledger.record_trace_mutation(trace_mutation);
+        }
         self.ledger.apply_release(&self.projection, self.mutation);
     }
+
+    /// Drops the recorder immediately before applying this prepared release.
+    ///
+    /// Successful scheduler shutdown uses this after every trace consumer has
+    /// taken its final read and after the trace allocation itself is dropped.
+    /// Dropping the permit without calling this method changes neither state.
+    pub(crate) fn drop_trace_and_apply(self) {
+        let _ = self.ledger.trace.take();
+        self.ledger.apply_release(&self.projection, self.mutation);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparedLedgerTraceMutation {
+    kind: LedgerMutationKind,
+    owner: LedgerTraceOwner,
+    bytes: [u64; LEDGER_CATEGORY_COUNT],
 }
 
 /// Fixed-array semantic capacity ledger.
@@ -653,6 +753,7 @@ pub struct CapacityLedger {
     total_peak: u64,
     total_limit: u64,
     mutation: u64,
+    trace: Option<LedgerTraceRecorder>,
 }
 
 impl CapacityLedger {
@@ -672,6 +773,7 @@ impl CapacityLedger {
             total_peak: 0,
             total_limit,
             mutation: 0,
+            trace: None,
         }
     }
 
@@ -784,6 +886,25 @@ impl CapacityLedger {
         Ok(provisional.reservation)
     }
 
+    /// Records an already committed request-owned acquisition at its durable
+    /// publication boundary. Callers must prove that the corresponding ledger
+    /// transition cannot subsequently be omitted from evidence: a raw commit
+    /// followed by an untraced release can raise historical peaks and is not a
+    /// valid substitute for retaining a provisional rollback through fallible
+    /// ownership transfers.
+    pub(crate) fn record_committed_request_acquire(
+        &mut self,
+        request_id: RequestId,
+        reservation: &LedgerReservation,
+    ) {
+        debug_assert_eq!(reservation.shared_bytes, 0);
+        self.record_trace_mutation(PreparedLedgerTraceMutation {
+            kind: LedgerMutationKind::Acquire,
+            owner: LedgerTraceOwner::Request(request_id),
+            bytes: reservation.bytes,
+        });
+    }
+
     /// Reverses the most recent provisional acquisition and restores every
     /// high-water counter to its exact pre-acquire value.
     pub fn rollback_provisional(
@@ -824,6 +945,30 @@ impl CapacityLedger {
         &mut self,
         reservations: impl IntoIterator<Item = &'reservation LedgerReservation>,
     ) -> Result<ReleasePermit<'_>, LedgerError> {
+        self.prepare_release_inner(reservations, None)
+    }
+
+    /// Prevalidates an atomic release owned by one accepted request and binds
+    /// the durable mutation evidence to the resulting permit.
+    pub(crate) fn prepare_request_release<'reservation>(
+        &mut self,
+        request_id: RequestId,
+        reservations: impl IntoIterator<Item = &'reservation LedgerReservation>,
+    ) -> Result<ReleasePermit<'_>, LedgerError> {
+        self.prepare_release_inner(
+            reservations,
+            Some((
+                LedgerMutationKind::Release,
+                LedgerTraceOwner::Request(request_id),
+            )),
+        )
+    }
+
+    fn prepare_release_inner<'reservation>(
+        &mut self,
+        reservations: impl IntoIterator<Item = &'reservation LedgerReservation>,
+        trace_owner: Option<(LedgerMutationKind, LedgerTraceOwner)>,
+    ) -> Result<ReleasePermit<'_>, LedgerError> {
         let mut bytes = [0_u64; LEDGER_CATEGORY_COUNT];
         for reservation in reservations {
             for category in LedgerCategory::ALL {
@@ -838,11 +983,59 @@ impl CapacityLedger {
         let summary = summarize_bytes(bytes)?;
         let projection = self.project_release(&bytes, &summary)?;
         let mutation = self.next_mutation()?;
+        if let Some((_, owner)) = trace_owner {
+            debug_assert!(LedgerCategory::ALL.iter().all(|category| {
+                bytes[category.index()] == 0 || category.ownership() == owner.ownership()
+            }));
+        }
         Ok(ReleasePermit {
             ledger: self,
             projection,
             mutation,
+            trace_mutation: trace_owner.map(|(kind, owner)| PreparedLedgerTraceMutation {
+                kind,
+                owner,
+                bytes,
+            }),
         })
+    }
+
+    /// Fallibly preallocates an unattached recorder from the current shared
+    /// baseline. Constructors call this while the static shared acquisition
+    /// is still provisional, so any later allocation failure can roll back the
+    /// ledger and simply drop this recorder.
+    pub(crate) fn prepare_trace_recorder(
+        &self,
+        event_limit: usize,
+    ) -> Result<LedgerTraceRecorder, TryReserveError> {
+        debug_assert_eq!(self.request_used, 0);
+        LedgerTraceRecorder::try_new(event_limit, self.snapshot())
+    }
+
+    /// Installs a recorder which was fully allocated while static shared
+    /// ownership was still provisional. Installation itself cannot allocate.
+    pub(crate) fn install_preallocated_trace(&mut self, recorder: LedgerTraceRecorder) {
+        debug_assert!(self.trace.is_none());
+        debug_assert_eq!(self.request_used, 0);
+        self.trace = Some(recorder);
+    }
+
+    /// Borrows a retained ledger-event suffix. `None` means either no recorder
+    /// is installed or the cursor is outside the retained prefix or inside one
+    /// complete repeated-sequence mutation.
+    pub(crate) fn ledger_trace_since(
+        &self,
+        cursor: LedgerTraceCursor,
+    ) -> Option<LedgerTraceRead<'_>> {
+        self.trace
+            .as_ref()
+            .and_then(|trace| trace.read_since(cursor))
+    }
+
+    /// Returns whether a readable recorder is currently installed.
+    #[must_use]
+    pub(crate) const fn has_ledger_trace(&self) -> bool {
+        self.trace.is_some()
     }
 
     #[must_use]
@@ -1011,6 +1204,42 @@ impl CapacityLedger {
         self.total_used = projection.total;
         self.mutation = mutation;
     }
+
+    fn record_trace_mutation(&mut self, mutation: PreparedLedgerTraceMutation) {
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        trace.record_mutation(
+            mutation.kind,
+            LedgerCategory::ALL.into_iter().map(|category| {
+                LedgerTraceChange::new(mutation.owner, category, mutation.bytes[category.index()])
+            }),
+        );
+    }
+
+    fn record_request_partition_acquire(
+        &mut self,
+        request_ids: &[RequestId],
+        partitions: &[ReservationPartition],
+    ) {
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        trace.record_mutation(
+            LedgerMutationKind::Acquire,
+            request_ids.iter().copied().zip(partitions.iter()).flat_map(
+                |(request_id, partition)| {
+                    LedgerCategory::ALL.into_iter().map(move |category| {
+                        LedgerTraceChange::new(
+                            LedgerTraceOwner::Request(request_id),
+                            category,
+                            partition.bytes[category.index()],
+                        )
+                    })
+                },
+            ),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1093,6 +1322,7 @@ mod tests {
         CapacityLedger, LEDGER_CATEGORY_COUNT, LEDGER_QUANTUM_BYTES, LedgerCategory, LedgerCharge,
         LedgerError, LedgerOwnership, LedgerReservation, LedgerScope, ReservationPartition,
     };
+    use crate::{LedgerMutationKind, LedgerTraceCursor, id::request_id_for_test};
 
     const MAX_ALIGNED: u64 = u64::MAX - (LEDGER_QUANTUM_BYTES - 1);
 
@@ -1125,6 +1355,178 @@ mod tests {
             LedgerCharge::from_aligned(category, 65),
             Err(LedgerError::UnalignedCharge { category })
         );
+    }
+
+    #[test]
+    fn category_evidence_ids_are_frozen_zero_through_fifteen() {
+        let expected = [
+            (LedgerCategory::PromptStorage, 0_u8),
+            (LedgerCategory::RequestRecord, 1),
+            (LedgerCategory::RequestSlot, 2),
+            (LedgerCategory::ActiveState, 3),
+            (LedgerCategory::PendingTransaction, 4),
+            (LedgerCategory::Output, 5),
+            (LedgerCategory::Terminal, 6),
+            (LedgerCategory::WorkerScratch, 7),
+            (LedgerCategory::SamplingScratch, 8),
+            (LedgerCategory::CoalescedBatch, 9),
+            (LedgerCategory::ModelResident, 10),
+            (LedgerCategory::PagePool, 11),
+            (LedgerCategory::Trace, 12),
+            (LedgerCategory::AdmissionReserve, 13),
+            (LedgerCategory::ActorCommand, 14),
+            (LedgerCategory::ActorControl, 15),
+        ];
+        assert_eq!(
+            LedgerCategory::ALL.map(|category| (category, category.evidence_id())),
+            expected
+        );
+        for (category, evidence_id) in expected {
+            assert_eq!(category.index(), usize::from(evidence_id));
+        }
+    }
+
+    #[test]
+    fn preallocated_trace_starts_at_shared_snapshot_and_replays_request_lifecycle() {
+        let mut ledger = CapacityLedger::new(512, unlimited_categories());
+        let shared = ledger
+            .acquire(&[charge(LedgerCategory::WorkerScratch, 64)])
+            .unwrap();
+        let recorder = ledger.prepare_trace_recorder(8).unwrap();
+        ledger.install_preallocated_trace(recorder);
+        assert!(ledger.has_ledger_trace());
+
+        let request_id = request_id_for_test(7);
+        let permit = ledger
+            .acquire_provisional_permit(&[
+                charge(LedgerCategory::PromptStorage, 64),
+                charge(LedgerCategory::Output, 128),
+            ])
+            .unwrap();
+        let request = permit.commit_for_request(request_id);
+        ledger
+            .prepare_request_release(request_id, [&request])
+            .unwrap()
+            .apply();
+
+        let read = ledger
+            .ledger_trace_since(LedgerTraceCursor::origin())
+            .unwrap();
+        assert_eq!(read.initial_snapshot().sequence(), 0);
+        assert_eq!(
+            read.initial_snapshot()
+                .ledger_snapshot()
+                .category(LedgerCategory::WorkerScratch)
+                .used(),
+            64
+        );
+        assert_eq!(read.events().len(), 4);
+        assert_eq!(
+            read.events()
+                .iter()
+                .map(|event| (
+                    event.sequence(),
+                    event.kind(),
+                    event.owner().evidence_id(),
+                    event.category(),
+                    event.signed_delta_bytes(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    1,
+                    LedgerMutationKind::Acquire,
+                    7,
+                    LedgerCategory::PromptStorage,
+                    64,
+                ),
+                (
+                    1,
+                    LedgerMutationKind::Acquire,
+                    7,
+                    LedgerCategory::Output,
+                    128,
+                ),
+                (
+                    2,
+                    LedgerMutationKind::Release,
+                    7,
+                    LedgerCategory::PromptStorage,
+                    -64,
+                ),
+                (
+                    2,
+                    LedgerMutationKind::Release,
+                    7,
+                    LedgerCategory::Output,
+                    -128,
+                ),
+            ]
+        );
+        assert_eq!(read.status().retained_mutations(), 2);
+        assert!(read.status().healthy());
+        drop(request);
+        ledger.release(shared).unwrap();
+    }
+
+    #[test]
+    fn exact_batch_partitions_share_one_trace_sequence_in_request_order() {
+        let mut ledger = CapacityLedger::new(512, unlimited_categories());
+        let recorder = ledger.prepare_trace_recorder(8).unwrap();
+        ledger.install_preallocated_trace(recorder);
+        let first = [charge(LedgerCategory::PromptStorage, 64)];
+        let second = [
+            charge(LedgerCategory::RequestRecord, 64),
+            charge(LedgerCategory::Output, 64),
+        ];
+        let aggregate = [first[0], second[0], second[1]];
+        let permit = ledger.acquire_provisional_permit(&aggregate).unwrap();
+        let partitions = permit
+            .prove_exact_partitions(vec![
+                ReservationPartition::from_charges(&first).unwrap(),
+                ReservationPartition::from_charges(&second).unwrap(),
+            ])
+            .unwrap();
+        let request_ids = [request_id_for_test(10), request_id_for_test(11)];
+        partitions
+            .validate_trace_request_owners(&request_ids)
+            .unwrap();
+        let aggregate = permit.commit_for_requests(&request_ids, &partitions);
+
+        let read = ledger
+            .ledger_trace_since(LedgerTraceCursor::origin())
+            .unwrap();
+        assert_eq!(read.events().len(), 3);
+        assert!(read.events().iter().all(|event| event.sequence() == 1));
+        assert_eq!(
+            read.events()
+                .iter()
+                .map(|event| (event.owner().evidence_id(), event.category().evidence_id()))
+                .collect::<Vec<_>>(),
+            vec![(10, 0), (11, 1), (11, 5)]
+        );
+
+        let mut partitions = partitions;
+        let (first, remainder) = partitions.split_next(aggregate);
+        let (second, remainder) = partitions.split_next(remainder);
+        assert!(remainder.is_empty());
+        ledger.release(first).unwrap();
+        ledger.release(second).unwrap();
+    }
+
+    #[test]
+    fn prepared_shutdown_release_drops_trace_only_when_applied() {
+        let mut ledger = CapacityLedger::new(64, unlimited_categories());
+        let shared = ledger
+            .acquire(&[charge(LedgerCategory::WorkerScratch, 64)])
+            .unwrap();
+        let recorder = ledger.prepare_trace_recorder(1).unwrap();
+        ledger.install_preallocated_trace(recorder);
+        let release = ledger.prepare_release([&shared]).unwrap();
+        release.drop_trace_and_apply();
+        drop(shared);
+        assert!(!ledger.has_ledger_trace());
+        assert!(ledger.snapshot().current_is_zero());
     }
 
     #[test]
