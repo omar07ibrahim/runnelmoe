@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent bounded semantic primitives for actor race-history captures.
 
-This layer owns seven deliberately narrow responsibilities:
+This layer owns eight deliberately narrow responsibilities:
 
 * a deterministic, reason-labelled partial-order DAG with bitset reachability;
 * authentication and exact comparison of the frozen scheduler action program;
@@ -9,15 +9,17 @@ This layer owns seven deliberately narrow responsibilities:
 * submission-command custody and an explicit event graph for admission results;
 * immutable accepted-identity projection and target lookup/access custody;
 * packed control-word algebra and request/control lifecycle custody;
-* endpoint terminal/EOF, FIFO output, cleanup-receiver, and recorder custody.
+* endpoint terminal/EOF, FIFO output, cleanup-receiver, and recorder custody;
+* wake-signal park-epoch order, final shutdown conservation, and bounded
+  full-capture structural verification.
 
-It does not interpret model or wake semantics beyond their frozen structural
-witnesses, and recorder append positions are not promoted into causal order.
-Action interval counters are mapped to explicit Invoke and Respond nodes; they
-are never promoted into a counter-derived global execution order.  In
-particular, consuming an actor command response is a separate CommandRelease
-event, never an alias for either ActorCommandRespond publication or the
-action's final Respond counter.
+It deliberately leaves model-prefix semantics to the independent model gate,
+and recorder append positions are not promoted into causal order.  Action
+interval counters are mapped to explicit Invoke and Respond nodes; they are
+never promoted into a counter-derived global execution order.  In particular,
+consuming an actor command response is a separate CommandRelease event, never
+an alias for either ActorCommandRespond publication or the action's final
+Respond counter.
 """
 
 from __future__ import annotations
@@ -211,6 +213,42 @@ if MAX_ENDPOINT_OBSERVATION_EDGE_INPUTS != 12_976:
     raise RuntimeError("endpoint observation edge-input budget does not total 12976")
 if MAX_ENDPOINT_OBSERVATION_EDGE_INPUTS > MAX_PROTOCOL_EDGE_INPUTS:
     raise RuntimeError("endpoint observation edge bound exceeds the protocol cap")
+
+# The final structural slice consumes the exact remaining node budget: one
+# signal-linearization event for each authenticated wake action and one
+# existential owner-done publication after the pre-shutdown gate.  Wake
+# acknowledgement remains scalar park-epoch evidence; the capture does not
+# witness a second point that could soundly be promoted into the DAG.
+_WAKE_SHUTDOWN_NODE_BUDGET = (
+    ("endpoint observation", MAX_ENDPOINT_OBSERVATION_NODES),
+    ("wake signal events", EXPECTED_KIND_COUNTS[4]),
+    ("owner-done publication", 1),
+)
+MAX_WAKE_SHUTDOWN_NODES = sum(
+    count for _, count in _WAKE_SHUTDOWN_NODE_BUDGET
+)
+if MAX_WAKE_SHUTDOWN_NODES != 4_258:
+    raise RuntimeError("wake/shutdown node budget does not total 4258")
+if MAX_WAKE_SHUTDOWN_NODES != MAX_PROTOCOL_NODES:
+    raise RuntimeError("wake/shutdown node budget does not close the protocol cap")
+
+# At most one direction of the strict wake bracket relation can hold for a
+# pair because every acknowledgement epoch is greater than its own before
+# epoch.  Count the complete pairwise relation before graph deduplication.
+_WAKE_COUNT = EXPECTED_KIND_COUNTS[4]
+_WAKE_SHUTDOWN_EDGE_INPUT_BUDGET = (
+    ("endpoint observation", MAX_ENDPOINT_OBSERVATION_EDGE_INPUTS),
+    ("wake invocation and response custody", 2 * _WAKE_COUNT),
+    ("wake park-epoch order", _WAKE_COUNT * (_WAKE_COUNT - 1) // 2),
+    ("pre-shutdown before owner-done", 1),
+)
+MAX_WAKE_SHUTDOWN_EDGE_INPUTS = sum(
+    count for _, count in _WAKE_SHUTDOWN_EDGE_INPUT_BUDGET
+)
+if MAX_WAKE_SHUTDOWN_EDGE_INPUTS != 22_846:
+    raise RuntimeError("wake/shutdown edge-input budget does not total 22846")
+if MAX_WAKE_SHUTDOWN_EDGE_INPUTS > MAX_PROTOCOL_EDGE_INPUTS:
+    raise RuntimeError("wake/shutdown edge bound exceeds the protocol edge cap")
 _SCHEDULER_TO_CAPTURE_KIND = {
     "submit": "submit",
     "cancel": "cancel",
@@ -808,6 +846,62 @@ class EndpointObservationOrder:
 
 
 @dataclass(frozen=True, slots=True)
+class WakeSignalLifecycle:
+    """One witnessed global wake signal and its scalar park-epoch bracket."""
+
+    action_ordinal: int
+    producer: int
+    dirty_was_set: bool
+    before_park_epoch: int
+    after_park_epoch: int
+    signal: ProtocolEvent
+
+
+@dataclass(frozen=True, slots=True)
+class WakeShutdownMapping:
+    """Immutable wake, final-owner, and lifecycle-accounting projection."""
+
+    by_action: tuple[WakeSignalLifecycle | None, ...]
+    in_action_order: tuple[WakeSignalLifecycle, ...]
+    owner_done_publish: PhaseEvent
+    diagnostics: actor_race_history.Diagnostics
+    pre_cleanup: actor_race_history.ProbeSnapshot
+    pre_shutdown: actor_race_history.ProbeSnapshot
+    post_shutdown: actor_race_history.ProbeSnapshot
+    shutdown: actor_race_history.Shutdown
+    phase_events: tuple[PhaseEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WakeShutdownOrder:
+    """Complete structural order for one authenticated race repetition."""
+
+    endpoint_order: EndpointObservationOrder
+    lifecycle: WakeShutdownMapping
+    graph: ReasonedDAG
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralRepetitionReport:
+    """Bounded summary retained by the streaming full-capture entry point."""
+
+    repetition: int
+    node_count: int
+    edge_count: int
+    wake_count: int
+    accepted_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralCaptureReport:
+    """Immutable summaries for all 32 independently verified repetitions."""
+
+    schema: str
+    repetition_count: int
+    repetitions: tuple[StructuralRepetitionReport, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _DescriptorProjection:
     """Closed structural descriptor facts regenerated before graph work."""
 
@@ -832,6 +926,46 @@ class _EndpointObservationInputs:
     pre_shutdown: actor_race_history.ProbeSnapshot
     shutdown: actor_race_history.Shutdown
     descriptors: tuple[_DescriptorProjection, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SealedRepetitionRoot:
+    """One-read immutable root fields used by the complete structural gate."""
+
+    actions: tuple[actor_race_history.Action, ...]
+    cleanup_authorities: tuple[actor_race_history.CleanupAuthority, ...]
+    cleanup_receivers: tuple[actor_race_history.CleanupReceiver, ...]
+    diagnostics: actor_race_history.Diagnostics
+    observations: tuple[actor_race_history.Observation, ...]
+    post_shutdown: actor_race_history.ProbeSnapshot
+    pre_cleanup: actor_race_history.ProbeSnapshot
+    pre_shutdown: actor_race_history.ProbeSnapshot
+    repetition: int
+    shutdown: actor_race_history.Shutdown
+
+
+@dataclass(frozen=True, slots=True)
+class _WakeShutdownInputs:
+    """Complete preflight result shared by endpoint and final graph layers."""
+
+    endpoint: _EndpointObservationInputs
+    diagnostics: actor_race_history.Diagnostics
+    post_shutdown: actor_race_history.ProbeSnapshot
+    repetition: int
+    wakes: tuple[_WakeProjection, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _WakeProjection:
+    """Closed wake fields retained before any graph allocation."""
+
+    action_ordinal: int
+    producer: int
+    invocation: int
+    response: int
+    dirty_was_set: bool
+    before_park_epoch: int
+    after_park_epoch: int
 
 
 class _ProtocolGraphPlanner:
@@ -930,6 +1064,7 @@ class _ProtocolGraphPlanner:
             "PrimaryEndpointPop",
             "OpportunisticEndpointPop",
             "CachedEofRead",
+            "WakeSignal",
         }:
             _fail("protocol event kind is unsupported")
         event = ProtocolEvent(self._reserve_node(), action_ordinal, kind)
@@ -1057,7 +1192,11 @@ class _ProtocolGraphPlanner:
     def allocate_phase(self, kind: str) -> PhaseEvent:
         """Allocate one non-action phase gate."""
 
-        if kind not in {"PreCleanupGate", "PreShutdownGate"}:
+        if kind not in {
+            "PreCleanupGate",
+            "PreShutdownGate",
+            "OwnerDonePublish",
+        }:
             _fail("phase event kind is unsupported")
         event = PhaseEvent(self._reserve_node(), kind)
         self._phase_events.append(event)
@@ -1629,6 +1768,17 @@ _STALE_TARGET_ERROR = actor_race_history.CapturedError(
     None,
     None,
     None,
+)
+_EXPECTED_CAPTURE_SCHEMA = "runnel.actor-race-history/1"
+_EXPECTED_WORKLOAD = actor_race_history.Workload(
+    "sha256:382856e13f688b5176ad1e5f06c26bcd85bcaeb719a10a60e9adc9ff387c945c",
+    "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab",
+    "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
+    "sha256:ed57d7961e65c76223c169cabebaff9c02d8293da026abb0c0c0a22d38079845",
+    "runnel-m5-actor-stress-v1",
+    EXPECTED_FIXTURE_FILE_SHA256,
+    EXPECTED_FIXTURE_ID,
+    "runnel.actor-stress-vectors/2",
 )
 
 
@@ -3925,7 +4075,7 @@ _PROBE_BOOLEAN_FIELDS = (
 )
 
 
-def _preflight_quiescent_snapshot(
+def _preflight_probe_snapshot_shell(
     snapshot: Any,
     label: str,
 ) -> actor_race_history.ProbeSnapshot:
@@ -3937,6 +4087,14 @@ def _preflight_quiescent_snapshot(
             _fail(f"{label} {field_name} is outside the u64 range")
     for field_name in _PROBE_BOOLEAN_FIELDS:
         _plain_bool(getattr(snapshot, field_name), f"{label} {field_name}")
+    return snapshot
+
+
+def _preflight_quiescent_snapshot(
+    snapshot: Any,
+    label: str,
+) -> actor_race_history.ProbeSnapshot:
+    snapshot = _preflight_probe_snapshot_shell(snapshot, label)
     if (
         not snapshot.parked
         or snapshot.dirty
@@ -4276,6 +4434,303 @@ def _preflight_endpoint_observation_inputs(
         pre_shutdown,
         shutdown,
         descriptors,
+    )
+
+
+def _preflight_wake_projections(
+    actions: tuple[actor_race_history.Action, ...],
+    pre_cleanup: actor_race_history.ProbeSnapshot,
+) -> tuple[_WakeProjection, ...]:
+    """Seal all wake brackets and reject impossible real-time epoch overlap."""
+
+    wakes: list[_WakeProjection] = []
+    for ordinal, action in enumerate(actions):
+        label = f"wake action {ordinal}"
+        kind = action.kind
+        if type(kind) is not str or kind not in CAPTURE_ACTION_KINDS:
+            _fail(f"decoded action {ordinal} kind is invalid")
+        wake = action.wake
+        if kind != "wake":
+            _exact_typed_value(wake, _WAKE_SENTINEL, f"decoded action {ordinal} wake")
+            continue
+        if type(wake) is not actor_race_history.WakeWitness:
+            _fail(f"{label} witness has an invalid exact type")
+        if action.submit_attempt is not None:
+            _fail(f"{label} retained a submit attempt")
+        client_index = _plain_int(action.client_index, f"{label} client_index")
+        if client_index < 0 or client_index >= EXPECTED_IN_RANGE_SUBMIT_COUNT:
+            _fail(f"{label} client_index is outside 0..63")
+        producer = _plain_int(action.producer, f"{label} producer")
+        if producer not in (0, 1):
+            _fail(f"{label} producer is invalid")
+        action_ordinal = _plain_int(action.ordinal, f"{label} ordinal")
+        if action_ordinal != ordinal:
+            _fail(f"{label} ordinal is out of order")
+        invocation = _plain_int(action.invocation, f"{label} invocation")
+        response = _plain_int(action.response, f"{label} response")
+        if not 1 <= invocation < response <= EXPECTED_ACTION_COUNTER_FINAL:
+            _fail(f"{label} interval is invalid")
+        if type(action.result) is not str or action.result != "wake_signaled":
+            _fail(f"{label} result is invalid")
+        if action.error is not None or action.request_id is not None or action.output is not None:
+            _fail(f"{label} retained request result state")
+        _exact_typed_value(action.command, _COMMAND_SENTINEL, f"{label} command witness")
+        _exact_typed_value(action.accepted, _ACCEPTED_SENTINEL, f"{label} accepted witness")
+        _exact_typed_value(action.control, _CONTROL_SENTINEL, f"{label} control witness")
+        _exact_typed_value(action.primary_pop, _PRIMARY_POP_SENTINEL, f"{label} primary pop")
+        _exact_typed_value(
+            action.opportunistic_eof_pop,
+            _OPPORTUNISTIC_POP_SENTINEL,
+            f"{label} opportunistic pop",
+        )
+        if _plain_bool(action.cached_eof, f"{label} cached_eof"):
+            _fail(f"{label} retained cached EOF")
+        if not _plain_bool(wake.boundary, f"{label} boundary"):
+            _fail(f"{label} omitted its reached boundary")
+        dirty_was_set = _plain_bool(
+            wake.dirty_was_set,
+            f"{label} dirty_was_set",
+        )
+        before = _plain_int(wake.before_park_epoch, f"{label} before_park_epoch")
+        after = _plain_int(wake.after_park_epoch, f"{label} after_park_epoch")
+        if (
+            before < 0
+            or before > actor_race_history.MAX_U64
+            or after < 0
+            or after > actor_race_history.MAX_U64
+        ):
+            _fail(f"{label} park epoch is outside the u64 range")
+        if after <= before:
+            _fail(f"{label} did not acknowledge a later park epoch")
+        if after > pre_cleanup.park_epoch:
+            _fail(f"{label} acknowledgement is after pre_cleanup")
+        wakes.append(
+            _WakeProjection(
+                ordinal,
+                producer,
+                invocation,
+                response,
+                dirty_was_set,
+                before,
+                after,
+            )
+        )
+
+    if len(wakes) != _WAKE_COUNT:
+        _fail(f"wake custody must cover exactly {_WAKE_COUNT} actions")
+    for left in wakes:
+        for right in wakes:
+            if (
+                left.action_ordinal != right.action_ordinal
+                and left.response < right.invocation
+                and left.after_park_epoch > right.before_park_epoch
+            ):
+                _fail(
+                    f"wake action {left.action_ordinal} acknowledgement overlaps "
+                    f"later wake action {right.action_ordinal}"
+                )
+    return tuple(wakes)
+
+
+def _boundary_is_reached(action: actor_race_history.Action, boundary: str) -> bool:
+    """Return one exact overlap-boundary predicate without inventing order."""
+
+    if boundary == "command":
+        witness = action.command
+        if type(witness) is not actor_race_history.CommandWitness:
+            _fail("overlap command witness has an invalid exact type")
+        return _plain_bool(witness.boundary, "overlap command boundary")
+    if boundary == "control":
+        witness = action.control
+        if type(witness) is not actor_race_history.ControlWitness:
+            _fail("overlap control witness has an invalid exact type")
+        return _plain_bool(witness.boundary, "overlap control boundary")
+    if boundary == "primary_endpoint":
+        witness = action.primary_pop
+        if type(witness) is not actor_race_history.PopWitness:
+            _fail("overlap primary endpoint witness has an invalid exact type")
+        return _plain_bool(witness.boundary, "overlap primary endpoint boundary")
+    if boundary == "opportunistic_endpoint":
+        witness = action.opportunistic_eof_pop
+        if type(witness) is not actor_race_history.PopWitness:
+            _fail("overlap opportunistic endpoint witness has an invalid exact type")
+        return _plain_bool(
+            witness.boundary,
+            "overlap opportunistic endpoint boundary",
+        )
+    if boundary == "wake":
+        witness = action.wake
+        if type(witness) is not actor_race_history.WakeWitness:
+            _fail("overlap wake witness has an invalid exact type")
+        return _plain_bool(witness.boundary, "overlap wake boundary")
+    _fail("overlap pair names an unsupported boundary")
+
+
+def _preflight_final_lifecycle(
+    root: _SealedRepetitionRoot,
+    endpoint: _EndpointObservationInputs,
+) -> None:
+    """Validate diagnostics, overlap proof, and owner-done conservation."""
+
+    diagnostics = root.diagnostics
+    if type(diagnostics) is not actor_race_history.Diagnostics:
+        _fail("diagnostics has an invalid exact type")
+    for field_name in (
+        "action_counter_final",
+        "cleanup_counter_final",
+        "engine_steps_delta",
+        "final_engine_steps",
+        "final_pump_entries",
+        "initial_engine_steps",
+        "initial_pump_entries",
+        "pump_entries_delta",
+    ):
+        value = _plain_int(getattr(diagnostics, field_name), f"diagnostics {field_name}")
+        if value < 0 or value > actor_race_history.MAX_U64:
+            _fail(f"diagnostics {field_name} is outside the u64 range")
+    if not _plain_bool(diagnostics.barrier_released, "diagnostics barrier_released"):
+        _fail("diagnostics barrier was not released")
+    if diagnostics.action_counter_final != EXPECTED_ACTION_COUNTER_FINAL:
+        _fail("diagnostics action_counter_final is not 2048")
+    if diagnostics.cleanup_counter_final != endpoint.cleanup_counter_final:
+        _fail("diagnostics cleanup counter changed after endpoint preflight")
+    if diagnostics.final_engine_steps < diagnostics.initial_engine_steps:
+        _fail("diagnostics engine endpoints regress")
+    if diagnostics.final_pump_entries < diagnostics.initial_pump_entries:
+        _fail("diagnostics pump endpoints regress")
+    if (
+        diagnostics.engine_steps_delta
+        != diagnostics.final_engine_steps - diagnostics.initial_engine_steps
+    ):
+        _fail("diagnostics engine delta mismatch")
+    if (
+        diagnostics.pump_entries_delta
+        != diagnostics.final_pump_entries - diagnostics.initial_pump_entries
+    ):
+        _fail("diagnostics pump delta mismatch")
+    if diagnostics.pump_entries_delta > 4_096:
+        _fail("diagnostics pump delta exceeds 4096")
+    if (
+        endpoint.pre_cleanup.engine_steps < diagnostics.initial_engine_steps
+        or endpoint.pre_cleanup.pump_entries < diagnostics.initial_pump_entries
+    ):
+        _fail("pre_cleanup predates the initial diagnostic endpoints")
+
+    overlap = diagnostics.overlap_pair
+    if type(overlap) is not tuple or len(overlap) != 4:
+        _fail("diagnostics overlap_pair must be an exact four-position tuple")
+    left_ordinal = _plain_int(overlap[0], "overlap left ordinal")
+    right_ordinal = _plain_int(overlap[2], "overlap right ordinal")
+    left_boundary = overlap[1]
+    right_boundary = overlap[3]
+    if not 0 <= left_ordinal < EXPECTED_ACTION_COUNT:
+        _fail("overlap left ordinal is outside 0..1023")
+    if not 0 <= right_ordinal < EXPECTED_ACTION_COUNT:
+        _fail("overlap right ordinal is outside 0..1023")
+    if type(left_boundary) is not str or type(right_boundary) is not str:
+        _fail("overlap boundary names must be strings")
+    if left_ordinal == right_ordinal:
+        _fail("overlap pair repeats one action")
+    left = root.actions[left_ordinal]
+    right = root.actions[right_ordinal]
+    if left.producer == right.producer:
+        _fail("overlap pair actions have the same producer")
+    if not (left.invocation < right.response and right.invocation < left.response):
+        _fail("overlap pair action intervals do not overlap")
+    if not _boundary_is_reached(left, left_boundary):
+        _fail("overlap left action did not reach its named boundary")
+    if not _boundary_is_reached(right, right_boundary):
+        _fail("overlap right action did not reach its named boundary")
+
+    shutdown = root.shutdown
+    if type(shutdown) is not actor_race_history.Shutdown:
+        _fail("shutdown has an invalid exact type")
+    for field_name in (
+        "accepted_submissions",
+        "discarded_output_events",
+        "engine_steps",
+        "rejected_submissions",
+        "released_request_bytes",
+        "remaining_shared_bytes",
+        "shutdown_cancellations",
+        "terminated_requests",
+    ):
+        value = _plain_int(getattr(shutdown, field_name), f"shutdown {field_name}")
+        if value < 0 or value > actor_race_history.MAX_U64:
+            _fail(f"shutdown {field_name} is outside the u64 range")
+    if shutdown.accepted_submissions + shutdown.rejected_submissions != 64:
+        _fail("shutdown submission counts do not conserve 64 offers")
+    for field_name in (
+        "discarded_output_events",
+        "released_request_bytes",
+        "remaining_shared_bytes",
+        "shutdown_cancellations",
+        "terminated_requests",
+    ):
+        if getattr(shutdown, field_name) != 0:
+            _fail(f"shutdown {field_name} must be exactly zero")
+
+    post = _preflight_probe_snapshot_shell(root.post_shutdown, "post_shutdown")
+    if not post.owner_done or not post.dirty or post.parked or post.pump_in_flight:
+        _fail("post_shutdown owner state is invalid")
+    if any(
+        (
+            post.command_in_flight,
+            post.command_ready,
+            post.command_reserved,
+            post.command_responded,
+        )
+    ):
+        _fail("post_shutdown retained command occupancy")
+    if post.outstanding_requests != 0 or post.request_bytes != 0 or post.shared_bytes != 0:
+        _fail("post_shutdown retained actor-owned state")
+    if not (
+        post.pump_hold_requested
+        == post.pump_hold_observed
+        == post.pump_hold_released
+    ):
+        _fail("post_shutdown retained an incomplete pump hold")
+    _preflight_snapshot_not_before(post, endpoint.pre_shutdown, "post_shutdown")
+    if (
+        post.engine_steps != diagnostics.final_engine_steps
+        or post.pump_entries != diagnostics.final_pump_entries
+        or post.engine_steps != shutdown.engine_steps
+    ):
+        _fail("post_shutdown final diagnostic endpoints mismatch")
+
+
+def _preflight_wake_shutdown_inputs(repetition: Any) -> _WakeShutdownInputs:
+    """Read the complete repetition root once and fail before graph allocation."""
+
+    try:
+        root = _SealedRepetitionRoot(
+            repetition.actions,
+            repetition.cleanup_authorities,
+            repetition.cleanup_receivers,
+            repetition.diagnostics,
+            repetition.observations,
+            repetition.post_shutdown,
+            repetition.pre_cleanup,
+            repetition.pre_shutdown,
+            repetition.repetition,
+            repetition.shutdown,
+        )
+    except AttributeError:
+        _fail("decoded repetition lacks complete wake/shutdown custody fields")
+    actions = _require_exact_decoded_actions(root.actions)
+    repetition_index = _plain_int(root.repetition, "repetition index")
+    if repetition_index < 0 or repetition_index >= EXPECTED_REPETITION_COUNT:
+        _fail("repetition index is outside 0..31")
+    pre_cleanup = _preflight_probe_snapshot_shell(root.pre_cleanup, "pre_cleanup")
+    wakes = _preflight_wake_projections(actions, pre_cleanup)
+    endpoint = _preflight_endpoint_observation_inputs(root)
+    _preflight_final_lifecycle(root, endpoint)
+    return _WakeShutdownInputs(
+        endpoint,
+        root.diagnostics,
+        root.post_shutdown,
+        repetition_index,
+        wakes,
     )
 
 
@@ -4976,6 +5431,158 @@ def build_endpoint_observation_order(repetition: Any) -> EndpointObservationOrde
         shutdown=inputs.shutdown,
     )
     return _build_endpoint_observation_order(inputs, control_order)
+
+
+def _build_wake_shutdown_order(
+    inputs: _WakeShutdownInputs,
+    endpoint_order: EndpointObservationOrder,
+) -> WakeShutdownOrder:
+    """Layer exact wake signals and one owner-done publication onto the DAG."""
+
+    planner = _ProtocolGraphPlanner(endpoint_order.graph.node_count)
+    planner.layer(endpoint_order.graph)
+    interval_mapping = endpoint_order.control_order.target_order.submission_order.interval_order
+    by_action: list[WakeSignalLifecycle | None] = [None] * EXPECTED_ACTION_COUNT
+    wakes: list[WakeSignalLifecycle] = []
+
+    for projection in inputs.wakes:
+        event = planner.allocate(projection.action_ordinal, "WakeSignal")
+        endpoints = interval_mapping.endpoints.by_action[projection.action_ordinal]
+        planner.edge(
+            endpoints.invocation.node,
+            event.node,
+            "wake-action-invocation-before-signal",
+        )
+        planner.edge(
+            event.node,
+            endpoints.response.node,
+            "wake-signal-before-action-response",
+        )
+        lifecycle = WakeSignalLifecycle(
+            projection.action_ordinal,
+            projection.producer,
+            projection.dirty_was_set,
+            projection.before_park_epoch,
+            projection.after_park_epoch,
+            event,
+        )
+        by_action[projection.action_ordinal] = lifecycle
+        wakes.append(lifecycle)
+
+    for left_index, left in enumerate(wakes):
+        for right in wakes[left_index + 1 :]:
+            if left.after_park_epoch <= right.before_park_epoch:
+                planner.edge(
+                    left.signal.node,
+                    right.signal.node,
+                    "wake-park-epoch-order",
+                )
+            elif right.after_park_epoch <= left.before_park_epoch:
+                planner.edge(
+                    right.signal.node,
+                    left.signal.node,
+                    "wake-park-epoch-order",
+                )
+
+    owner_done = planner.allocate_phase("OwnerDonePublish")
+    planner.edge(
+        endpoint_order.endpoint.pre_shutdown.node,
+        owner_done.node,
+        "pre-shutdown-before-owner-done",
+    )
+
+    expected_nodes = endpoint_order.graph.node_count + _WAKE_COUNT + 1
+    if planner.node_count != expected_nodes:
+        _fail("wake/shutdown node arithmetic changed")
+    if planner.node_count > MAX_WAKE_SHUTDOWN_NODES:
+        _fail("wake/shutdown graph exceeds its 4258-node bound")
+    if planner.edge_input_count > MAX_WAKE_SHUTDOWN_EDGE_INPUTS:
+        _fail("wake/shutdown graph exceeds its 22846-edge-input bound")
+    graph = planner.build()
+    return WakeShutdownOrder(
+        endpoint_order,
+        WakeShutdownMapping(
+            tuple(by_action),
+            tuple(wakes),
+            owner_done,
+            inputs.diagnostics,
+            inputs.endpoint.pre_cleanup,
+            inputs.endpoint.pre_shutdown,
+            inputs.post_shutdown,
+            inputs.endpoint.shutdown,
+            endpoint_order.endpoint.phase_events + planner.phase_events,
+        ),
+        graph,
+    )
+
+
+def build_wake_shutdown_order(repetition: Any) -> WakeShutdownOrder:
+    """Authenticate and prove one complete structural race repetition."""
+
+    inputs = _preflight_wake_shutdown_inputs(repetition)
+    control_order = _build_control_lifecycle_order_from_fields(
+        actions=inputs.endpoint.actions,
+        cleanup_authorities=inputs.endpoint.cleanup_authorities,
+        cleanup_receivers=inputs.endpoint.cleanup_receivers,
+        action_counter_final=inputs.endpoint.action_counter_final,
+        cleanup_counter_final=inputs.endpoint.cleanup_counter_final,
+        pre_cleanup=inputs.endpoint.pre_cleanup,
+        shutdown=inputs.endpoint.shutdown,
+    )
+    endpoint_order = _build_endpoint_observation_order(inputs.endpoint, control_order)
+    return _build_wake_shutdown_order(inputs, endpoint_order)
+
+
+def verify_capture_structure(capture: Any) -> StructuralCaptureReport:
+    """Stream all 32 repetitions through the complete structural gate.
+
+    Only bounded scalar summaries survive each iteration; complete DAGs are not
+    retained across repetitions.  Model-prefix parity is a separate mandatory
+    gate and is deliberately outside this function.
+    """
+
+    if type(capture) is not actor_race_history.Capture:
+        _fail("decoded capture has an invalid exact type")
+    repetition_count = _plain_int(
+        capture.repetition_count,
+        "decoded capture repetition count",
+    )
+    if repetition_count != EXPECTED_REPETITION_COUNT:
+        _fail("decoded capture repetition count is not exactly 32")
+    if type(capture.schema) is not str or capture.schema != _EXPECTED_CAPTURE_SCHEMA:
+        _fail("decoded capture schema is not the frozen race-history schema")
+    if not _same_exact_value(capture.workload, _EXPECTED_WORKLOAD):
+        _fail("decoded capture workload differs from the authenticated constants")
+    repetitions = capture.repetitions
+    if type(repetitions) is not tuple or len(repetitions) != EXPECTED_REPETITION_COUNT:
+        _fail("decoded capture repetitions must be an exact 32-entry tuple")
+
+    reports: list[StructuralRepetitionReport] = []
+    for expected_index, repetition in enumerate(repetitions):
+        if type(repetition) is not actor_race_history.Repetition:
+            _fail(f"decoded repetition {expected_index} has an invalid exact type")
+        index = _plain_int(repetition.repetition, f"repetition {expected_index} index")
+        if index != expected_index:
+            _fail(f"repetition {expected_index} index is out of order")
+        order = build_wake_shutdown_order(repetition)
+        reports.append(
+            StructuralRepetitionReport(
+                index,
+                order.graph.node_count,
+                len(order.graph.edges),
+                len(order.lifecycle.in_action_order),
+                len(order.endpoint_order.endpoint.requests_by_request_id),
+            )
+        )
+        # Do not keep the completed repetition alive while constructing the
+        # next large DAG.  Assignment would otherwise retain this order until
+        # the following build returns, doubling the intended peak graph set.
+        del order
+    return StructuralCaptureReport(
+        capture.schema,
+        repetition_count,
+        tuple(reports),
+    )
 
 
 def producer_action_interval_edges(

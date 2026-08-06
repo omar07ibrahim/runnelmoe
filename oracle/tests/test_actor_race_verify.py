@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import gc
 from itertools import permutations
 import random
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import weakref
 
 from oracle import actor_race_history, actor_race_verify
 
@@ -928,6 +930,132 @@ def _exact_endpoint_repetition() -> SimpleNamespace:
             len(repetition.cleanup_receivers),
         ),
         shutdown=repetition.shutdown,
+    )
+
+
+def _reached_overlap_boundary(action: actor_race_history.Action) -> str | None:
+    if action.command.boundary:
+        return "command"
+    if action.control.boundary:
+        return "control"
+    if action.primary_pop.boundary:
+        return "primary_endpoint"
+    if action.opportunistic_eof_pop.boundary:
+        return "opportunistic_endpoint"
+    if action.wake.boundary:
+        return "wake"
+    return None
+
+
+def _exact_wake_shutdown_repetition(
+    repetition_index: int = 0,
+) -> actor_race_history.Repetition:
+    """Close the endpoint fixture with all wake and owner lifecycle evidence."""
+
+    endpoint = _exact_endpoint_repetition()
+    actions = list(endpoint.actions)
+    wake_epoch = 1
+    for ordinal, action in enumerate(actions):
+        if action.kind != "wake":
+            continue
+        actions[ordinal] = replace(
+            action,
+            result="wake_signaled",
+            wake=actor_race_history.WakeWitness(
+                True,
+                bool(wake_epoch % 2),
+                wake_epoch,
+                wake_epoch + 1,
+            ),
+        )
+        wake_epoch += 1
+    assert wake_epoch == actor_race_verify.EXPECTED_KIND_COUNTS[4] + 1
+
+    overlap: tuple[int, str, int, str] | None = None
+    for left_ordinal in range(len(actions) - 1):
+        right_ordinal = left_ordinal + 1
+        left = actions[left_ordinal]
+        right = actions[right_ordinal]
+        left_boundary = _reached_overlap_boundary(left)
+        right_boundary = _reached_overlap_boundary(right)
+        if (
+            left.producer != right.producer
+            and left_boundary is not None
+            and right_boundary is not None
+        ):
+            original_left_response = left.response
+            original_right_invocation = right.invocation
+            actions[left_ordinal] = replace(
+                left,
+                response=original_right_invocation,
+            )
+            actions[right_ordinal] = replace(
+                right,
+                invocation=original_left_response,
+            )
+            overlap = (
+                left_ordinal,
+                left_boundary,
+                right_ordinal,
+                right_boundary,
+            )
+            break
+    assert overlap is not None
+
+    live = len(endpoint.cleanup_receivers)
+    pre_cleanup = replace(endpoint.pre_cleanup, park_epoch=wake_epoch)
+    receivers = tuple(
+        replace(
+            receiver,
+            post_drop_quiescent=replace(
+                receiver.post_drop_quiescent,
+                engine_steps=ordinal + 2,
+                park_epoch=wake_epoch + ordinal + 1,
+                pump_entries=ordinal + 2,
+            ),
+        )
+        for ordinal, receiver in enumerate(endpoint.cleanup_receivers)
+    )
+    pre_shutdown = replace(
+        endpoint.pre_shutdown,
+        engine_steps=live + 1,
+        park_epoch=wake_epoch + live,
+        pump_entries=live + 1,
+    )
+    post_shutdown = replace(
+        pre_shutdown,
+        dirty=True,
+        owner_done=True,
+        parked=False,
+        pump_entries=pre_shutdown.pump_entries + 1,
+        shared_bytes=0,
+    )
+    shutdown = replace(endpoint.shutdown, engine_steps=post_shutdown.engine_steps)
+    diagnostics = actor_race_history.Diagnostics(
+        endpoint.diagnostics.action_counter_final,
+        True,
+        endpoint.diagnostics.cleanup_counter_final,
+        post_shutdown.engine_steps - 1,
+        post_shutdown.engine_steps,
+        post_shutdown.pump_entries,
+        1,
+        1,
+        overlap,
+        post_shutdown.pump_entries - 1,
+        endpoint.diagnostics.recorder_final,
+        endpoint.diagnostics.recorder_initial,
+    )
+    return actor_race_history.Repetition(
+        tuple(actions),
+        endpoint.cleanup_authorities,
+        receivers,
+        diagnostics,
+        endpoint.observations,
+        post_shutdown,
+        pre_cleanup,
+        pre_shutdown,
+        repetition_index,
+        shutdown,
     )
 
 
@@ -4051,6 +4179,668 @@ class EndpointObservationOrderTests(unittest.TestCase):
             ):
                 actor_race_verify.build_endpoint_observation_order(forged)
         authenticate.assert_not_called()
+
+
+class WakeShutdownOrderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repetition = _exact_wake_shutdown_repetition()
+        cls.order = actor_race_verify.build_wake_shutdown_order(cls.repetition)
+
+    @staticmethod
+    def _replace_action(
+        repetition: actor_race_history.Repetition,
+        ordinal: int,
+        **changes: object,
+    ) -> actor_race_history.Repetition:
+        actions = list(repetition.actions)
+        actions[ordinal] = replace(actions[ordinal], **changes)
+        return replace(repetition, actions=tuple(actions))
+
+    def test_exact_remaining_budget_and_event_custody(self) -> None:
+        lifecycle = self.order.lifecycle
+        self.assertEqual(len(lifecycle.in_action_order), 139)
+        self.assertEqual(
+            self.order.graph.node_count,
+            self.order.endpoint_order.graph.node_count + 139 + 1,
+        )
+        self.assertLessEqual(
+            self.order.graph.node_count,
+            actor_race_verify.MAX_WAKE_SHUTDOWN_NODES,
+        )
+        self.assertEqual(actor_race_verify.MAX_WAKE_SHUTDOWN_NODES, 4_258)
+        self.assertEqual(actor_race_verify.MAX_WAKE_SHUTDOWN_EDGE_INPUTS, 22_846)
+        self.assertEqual(
+            tuple(event.kind for event in lifecycle.phase_events),
+            ("PreCleanupGate", "PreShutdownGate", "OwnerDonePublish"),
+        )
+        self.assertTrue(
+            self.order.graph.precedes(
+                self.order.endpoint_order.endpoint.pre_shutdown.node,
+                lifecycle.owner_done_publish.node,
+            )
+        )
+        for wake in lifecycle.in_action_order:
+            action_endpoints = (
+                self.order.endpoint_order.control_order.target_order.submission_order
+                .interval_order.endpoints.by_action[wake.action_ordinal]
+            )
+            self.assertEqual(wake.signal.kind, "WakeSignal")
+            self.assertTrue(
+                self.order.graph.precedes(
+                    action_endpoints.invocation.node,
+                    wake.signal.node,
+                )
+            )
+            self.assertTrue(
+                self.order.graph.precedes(
+                    wake.signal.node,
+                    action_endpoints.response.node,
+                )
+            )
+        self.assertEqual(
+            {wake.dirty_was_set for wake in lifecycle.in_action_order},
+            {False, True},
+        )
+        self.assertTrue(
+            self.order.graph.precedes(
+                lifecycle.in_action_order[0].signal.node,
+                lifecycle.in_action_order[-1].signal.node,
+            )
+        )
+
+    def test_overlapping_coalesced_wakes_remain_unordered(self) -> None:
+        left_ordinal, right_ordinal = 94, 95
+        actions = list(self.repetition.actions)
+        left = actions[left_ordinal]
+        right = actions[right_ordinal]
+        self.assertEqual((left.kind, right.kind), ("wake", "wake"))
+        actions[left_ordinal] = replace(
+            left,
+            response=right.invocation,
+            wake=replace(
+                left.wake,
+                dirty_was_set=True,
+                before_park_epoch=12,
+                after_park_epoch=14,
+            ),
+        )
+        actions[right_ordinal] = replace(
+            right,
+            invocation=left.response,
+            wake=replace(
+                right.wake,
+                dirty_was_set=False,
+                before_park_epoch=12,
+                after_park_epoch=14,
+            ),
+        )
+        order = actor_race_verify.build_wake_shutdown_order(
+            replace(self.repetition, actions=tuple(actions))
+        )
+        left_wake = order.lifecycle.by_action[left_ordinal]
+        right_wake = order.lifecycle.by_action[right_ordinal]
+        assert left_wake is not None and right_wake is not None
+        self.assertEqual((left_wake.dirty_was_set, right_wake.dirty_was_set), (True, False))
+        self.assertFalse(order.graph.precedes(left_wake.signal.node, right_wake.signal.node))
+        self.assertFalse(order.graph.precedes(right_wake.signal.node, left_wake.signal.node))
+
+    def test_reverse_epoch_bracket_orders_overlapping_wake_signals(self) -> None:
+        left_ordinal, right_ordinal = 94, 95
+        actions = list(self.repetition.actions)
+        left = actions[left_ordinal]
+        right = actions[right_ordinal]
+        self.assertEqual((left.kind, right.kind), ("wake", "wake"))
+        actions[left_ordinal] = replace(
+            left,
+            response=right.invocation,
+            wake=replace(
+                left.wake,
+                before_park_epoch=13,
+                after_park_epoch=14,
+            ),
+        )
+        actions[right_ordinal] = replace(
+            right,
+            invocation=left.response,
+            wake=replace(
+                right.wake,
+                before_park_epoch=12,
+                after_park_epoch=13,
+            ),
+        )
+        order = actor_race_verify.build_wake_shutdown_order(
+            replace(self.repetition, actions=tuple(actions))
+        )
+        left_wake = order.lifecycle.by_action[left_ordinal]
+        right_wake = order.lifecycle.by_action[right_ordinal]
+        assert left_wake is not None and right_wake is not None
+        self.assertTrue(
+            order.graph.precedes(right_wake.signal.node, left_wake.signal.node)
+        )
+        self.assertFalse(
+            order.graph.precedes(left_wake.signal.node, right_wake.signal.node)
+        )
+
+    def test_wake_bracket_and_real_time_mutations_fail_closed(self) -> None:
+        wakes = [action for action in self.repetition.actions if action.kind == "wake"]
+        first, second = wakes[:2]
+        cases = (
+            (
+                "missing-boundary",
+                self._replace_action(
+                    self.repetition,
+                    first.ordinal,
+                    wake=replace(first.wake, boundary=False),
+                ),
+                "omitted its reached boundary",
+            ),
+            (
+                "nonadvancing",
+                self._replace_action(
+                    self.repetition,
+                    first.ordinal,
+                    wake=replace(
+                        first.wake,
+                        after_park_epoch=first.wake.before_park_epoch,
+                    ),
+                ),
+                "did not acknowledge a later park epoch",
+            ),
+            (
+                "after-cleanup",
+                self._replace_action(
+                    self.repetition,
+                    first.ordinal,
+                    wake=replace(
+                        first.wake,
+                        after_park_epoch=self.repetition.pre_cleanup.park_epoch + 1,
+                    ),
+                ),
+                "acknowledgement is after pre_cleanup",
+            ),
+            (
+                "real-time-overlap",
+                self._replace_action(
+                    self.repetition,
+                    first.ordinal,
+                    wake=replace(
+                        first.wake,
+                        after_park_epoch=second.wake.before_park_epoch + 1,
+                    ),
+                ),
+                "acknowledgement overlaps later wake",
+            ),
+        )
+        for label, forged, error in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    error,
+                ):
+                    actor_race_verify.build_wake_shutdown_order(forged)
+
+        nonwake = next(action for action in self.repetition.actions if action.kind != "wake")
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "exact typed sentinel",
+        ):
+            actor_race_verify.build_wake_shutdown_order(
+                self._replace_action(
+                    self.repetition,
+                    nonwake.ordinal,
+                    wake=wakes[0].wake,
+                )
+            )
+
+    def test_wake_exact_types_and_bool_integer_boundaries_fail_closed(self) -> None:
+        wake_action = next(
+            action for action in self.repetition.actions if action.kind == "wake"
+        )
+        nonwake = next(
+            action for action in self.repetition.actions if action.kind != "wake"
+        )
+        cases = (
+            (
+                "wrong-witness-type",
+                self._replace_action(
+                    self.repetition,
+                    wake_action.ordinal,
+                    wake=SimpleNamespace(
+                        boundary=True,
+                        dirty_was_set=False,
+                        before_park_epoch=1,
+                        after_park_epoch=2,
+                    ),
+                ),
+                "invalid exact type",
+            ),
+            (
+                "integer-boundary",
+                self._replace_action(
+                    self.repetition,
+                    wake_action.ordinal,
+                    wake=replace(wake_action.wake, boundary=1),
+                ),
+                "boundary must be a boolean",
+            ),
+            (
+                "integer-dirty",
+                self._replace_action(
+                    self.repetition,
+                    wake_action.ordinal,
+                    wake=replace(wake_action.wake, dirty_was_set=1),
+                ),
+                "dirty_was_set must be a boolean",
+            ),
+            (
+                "boolean-epoch",
+                self._replace_action(
+                    self.repetition,
+                    wake_action.ordinal,
+                    wake=replace(wake_action.wake, before_park_epoch=False),
+                ),
+                "before_park_epoch must be an integer",
+            ),
+            (
+                "nonwake-boolean-sentinel",
+                self._replace_action(
+                    self.repetition,
+                    nonwake.ordinal,
+                    wake=actor_race_history.WakeWitness(False, False, False, 0),
+                ),
+                "exact typed sentinel",
+            ),
+        )
+        for label, forged, error in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    error,
+                ):
+                    actor_race_verify.build_wake_shutdown_order(forged)
+
+    def test_final_snapshot_diagnostics_and_overlap_mutations_fail_closed(self) -> None:
+        post = self.repetition.post_shutdown
+        diagnostics = self.repetition.diagnostics
+        overlap = diagnostics.overlap_pair
+        large_pump_endpoint = diagnostics.initial_pump_entries + 4_097
+        cases = (
+            (
+                "barrier-held",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(diagnostics, barrier_released=False),
+                ),
+                "barrier was not released",
+            ),
+            (
+                "engine-delta",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(
+                        diagnostics,
+                        engine_steps_delta=diagnostics.engine_steps_delta + 1,
+                    ),
+                ),
+                "engine delta mismatch",
+            ),
+            (
+                "pump-delta",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(
+                        diagnostics,
+                        pump_entries_delta=diagnostics.pump_entries_delta + 1,
+                    ),
+                ),
+                "pump delta mismatch",
+            ),
+            (
+                "pump-delta-cap",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(
+                        diagnostics,
+                        final_pump_entries=large_pump_endpoint,
+                        pump_entries_delta=4_097,
+                    ),
+                    post_shutdown=replace(
+                        post,
+                        pump_entries=large_pump_endpoint,
+                    ),
+                ),
+                "pump delta exceeds 4096",
+            ),
+            (
+                "owner-running",
+                replace(self.repetition, post_shutdown=replace(post, owner_done=False)),
+                "owner state is invalid",
+            ),
+            (
+                "shared-residue",
+                replace(self.repetition, post_shutdown=replace(post, shared_bytes=1)),
+                "retained actor-owned state",
+            ),
+            (
+                "hold-residue",
+                replace(
+                    self.repetition,
+                    post_shutdown=replace(post, pump_hold_released=0),
+                ),
+                "incomplete pump hold",
+            ),
+            (
+                "final-endpoint",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(
+                        diagnostics,
+                        final_pump_entries=diagnostics.final_pump_entries + 1,
+                        pump_entries_delta=diagnostics.pump_entries_delta + 1,
+                    ),
+                ),
+                "final diagnostic endpoints mismatch",
+            ),
+            (
+                "overlap-list",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(diagnostics, overlap_pair=list(overlap)),
+                ),
+                "exact four-position tuple",
+            ),
+            (
+                "repeated-overlap-action",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(
+                        diagnostics,
+                        overlap_pair=(overlap[0], overlap[1], overlap[0], overlap[1]),
+                    ),
+                ),
+                "repeats one action",
+            ),
+            (
+                "same-producer-overlap",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(
+                        diagnostics,
+                        overlap_pair=(1, "command", 3, "command"),
+                    ),
+                ),
+                "same producer",
+            ),
+            (
+                "nonoverlapping-actions",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(
+                        diagnostics,
+                        overlap_pair=(3, "command", 4, "command"),
+                    ),
+                ),
+                "intervals do not overlap",
+            ),
+            (
+                "unsupported-overlap-boundary",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(
+                        diagnostics,
+                        overlap_pair=(1, "foreign", 2, "command"),
+                    ),
+                ),
+                "unsupported boundary",
+            ),
+            (
+                "unreached-overlap-boundary",
+                replace(
+                    self.repetition,
+                    diagnostics=replace(
+                        diagnostics,
+                        overlap_pair=(1, "wake", 2, "command"),
+                    ),
+                ),
+                "did not reach its named boundary",
+            ),
+            (
+                "post-park-regression",
+                replace(
+                    self.repetition,
+                    post_shutdown=replace(
+                        post,
+                        park_epoch=self.repetition.pre_shutdown.park_epoch - 1,
+                    ),
+                ),
+                "regressed a monotone actor counter",
+            ),
+            (
+                "post-engine-regression",
+                replace(
+                    self.repetition,
+                    post_shutdown=replace(
+                        post,
+                        engine_steps=self.repetition.pre_shutdown.engine_steps - 1,
+                    ),
+                ),
+                "regressed a monotone actor counter",
+            ),
+            (
+                "post-pump-regression",
+                replace(
+                    self.repetition,
+                    post_shutdown=replace(
+                        post,
+                        pump_entries=self.repetition.pre_shutdown.pump_entries - 1,
+                    ),
+                ),
+                "regressed a monotone actor counter",
+            ),
+            (
+                "post-hold-regression",
+                replace(
+                    self.repetition,
+                    post_shutdown=replace(
+                        post,
+                        pump_hold_requested=0,
+                        pump_hold_observed=0,
+                        pump_hold_released=0,
+                    ),
+                ),
+                "regressed a monotone actor counter",
+            ),
+            (
+                "shutdown-residue",
+                replace(
+                    self.repetition,
+                    shutdown=replace(
+                        self.repetition.shutdown,
+                        discarded_output_events=1,
+                    ),
+                ),
+                "must be exactly zero",
+            ),
+        )
+        for label, forged, error in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    error,
+                ):
+                    actor_race_verify.build_wake_shutdown_order(forged)
+
+        self.assertEqual(post.park_epoch, self.repetition.pre_shutdown.park_epoch)
+        self.assertEqual(post.engine_steps, self.repetition.pre_shutdown.engine_steps)
+
+    def test_post_shutdown_may_advance_park_and_engine_counters(self) -> None:
+        post = replace(
+            self.repetition.post_shutdown,
+            park_epoch=self.repetition.post_shutdown.park_epoch + 1,
+            engine_steps=self.repetition.post_shutdown.engine_steps + 1,
+        )
+        diagnostics = replace(
+            self.repetition.diagnostics,
+            final_engine_steps=post.engine_steps,
+            engine_steps_delta=(
+                post.engine_steps - self.repetition.diagnostics.initial_engine_steps
+            ),
+        )
+        shutdown = replace(self.repetition.shutdown, engine_steps=post.engine_steps)
+        order = actor_race_verify.build_wake_shutdown_order(
+            replace(
+                self.repetition,
+                diagnostics=diagnostics,
+                post_shutdown=post,
+                shutdown=shutdown,
+            )
+        )
+        self.assertEqual(order.lifecycle.post_shutdown.park_epoch, post.park_epoch)
+        self.assertEqual(order.lifecycle.post_shutdown.engine_steps, post.engine_steps)
+
+    def test_full_preflight_reads_root_once_and_fails_before_auth_or_graph(self) -> None:
+        source = self.repetition
+
+        class CountingRepetition:
+            def __init__(self) -> None:
+                self.reads: dict[str, int] = {}
+
+            def _read(self, name: str) -> object:
+                self.reads[name] = self.reads.get(name, 0) + 1
+                return getattr(source, name)
+
+            actions = property(lambda self: self._read("actions"))
+            cleanup_authorities = property(lambda self: self._read("cleanup_authorities"))
+            cleanup_receivers = property(lambda self: self._read("cleanup_receivers"))
+            diagnostics = property(lambda self: self._read("diagnostics"))
+            observations = property(lambda self: self._read("observations"))
+            post_shutdown = property(lambda self: self._read("post_shutdown"))
+            pre_cleanup = property(lambda self: self._read("pre_cleanup"))
+            pre_shutdown = property(lambda self: self._read("pre_shutdown"))
+            repetition = property(lambda self: self._read("repetition"))
+            shutdown = property(lambda self: self._read("shutdown"))
+
+        counting = CountingRepetition()
+        actor_race_verify.build_wake_shutdown_order(counting)
+        self.assertEqual(
+            counting.reads,
+            {
+                "actions": 1,
+                "cleanup_authorities": 1,
+                "cleanup_receivers": 1,
+                "diagnostics": 1,
+                "observations": 1,
+                "post_shutdown": 1,
+                "pre_cleanup": 1,
+                "pre_shutdown": 1,
+                "repetition": 1,
+                "shutdown": 1,
+            },
+        )
+
+        malformed = replace(
+            self.repetition,
+            post_shutdown=replace(self.repetition.post_shutdown, owner_done=False),
+        )
+        with mock.patch.object(
+            actor_race_verify,
+            "regenerate_authenticated_action_program",
+        ) as authenticate_never:
+            with mock.patch.object(actor_race_verify.ReasonedDAG, "build") as graph_never:
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    "owner state is invalid",
+                ):
+                    actor_race_verify.build_wake_shutdown_order(malformed)
+        authenticate_never.assert_not_called()
+        graph_never.assert_not_called()
+
+    def test_streaming_capture_entry_has_exact_root_gates(self) -> None:
+        repetitions = tuple(
+            replace(self.repetition, repetition=index)
+            for index in range(actor_race_verify.EXPECTED_REPETITION_COUNT)
+        )
+        capture = actor_race_history.Capture(
+            actor_race_verify.EXPECTED_REPETITION_COUNT,
+            repetitions,
+            actor_race_verify._EXPECTED_CAPTURE_SCHEMA,
+            actor_race_verify._EXPECTED_WORKLOAD,
+        )
+        with mock.patch.object(
+            actor_race_verify,
+            "build_wake_shutdown_order",
+            return_value=self.order,
+        ) as build:
+            report = actor_race_verify.verify_capture_structure(capture)
+        self.assertEqual(build.call_count, 32)
+        self.assertEqual(report.repetition_count, 32)
+        self.assertEqual(len(report.repetitions), 32)
+        self.assertTrue(
+            all(
+                type(item) is actor_race_verify.StructuralRepetitionReport
+                for item in report.repetitions
+            )
+        )
+
+        invalid = (
+            replace(capture, schema="runnel.actor-race-history/0"),
+            replace(
+                capture,
+                workload=replace(capture.workload, specification="foreign"),
+            ),
+            replace(
+                capture,
+                repetitions=(replace(repetitions[0], repetition=1), *repetitions[1:]),
+            ),
+        )
+        for forged in invalid:
+            with self.assertRaises(actor_race_verify.ActorRaceVerificationError):
+                actor_race_verify.verify_capture_structure(forged)
+
+    def test_streaming_capture_releases_each_graph_before_the_next_build(self) -> None:
+        repetitions = tuple(
+            replace(self.repetition, repetition=index)
+            for index in range(actor_race_verify.EXPECTED_REPETITION_COUNT)
+        )
+        capture = actor_race_history.Capture(
+            actor_race_verify.EXPECTED_REPETITION_COUNT,
+            repetitions,
+            actor_race_verify._EXPECTED_CAPTURE_SCHEMA,
+            actor_race_verify._EXPECTED_WORKLOAD,
+        )
+
+        class EphemeralOrder:
+            def __init__(self) -> None:
+                self.graph = SimpleNamespace(node_count=4_000, edges=())
+                self.lifecycle = SimpleNamespace(in_action_order=(None,) * 139)
+                self.endpoint_order = SimpleNamespace(
+                    endpoint=SimpleNamespace(requests_by_request_id=())
+                )
+
+        live: weakref.WeakSet[EphemeralOrder] = weakref.WeakSet()
+
+        def build(_: actor_race_history.Repetition) -> EphemeralOrder:
+            gc.collect()
+            self.assertEqual(
+                len(live),
+                0,
+                "the preceding complete DAG survived into the next build",
+            )
+            order = EphemeralOrder()
+            live.add(order)
+            return order
+
+        with mock.patch.object(
+            actor_race_verify,
+            "build_wake_shutdown_order",
+            side_effect=build,
+        ) as build_mock:
+            report = actor_race_verify.verify_capture_structure(capture)
+        gc.collect()
+        self.assertEqual(build_mock.call_count, 32)
+        self.assertEqual(len(report.repetitions), 32)
+        self.assertEqual(len(live), 0)
 
 
 class SubmissionProtocolOrderTests(unittest.TestCase):
