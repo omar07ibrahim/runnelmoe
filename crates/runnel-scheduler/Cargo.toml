@@ -10,6 +10,7 @@ repository.workspace = true
 [features]
 default = ["native-avx2"]
 actor-stress-instrumentation = []
+deterministic-checkpoint-instrumentation = []
 native-avx2 = ["runnel-runtime/native-avx2"]
 
 [dependencies]

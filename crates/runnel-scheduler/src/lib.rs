@@ -9,6 +9,7 @@
 
 mod accounting;
 mod actor;
+mod checkpoint;
 mod config;
 mod control;
 mod endpoint;
@@ -34,6 +35,12 @@ pub use actor::{
 pub use actor::{
     ActorShutdownReport, RequestCancellation, RequestHandle, SchedulerActor, SchedulerClient,
     Submission, TryRecvOutput,
+};
+#[cfg(any(test, feature = "deterministic-checkpoint-instrumentation"))]
+#[doc(hidden)]
+pub use checkpoint::{
+    CheckpointAction, CheckpointDirective, CheckpointEffect, CheckpointPlan, CheckpointPoint,
+    CheckpointRecord, DeadlineExpirationDisposition, MAX_CHECKPOINT_PLAN_ENTRIES,
 };
 pub use config::{
     MAX_BATCH_WIDTH, MAX_WAVES_PER_STEP, SchedulerConfig, SchedulerLimits, SchedulingPolicy,

@@ -269,16 +269,21 @@ infallibly publishes the optional output and independent terminal result from
 the same guard. Endpoint and control lifecycle guards make admission and reap
 cross-registry transitions rollback-safe. Deterministic gated tests exercise
 late cancellation, inclusive expiry, precedence, credit recovery, stale slot
-reuse, endpoint saturation, disconnect, and lifecycle rollback. The concurrent
-actor uses a preallocated generation-tagged submission table, ready-commit
-FIFO, direct request controls/endpoints, origin-relative Tokio deadlines, and
-one awaited blocking engine pump at a time. Responded commands retain their
+reuse, endpoint saturation, disconnect, and lifecycle rollback. An opt-in
+sealed checkpoint plan covers the four transaction boundaries from
+post-router/pre-expert through post-final-snapshot/pre-apply with cancel,
+inclusive-expiry, and ordered combined actions. It is engine- and
+generation-bound, allocates only during bounded preparation, redacts targets,
+and adds no callback or dynamic-dispatch path to ordinary execution. The
+concurrent actor uses a preallocated generation-tagged submission table,
+ready-commit FIFO, direct request controls/endpoints, origin-relative Tokio
+deadlines, and one awaited blocking engine pump at a time. Responded commands retain their
 slots until consumed or abandoned, and cooperative shutdown waits for command
-claims and live endpoint ownership before destructive teardown. The full
-checkpoint/deadline matrix, run-level timing observer, and accepted evidence
-remain incomplete until the rest of M5 lands. Weights remain eagerly
-resident in M5, so live cache-leased expert execution remains an explicit
-system gap.
+claims and live endpoint ownership before destructive teardown. The
+deterministic-preemption gate, remaining lifecycle-state deadline matrix,
+run-level timing observer, and accepted evidence remain incomplete until the
+rest of M5 lands. Weights remain eagerly resident in M5, so live cache-leased
+expert execution remains an explicit system gap.
 
 The service trace is a bounded semantic commit log, not a timer. Its public
 direct-engine surface borrows an immutable suffix from an opaque ordinal cursor;

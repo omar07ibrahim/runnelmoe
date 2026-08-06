@@ -263,6 +263,10 @@ cargo clippy -p runnel-scheduler --all-targets --all-features --locked --offline
 cargo test -p runnel-scheduler --all-targets --all-features --locked --offline
 cargo clippy -p runnel-scheduler --all-targets --no-default-features --locked --offline -- -D warnings
 cargo test -p runnel-scheduler --all-targets --no-default-features --locked --offline
+cargo clippy -p runnel-scheduler --all-targets --no-default-features \
+  --features deterministic-checkpoint-instrumentation --locked --offline -- -D warnings
+cargo test -p runnel-scheduler --all-targets --no-default-features \
+  --features deterministic-checkpoint-instrumentation --locked --offline
 RUSTDOCFLAGS="-D warnings" cargo doc -p runnel-scheduler --no-deps --locked --offline
 ```
 
@@ -270,6 +274,44 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p runnel-scheduler --no-deps --locked --of
 adapter-typed semantic Vec-payload requirement. It intentionally excludes
 allocator metadata and over-allocation; whole-process RSS remains an observed
 quantity. A smaller raw reserve is rejected before shared engine allocation.
+
+## M5 deterministic transaction-checkpoint verification
+
+`deterministic-checkpoint-instrumentation` exposes a hidden test-instrumentation
+API to external integration tests. A concrete `CheckpointPlan` binds at most
+64 directives to one live engine and to the target request generation before
+execution. The engine never calls an injected closure. The plan allocates once
+while preparing, then records fixed-size effects in place; the ordinary
+feature-off step path monomorphizes through the sealed no-checkpoint driver.
+
+The four addressable boundaries are post-router/pre-expert,
+ready-to-commit/pre-publication-plan, composite-permit/pre-final-snapshot, and
+post-final-snapshot/pre-apply. The last boundary deliberately occurs after the
+clock and control values for that position are fixed, so a signal there loses
+to exactly that position. The closed action set is observe, cancel, inclusive
+deadline expiry, and cancel followed by expiry. Generation, engine-domain,
+deadline, duplicate, count, and stale-slot validation all fail closed.
+
+The library matrix checks all three mutating actions at every boundary,
+cancellation precedence, exact state/RNG/output/service prefixes, skipped
+expert work at the earliest boundary, output-blocked cleanup, slot reuse, and
+ownership return. The external tiny-v3 workload additionally freezes 12
+long-prefill requests and three distinct cancellation boundaries without
+downloading weights:
+
+```console
+cargo test -p runnel-scheduler --lib engine_adversarial_tests \
+  --no-default-features --features deterministic-checkpoint-instrumentation \
+  --locked --offline
+cargo test -p runnel-scheduler --test checkpoint_instrumented_public \
+  --no-default-features --features deterministic-checkpoint-instrumentation \
+  --locked --offline
+```
+
+Checkpoint-plan allocation and the integration harness are correctness
+instrumentation and are excluded from M5 timing regions. This gate does not
+claim that deterministic scheduler preemption or the full M5 evidence capture
+has landed.
 
 ## M5 scheduling-policy verification
 

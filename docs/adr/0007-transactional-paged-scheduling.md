@@ -359,8 +359,11 @@ workspace returns.
 
 Cancellation is idempotent. If cancellation and deadline expiry are both
 already visible at a boundary, `cancelled` wins. Cancellation checks occur
-before preparation, after expert execution, and immediately before commit.
-No retry, wake-up, or stale completion may advance state or RNG twice.
+before preparation, after routing and before expert execution, after expert
+execution, before publication planning, and at the final snapshot immediately
+before commit. No retry, wake-up, or stale completion may advance state or RNG
+twice. A request suppressed at the post-router boundary contributes no expert
+call, while the already charged shared wave scratch is still drained normally.
 
 Four cancellation timestamps are distinct. `cancel_linearized` is the atomic
 control transition. `terminal_decided` is the actor's irrevocable outcome after
@@ -410,6 +413,56 @@ current value; `u64::MAX` is a valid terminal clock value after which no larger
 advance exists. `now >= deadline` is expired. Duration and absolute-time
 arithmetic is checked. Tests use a manual clock and deterministic gates rather
 than sleeps.
+
+### Sealed deterministic checkpoint instrumentation
+
+The opt-in Cargo feature `deterministic-checkpoint-instrumentation` exports a
+hidden concrete `CheckpointPlan` for integration tests. It is not a production
+control surface. Scheduler code never invokes a caller callback and never
+retains a plan. Preparation accepts at most 64 directives, performs the plan's
+sole allocation, sorts targets canonically, rejects duplicate boundaries, and
+binds every target to the engine's weak control-table domain, exact slot
+generation, request ID, position, and optional deadline. A plan therefore
+cannot keep an engine alive, cross engines, or redirect through slot reuse.
+Debug output redacts request identity.
+
+The closed boundary set is:
+
+1. `PostRouterPreExpert`, after authenticated task construction and sorting but
+   before any expert invocation;
+2. `ReadyToCommitPrePlan`, after validated contributions and pending state but
+   before output/RNG publication planning;
+3. `CompositePermitPreFinalSnapshot`, inside the validated adapter/service
+   permit composition immediately before the final live clock and control
+   read; and
+4. `PostFinalSnapshot`, after those values are fixed for the current position
+   and before infallible apply.
+
+The closed actions are observe-only, generation-checked cancellation,
+inclusive deadline expiry, and cancellation followed by expiry. The combined
+action always publishes cancellation first, with no scheduler observation
+between the two mutations. The final-snapshot action intentionally loses to
+exactly that already-snapshotted position; every earlier action suppresses all
+state, RNG, output, service-credit, and service-trace publication for its
+target position. Cancellation remains the terminal outcome when cancellation
+and expiry are both visible at the next boundary.
+
+Effects and fire ordinals are written into preallocated plan entries. Execution
+does not allocate for instrumentation. The ordinary feature-off path uses the
+sealed `NoCheckpoints` generic driver, so it has no callback, dynamic dispatch,
+plan scan, or instrumentation allocation. Plan preparation and effect
+inspection are excluded from every M5 timing region.
+
+The deterministic matrix covers every boundary with cancellation, expiry, and
+their ordered combination; exact seeded RNG/state/output/service prefixes;
+output-blocked cleanup; completing-position precedence; foreign engines; stale
+slot generations; duplicate/limit/deadline validation; and balanced request
+ownership. A separate scalar tiny-v3 integration workload freezes 12 `P(896)`
+requests with queued cancellation plus post-final/pre-apply position 0,
+post-router/pre-expert position 8, and composite-permit position 895 actions.
+This closes the transaction-boundary injection mechanism only. Deterministic
+preemption, the remaining lifecycle-state deadline matrix, and accepted M5
+timing evidence remain explicit gates.
 
 ### Seeded sampling
 
@@ -808,7 +861,7 @@ possible `try_reserve_exact` over-allocation, and RSS are not inferred.
 | `homogeneous-burst-16` | 16 requests: `P(16)`, 8 output tokens; horizon 16 | primary end-to-end output throughput and exact service lag |
 | `mixed-prefill-burst-16` | prompt lengths by request ID: `896,16,512,64, 64,896,16,512, 512,64,896,16, 16,512,64,896`; 8 output tokens each | primary p95 TTFT and prefill-completion rate |
 | `deadline-pressure-24` | 24 requests: `P(16)`, 8 output tokens; total-outstanding cap 16; deadline 20,000,000 ns after release | goodput, deadline, exact accept/reject set |
-| `cancellation-pressure-12` | 12 requests: `P(896)`, 8 output tokens; cancel IDs 2, 5, 8, 11 at frozen queued, after position-0 commit, position-8 post-router/pre-expert, and position-895 post-scatter/permit/preapply hooks | transactional cleanup and ownership |
+| `cancellation-pressure-12` | 12 requests: `P(896)`, 8 output tokens; cancel IDs 2, 5, 8, 11 at frozen queued, position-0 post-final-snapshot/pre-apply, position-8 post-router/pre-expert, and position-895 post-scatter/permit/preapply hooks | transactional cleanup and ownership |
 
 The batch call prevents promotion while all 24 offers linearize, so offered
 indices 0 through 15 are accepted and indices 16 through 23 must fail
@@ -827,13 +880,14 @@ ends at the last emitted-token commit, and cleanup/quiescence intervals are
 reported separately, so sink drain/reap work cannot manipulate that endpoint.
 
 Cancellation hooks are atomic deterministic harness barriers, never sleeps.
-Accepted request ID 2 cancels before any promotion. ID 5 cancels immediately
-after committing prompt position 0. ID 8 cancels before expert execution for
-prompt position 8. ID 11 cancels after prompt position 895 has a validated
-composite permit but before the final control check/apply, so that position,
-its RNG preview, and its first output must not commit. The post-router
-cancellation retains shared batch scratch until worker return while releasing
-request ownership exactly once.
+Accepted request ID 2 cancels before any promotion. ID 5 cancels after the
+final clock/control snapshot for prompt position 0 but before infallible apply;
+the signal therefore loses to exactly that commit. ID 8 cancels before expert
+execution for prompt position 8. ID 11 cancels after prompt position 895 has a
+validated composite permit but before the final control check/apply, so that
+position, its RNG preview, and its first output must not commit. The
+post-router cancellation retains shared batch scratch until worker return
+while releasing request ownership exactly once.
 
 ### KPI hierarchy and definitions
 
@@ -1034,6 +1088,22 @@ accepted. Earlier unit and integration correctness results are not relabeled as
 this protocol's evidence. The amendment changes no model or scheduler policy
 and uses no implementation, fixture, prose, or result from the credited
 prior-art repository.
+
+Pre-measurement protocol correction (2026-08-06): the
+`cancellation-pressure-12` ID 5 hook was changed from the earlier phrase
+"immediately after committing prompt position 0" to the exact
+post-final-snapshot/pre-apply boundary. The earlier phrase did not distinguish
+the transaction's commit linearization point from its subsequent infallible
+physical apply. The corrected hook publishes cancellation after the final
+clock/control snapshot, so it loses to exactly position 0, while still making
+the signal and cleanup boundary deterministic. This moves the measured
+`cancel_linearized` timestamp to before physical apply rather than after it;
+the committed service/output prefix is unchanged. No M5 timing run, capture,
+raw evidence row, cancellation golden digest, or accepted M5 result existed
+when this correction was adopted. Earlier correctness runs are not timing
+evidence and are not relabeled as a preregistered capture. The table and hook
+description above contain the corrected protocol; published Git history
+retains the earlier wording.
 
 Golden custody acceptance (2026-08-04): after three byte-identical local
 captures, independent Rust/Python byte agreement, PyTorch prefix validation,

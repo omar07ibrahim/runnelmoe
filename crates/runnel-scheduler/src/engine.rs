@@ -10,6 +10,7 @@ use crate::{
         ADMISSION_BASE_PLAN_LEN, ChargePlan, active_plan, admission_base_plan,
         aggregate_admission_base_plans, map_ledger_error, shared_static_plan,
     },
+    checkpoint::{CheckpointContext, CheckpointDriver, CheckpointPoint, NoCheckpoints},
     config::{MAX_BATCH_WIDTH, SchedulerConfig},
     control::{
         ControlBatchBindPermit, ControlBinding, ControlRegistry, ControlSnapshot,
@@ -42,6 +43,9 @@ use crate::{
     },
     wave::{TaskEnvelope, WaveScratch, WaveScratchError, WaveSelection},
 };
+
+#[cfg(any(test, feature = "deterministic-checkpoint-instrumentation"))]
+use crate::checkpoint::{CheckpointDirective, CheckpointPlan};
 
 const ACTIVE_PLAN_LEN: usize = 2;
 
@@ -1275,8 +1279,41 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         observe_clock_value(&mut self.monotonic_ns, clock)
     }
 
+    fn fire_checkpoint<D: CheckpointDriver>(
+        &mut self,
+        checkpoints: &mut D,
+        key: SlotKey,
+        point: CheckpointPoint,
+    ) -> SchedulerResult<()> {
+        let prior_ns = self.monotonic_ns;
+        let next_ns = {
+            let record = self.record_for_key(key)?;
+            checkpoints.fire(CheckpointContext {
+                point,
+                slot: key,
+                request_id: record.request_id,
+                position: record.committed_positions,
+                control: &record.control,
+                deadline_ns: record.deadline_ns,
+                monotonic_ns: prior_ns,
+            })?
+        };
+        if next_ns < prior_ns {
+            return Err(SchedulerError::internal(
+                "checkpoint instrumentation moved the clock backwards",
+            ));
+        }
+        self.monotonic_ns = next_ns;
+        Ok(())
+    }
+
     pub fn request_phase(&self, id: crate::RequestId) -> SchedulerResult<RequestPhase> {
         Ok(self.record_by_id(id)?.phase)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rng_state_for_test(&self, id: crate::RequestId) -> SchedulerResult<Option<u64>> {
+        Ok(self.record_by_id(id)?.rng_state)
     }
 
     /// Returns the exact engine admission boundary recorded for this request.
@@ -1408,6 +1445,72 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         ))
     }
 
+    /// Prevalidates and binds a bounded deterministic checkpoint plan.
+    ///
+    /// The plan owns its sole allocation, retains no request control table,
+    /// and can only be executed by this engine generation domain.
+    #[cfg(any(test, feature = "deterministic-checkpoint-instrumentation"))]
+    #[doc(hidden)]
+    pub fn prepare_checkpoint_plan(
+        &self,
+        directives: &[CheckpointDirective],
+    ) -> SchedulerResult<CheckpointPlan> {
+        self.ensure_open()?;
+        let controls = self
+            .controls
+            .as_ref()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
+        CheckpointPlan::try_bind(
+            controls.checkpoint_domain(),
+            directives.iter().copied().map(|directive| {
+                let record = self.record_by_id(directive.request_id())?;
+                if record.phase == RequestPhase::Terminal {
+                    return Err(SchedulerError::invalid_request(
+                        "checkpoint directives",
+                        "target request is already terminal",
+                    ));
+                }
+                if directive.position() < record.committed_positions
+                    || directive.position() >= record.total_positions
+                {
+                    return Err(SchedulerError::invalid_request(
+                        "checkpoint directives",
+                        "target position is not pending for this request",
+                    ));
+                }
+                if directive.action().expires_deadline() && record.deadline_ns.is_none() {
+                    return Err(SchedulerError::invalid_request(
+                        "checkpoint directives",
+                        "expiry action requires a request deadline",
+                    ));
+                }
+                Ok((directive, record.key, record.deadline_ns))
+            }),
+        )
+    }
+
+    /// Executes one deterministic step with a prevalidated concrete plan.
+    #[cfg(any(test, feature = "deterministic-checkpoint-instrumentation"))]
+    #[doc(hidden)]
+    pub fn step_with_checkpoint_plan(
+        &mut self,
+        plan: &mut CheckpointPlan,
+    ) -> SchedulerResult<StepReport> {
+        self.ensure_open()?;
+        let controls = self
+            .controls
+            .as_ref()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
+        if !plan.belongs_to(&controls.checkpoint_domain()) {
+            return Err(SchedulerError::invalid_request(
+                "checkpoint plan",
+                "belongs to another scheduler engine",
+            ));
+        }
+        let fixed_ns = self.monotonic_ns;
+        self.step_with_clock_and_checkpoints(&|| fixed_ns, plan)
+    }
+
     /// Advances bounded admission and executes up to the configured number of
     /// deterministic token waves.
     pub fn step(&mut self) -> SchedulerResult<StepReport> {
@@ -1422,6 +1525,19 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     pub(crate) fn step_with_clock<F>(&mut self, clock: &F) -> SchedulerResult<StepReport>
     where
         F: Fn() -> u64,
+    {
+        let mut checkpoints = NoCheckpoints;
+        self.step_with_clock_and_checkpoints(clock, &mut checkpoints)
+    }
+
+    fn step_with_clock_and_checkpoints<F, D>(
+        &mut self,
+        clock: &F,
+        checkpoints: &mut D,
+    ) -> SchedulerResult<StepReport>
+    where
+        F: Fn() -> u64,
+        D: CheckpointDriver,
     {
         self.ensure_open()?;
         if self.adapter.is_none()
@@ -1468,6 +1584,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             &mut wave,
             &mut trace,
             clock,
+            checkpoints,
         );
         if result.is_err()
             && let Err(cleanup) = self.recover_wave(&mut ring, &mut wave)
@@ -1485,7 +1602,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn step_with_resources(
+    fn step_with_resources<D: CheckpointDriver>(
         &mut self,
         adapter: &A,
         ring: &mut DrrRing,
@@ -1494,6 +1611,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         wave: &mut WaveScratch<A::PreparedToken, A::ExpertTask, A::ExpertContribution>,
         trace: &mut Vec<ServiceTraceEvent>,
         clock: &impl Fn() -> u64,
+        checkpoints: &mut D,
     ) -> SchedulerResult<StepReport> {
         let mut report = StepReport::default();
         self.resolve_visible_controls(ring, &mut report, clock)?;
@@ -1512,6 +1630,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 trace,
                 &mut report,
                 clock,
+                checkpoints,
             )?;
             if selected == 0 {
                 break;
@@ -1646,7 +1765,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_wave(
+    fn execute_wave<D: CheckpointDriver>(
         &mut self,
         adapter: &A,
         ring: &mut DrrRing,
@@ -1656,6 +1775,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         trace: &mut Vec<ServiceTraceEvent>,
         report: &mut StepReport,
         clock: &impl Fn() -> u64,
+        checkpoints: &mut D,
     ) -> SchedulerResult<usize> {
         wave.reset().map_err(map_wave_error)?;
         if ring.current_epoch().is_none() && ring.open_round().map_err(map_ring_error)?.is_none() {
@@ -1881,6 +2001,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         }
 
         let mut failures = [None; MAX_BATCH_WIDTH as usize];
+        let mut suppressed_before_expert = [false; MAX_BATCH_WIDTH as usize];
+        for (selection_index, selection) in wave.selections().iter().enumerate() {
+            let key = selection.slot;
+            self.fire_checkpoint(checkpoints, key, CheckpointPoint::PostRouterPreExpert)?;
+            let now = self.observe_clock(clock);
+            suppressed_before_expert[selection_index] =
+                visible_control_outcome(self.record_for_key(key)?, now)?.is_some();
+        }
         let mut previous_expert = None;
         {
             let (tasks, selections, scatter) =
@@ -1888,7 +2016,12 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             for envelope in tasks {
                 let (completion, task) = envelope.into_parts();
                 let selection_index = completion.selection_index();
-                if failures.get(selection_index).copied().flatten().is_some() {
+                if failures.get(selection_index).copied().flatten().is_some()
+                    || suppressed_before_expert
+                        .get(selection_index)
+                        .copied()
+                        .unwrap_or(true)
+                {
                     continue;
                 }
                 let authorized = WaveScratch::<
@@ -2004,6 +2137,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 continue;
             }
             self.record_mut_for_key(key)?.phase = RequestPhase::ReadyToCommit;
+            self.fire_checkpoint(checkpoints, key, CheckpointPoint::ReadyToCommitPrePlan)?;
             let now = self.observe_clock(clock);
             if let Some(outcome) = visible_control_outcome(self.record_for_key(key)?, now)? {
                 self.release_wave_selection(ring, wave, selection_index)?;
@@ -2061,6 +2195,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 &pending,
                 publication,
                 clock,
+                checkpoints,
             );
             match committed {
                 Ok(CommitDisposition::Applied {
@@ -2204,7 +2339,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn commit_publication(
+    fn commit_publication<D: CheckpointDriver>(
         &mut self,
         adapter: &A,
         ring: &mut DrrRing,
@@ -2214,6 +2349,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         pending: &A::PendingStateCommit,
         publication: TokenPublication<'_>,
         clock: &impl Fn() -> u64,
+        checkpoints: &mut D,
     ) -> SchedulerResult<CommitDisposition> {
         let TokenPublication {
             position,
@@ -2285,13 +2421,46 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let control = &record.control;
         let mut release = Some(release);
         let mut endpoint_guard = Some(endpoint_guard);
-        let (callback, adapter_result, terminal_outcome) = ring
+        let (callback, adapter_result, terminal_outcome, checkpoint_error) = ring
             .with_validated_credit_commit(reservation, |mut service_permit| {
                 let mut callback = None;
+                let mut checkpoint_error = None;
                 let adapter_result =
                     adapter.with_validated_state_commit(&mut state, pending, |adapter_permit| {
+                        match checkpoints.fire(CheckpointContext {
+                            point: CheckpointPoint::CompositePermitPreFinalSnapshot,
+                            slot: key,
+                            request_id,
+                            position,
+                            control,
+                            deadline_ns,
+                            monotonic_ns: *monotonic_ns,
+                        }) {
+                            Ok(next_ns) => *monotonic_ns = next_ns,
+                            Err(error) => {
+                                checkpoint_error = Some(error);
+                                drop(adapter_permit);
+                                return;
+                            }
+                        }
                         let now = observe_clock_value(monotonic_ns, clock);
                         let snapshot = control.fresh_snapshot_prevalidated();
+                        match checkpoints.fire(CheckpointContext {
+                            point: CheckpointPoint::PostFinalSnapshot,
+                            slot: key,
+                            request_id,
+                            position,
+                            control,
+                            deadline_ns,
+                            monotonic_ns: *monotonic_ns,
+                        }) {
+                            Ok(next_ns) => *monotonic_ns = next_ns,
+                            Err(error) => {
+                                checkpoint_error = Some(error);
+                                drop(adapter_permit);
+                                return;
+                            }
+                        }
                         if let Some(outcome) = visible_snapshot_outcome(snapshot, deadline_ns, now)
                         {
                             drop(adapter_permit);
@@ -2355,9 +2524,12 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 {
                     guard.publish(terminal);
                 }
-                (callback, adapter_result, terminal_outcome)
+                (callback, adapter_result, terminal_outcome, checkpoint_error)
             })
             .map_err(map_ring_error)?;
+        if let Some(error) = checkpoint_error {
+            return Err(error);
+        }
         match (callback, adapter_result) {
             (Some(CommitCallback::Suppressed(outcome)), _) => {
                 Ok(CommitDisposition::Suppressed(outcome))

@@ -9,15 +9,17 @@ use std::{
 
 use runnel_runtime::{
     AdapterExecutionLayout, AdapterWorkIdentity, DecoderAdapter, Result as RuntimeResult,
-    RuntimeError, SamplingPolicy, StateLayoutAccounting,
+    RuntimeError, SampleConfig, SamplingPolicy, StateLayoutAccounting,
 };
 
 use crate::control::ControlBinding;
 use crate::endpoint::TryPop;
 use crate::{
-    BatchRequestSpec, CancelDisposition, ErrorCategory, LedgerCategory, LedgerOwnership,
-    LedgerTraceCursor, RequestPhase, RequestSpec, SchedulerConfig, SchedulerEngine, SchedulerError,
-    SchedulerLimits, ServiceTraceCursor, StepReport, TerminalOutcome,
+    BatchRequestSpec, CancelDisposition, CheckpointAction, CheckpointDirective, CheckpointPoint,
+    DeadlineExpirationDisposition, ErrorCategory, LedgerCategory, LedgerOwnership,
+    LedgerTraceCursor, MAX_CHECKPOINT_PLAN_ENTRIES, RequestPhase, RequestSpec, SchedulerConfig,
+    SchedulerEngine, SchedulerError, SchedulerLimits, ServiceTraceCursor, StepReport,
+    TerminalOutcome,
 };
 
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -504,6 +506,33 @@ fn new_engine(
     SchedulerEngine::new(adapter, config).expect("gated scheduler engine")
 }
 
+fn new_checkpoint_engine(
+    batch_width: u64,
+    waves_per_step: u64,
+    apply_count: Arc<AtomicUsize>,
+    expert_count: Arc<AtomicUsize>,
+) -> SchedulerEngine<GatedAdapter> {
+    let adapter = GatedAdapter::with_expert_count(
+        Arc::new(CommitGate::passthrough()),
+        apply_count,
+        expert_count,
+    );
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = batch_width;
+    limits.waves_per_step = waves_per_step;
+    let config = SchedulerConfig::new(&adapter, limits).expect("checkpoint scheduler config");
+    SchedulerEngine::new(adapter, config).expect("checkpoint scheduler engine")
+}
+
+fn seeded_policy(seed: u64) -> SamplingPolicy {
+    SamplingPolicy::Sample(SampleConfig {
+        seed,
+        temperature: 1.0,
+        top_k: 4,
+        top_p: 1.0,
+    })
+}
+
 fn assert_no_active_request_ownership(engine: &SchedulerEngine<GatedAdapter>) {
     let ledger = engine.ledger_snapshot();
     for category in [
@@ -830,6 +859,632 @@ fn cancellation_after_the_final_snapshot_loses_to_the_committed_position() {
     assert_eq!(terminal.committed_positions(), 1);
     assert_eq!(terminal.emitted_tokens(), 1);
     assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn concrete_checkpoint_plan_is_ordered_redacted_and_allocation_stable() {
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let expert_count = Arc::new(AtomicUsize::new(0));
+    let mut engine =
+        new_checkpoint_engine(1, 1, Arc::clone(&apply_count), Arc::clone(&expert_count));
+    let pristine = engine.ledger_snapshot();
+    let request = engine
+        .try_submit(RequestSpec::new(&[0], 1, seeded_policy(17), None))
+        .expect("accepted checkpoint ordering request");
+    let directives = [
+        CheckpointDirective::new(
+            request,
+            0,
+            CheckpointPoint::PostFinalSnapshot,
+            CheckpointAction::ObserveOnly,
+        ),
+        CheckpointDirective::new(
+            request,
+            0,
+            CheckpointPoint::CompositePermitPreFinalSnapshot,
+            CheckpointAction::ObserveOnly,
+        ),
+        CheckpointDirective::new(
+            request,
+            0,
+            CheckpointPoint::ReadyToCommitPrePlan,
+            CheckpointAction::ObserveOnly,
+        ),
+        CheckpointDirective::new(
+            request,
+            0,
+            CheckpointPoint::PostRouterPreExpert,
+            CheckpointAction::ObserveOnly,
+        ),
+    ];
+    let mut plan = engine
+        .prepare_checkpoint_plan(&directives)
+        .expect("ordered checkpoint plan");
+    let allocation = plan.allocation_fingerprint_for_test();
+    assert!(format!("{plan:?}").contains("<redacted>"));
+    assert!(format!("{:?}", directives[0]).contains("<redacted>"));
+
+    let report = engine
+        .step_with_checkpoint_plan(&mut plan)
+        .expect("observed checkpoint step");
+    assert_eq!(
+        report,
+        StepReport {
+            promoted_requests: 1,
+            waves: 1,
+            selected_positions: 1,
+            expert_tasks: 1,
+            expert_groups: 1,
+            committed_positions: 1,
+            terminal_decisions: 1,
+        }
+    );
+    assert_eq!(plan.allocation_fingerprint_for_test(), allocation);
+    assert_eq!(plan.fired_count(), 4);
+    assert!(plan.is_complete());
+    plan.ensure_complete().expect("complete checkpoint plan");
+    let records = plan.records().collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.directive().point())
+            .collect::<Vec<_>>(),
+        [
+            CheckpointPoint::PostRouterPreExpert,
+            CheckpointPoint::ReadyToCommitPrePlan,
+            CheckpointPoint::CompositePermitPreFinalSnapshot,
+            CheckpointPoint::PostFinalSnapshot,
+        ]
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.effect().expect("fired effect").fire_ordinal())
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+    assert!(records.iter().all(|record| {
+        let effect = record.effect().expect("fired observation");
+        effect.cancellation().is_none() && effect.deadline().is_none()
+    }));
+    assert_eq!(expert_count.load(Ordering::Acquire), 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 1);
+    assert!(engine.rng_state_for_test(request).unwrap().is_some());
+
+    assert_eq!(
+        engine
+            .drain_events(request, usize::MAX)
+            .expect("observed output")
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .take_terminal(request)
+            .expect("observed terminal query")
+            .expect("observed terminal")
+            .outcome(),
+        TerminalOutcome::Completed
+    );
+    assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn checkpoint_plan_validation_rejects_duplicates_limits_deadlines_and_foreign_engines() {
+    let mut engine = new_checkpoint_engine(
+        1,
+        1,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let request = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted checkpoint validation request");
+    let directive = CheckpointDirective::new(
+        request,
+        0,
+        CheckpointPoint::PostRouterPreExpert,
+        CheckpointAction::ObserveOnly,
+    );
+    let duplicate = engine
+        .prepare_checkpoint_plan(&[directive, directive])
+        .expect_err("duplicate checkpoint boundary must fail");
+    assert_eq!(duplicate.category(), ErrorCategory::InvalidRequest);
+    let excessive = vec![directive; MAX_CHECKPOINT_PLAN_ENTRIES + 1];
+    let excessive_error = engine
+        .prepare_checkpoint_plan(&excessive)
+        .expect_err("checkpoint count ceiling must fail before binding");
+    assert_eq!(excessive_error.category(), ErrorCategory::InvalidRequest);
+    let expiry_error = engine
+        .prepare_checkpoint_plan(&[CheckpointDirective::new(
+            request,
+            0,
+            CheckpointPoint::ReadyToCommitPrePlan,
+            CheckpointAction::ExpireDeadline,
+        )])
+        .expect_err("deadline-free expiry action must fail");
+    assert_eq!(expiry_error.category(), ErrorCategory::InvalidRequest);
+
+    let mut plan = engine
+        .prepare_checkpoint_plan(&[directive])
+        .expect("valid engine-bound checkpoint plan");
+    let mut foreign = new_checkpoint_engine(
+        1,
+        1,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    foreign
+        .try_submit(RequestSpec::new(&[1], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted foreign request with matching numeric ID");
+    let before = foreign.snapshot();
+    let foreign_error = foreign
+        .step_with_checkpoint_plan(&mut plan)
+        .expect_err("plan must not cross an engine control domain");
+    assert_eq!(foreign_error.category(), ErrorCategory::InvalidRequest);
+    assert_eq!(foreign.snapshot(), before);
+    assert_eq!(plan.fired_count(), 0);
+}
+
+#[test]
+fn stale_checkpoint_plan_cannot_redirect_to_a_reused_request_slot() {
+    let adapter = GatedAdapter::new(
+        Arc::new(CommitGate::passthrough()),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let mut limits = SchedulerLimits::tiny();
+    limits.max_outstanding_requests = 1;
+    limits.max_active_requests = 1;
+    limits.max_queued_requests = 1;
+    limits.max_retained_terminal_results = 1;
+    limits.batch_width = 1;
+    limits.waves_per_step = 1;
+    let config = SchedulerConfig::new(&adapter, limits).expect("stale-plan config");
+    let mut engine = SchedulerEngine::new(adapter, config).expect("stale-plan engine");
+    let first = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted first checkpoint generation");
+    let mut stale_plan = engine
+        .prepare_checkpoint_plan(&[CheckpointDirective::new(
+            first,
+            0,
+            CheckpointPoint::PostRouterPreExpert,
+            CheckpointAction::Cancel,
+        )])
+        .expect("first-generation checkpoint plan");
+    assert_eq!(
+        engine
+            .step()
+            .expect("complete first generation")
+            .committed_positions,
+        1
+    );
+    assert_eq!(engine.drain_events(first, usize::MAX).unwrap().len(), 1);
+    assert_eq!(
+        engine.take_terminal(first).unwrap().unwrap().outcome(),
+        TerminalOutcome::Completed
+    );
+
+    let current = engine
+        .try_submit(RequestSpec::new(&[1], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted reused checkpoint slot");
+    assert_ne!(first, current);
+    let report = engine
+        .step_with_checkpoint_plan(&mut stale_plan)
+        .expect("stale target is ignored rather than redirected");
+    assert_eq!(report.committed_positions, 1);
+    assert_eq!(report.terminal_decisions, 1);
+    assert_eq!(stale_plan.fired_count(), 0);
+    assert_eq!(
+        stale_plan
+            .ensure_complete()
+            .expect_err("stale target remains visibly incomplete")
+            .category(),
+        ErrorCategory::InvalidRequest
+    );
+    assert_eq!(engine.drain_events(current, usize::MAX).unwrap().len(), 1);
+    assert_eq!(
+        engine.take_terminal(current).unwrap().unwrap().outcome(),
+        TerminalOutcome::Completed
+    );
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+}
+
+#[test]
+fn cancellation_and_deadline_actions_suppress_each_preapply_checkpoint_exactly() {
+    for point in [
+        CheckpointPoint::PostRouterPreExpert,
+        CheckpointPoint::ReadyToCommitPrePlan,
+        CheckpointPoint::CompositePermitPreFinalSnapshot,
+    ] {
+        for action in [
+            CheckpointAction::Cancel,
+            CheckpointAction::ExpireDeadline,
+            CheckpointAction::CancelAndExpireDeadline,
+        ] {
+            let apply_count = Arc::new(AtomicUsize::new(0));
+            let expert_count = Arc::new(AtomicUsize::new(0));
+            let mut engine =
+                new_checkpoint_engine(2, 1, Arc::clone(&apply_count), Arc::clone(&expert_count));
+            let pristine = engine.ledger_snapshot();
+            let expires = matches!(
+                action,
+                CheckpointAction::ExpireDeadline | CheckpointAction::CancelAndExpireDeadline
+            );
+            if expires {
+                engine.advance_clock(9).expect("pre-deadline clock");
+            }
+            let target = engine
+                .try_submit(RequestSpec::new(
+                    &[0],
+                    1,
+                    seeded_policy(31),
+                    expires.then_some(10),
+                ))
+                .expect("accepted checkpoint target");
+            let sibling = engine
+                .try_submit(RequestSpec::new(
+                    &[1],
+                    1,
+                    seeded_policy(47),
+                    expires.then_some(100),
+                ))
+                .expect("accepted checkpoint sibling");
+            let mut plan = engine
+                .prepare_checkpoint_plan(&[CheckpointDirective::new(target, 0, point, action)])
+                .expect("preapply checkpoint plan");
+            let allocation = plan.allocation_fingerprint_for_test();
+
+            let report = engine
+                .step_with_checkpoint_plan(&mut plan)
+                .expect("preapply checkpoint suppression");
+            assert_eq!(report.promoted_requests, 2);
+            assert_eq!(report.waves, 1);
+            assert_eq!(report.selected_positions, 2);
+            assert_eq!(
+                report.expert_tasks,
+                usize::from(point != CheckpointPoint::PostRouterPreExpert) + 1
+            );
+            assert_eq!(report.expert_groups, 1);
+            assert_eq!(report.committed_positions, 1);
+            assert_eq!(report.terminal_decisions, 2);
+            assert_eq!(plan.allocation_fingerprint_for_test(), allocation);
+            plan.ensure_complete().expect("fired preapply plan");
+            let effect = plan
+                .records()
+                .next()
+                .expect("checkpoint record")
+                .effect()
+                .expect("checkpoint effect");
+            assert_eq!(effect.fire_ordinal(), 0);
+            assert_eq!(
+                effect.cancellation(),
+                matches!(
+                    action,
+                    CheckpointAction::Cancel | CheckpointAction::CancelAndExpireDeadline
+                )
+                .then_some(CancelDisposition::Requested)
+            );
+            assert_eq!(
+                effect.deadline(),
+                expires.then_some(DeadlineExpirationDisposition::AdvancedToDeadline)
+            );
+            assert_eq!(expert_count.load(Ordering::Acquire), report.expert_tasks);
+            assert_eq!(apply_count.load(Ordering::Acquire), 1);
+            assert_eq!(engine.rng_state_for_test(target).unwrap(), None);
+            assert!(engine.rng_state_for_test(sibling).unwrap().is_some());
+            assert_no_active_request_ownership(&engine);
+            let service = engine
+                .service_trace_since(ServiceTraceCursor::origin())
+                .expect("preapply service trace");
+            assert!(service.status().healthy());
+            assert_eq!(service.events().len(), 1);
+            assert_eq!(service.events()[0].request_id(), sibling);
+            drop(service);
+
+            assert!(
+                engine
+                    .drain_events(target, usize::MAX)
+                    .expect("suppressed target output")
+                    .is_empty()
+            );
+            let target_terminal = engine
+                .take_terminal(target)
+                .expect("suppressed target terminal query")
+                .expect("suppressed target terminal");
+            let expected_outcome = if action == CheckpointAction::ExpireDeadline {
+                TerminalOutcome::DeadlineExceeded
+            } else {
+                TerminalOutcome::Cancelled
+            };
+            assert_eq!(target_terminal.outcome(), expected_outcome);
+            assert_eq!(target_terminal.committed_positions(), 0);
+            assert_eq!(target_terminal.emitted_tokens(), 0);
+            assert_eq!(
+                engine
+                    .drain_events(sibling, usize::MAX)
+                    .expect("checkpoint sibling output")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                engine
+                    .take_terminal(sibling)
+                    .expect("checkpoint sibling terminal query")
+                    .expect("checkpoint sibling terminal")
+                    .outcome(),
+                TerminalOutcome::Completed
+            );
+            assert_all_request_ownership_reaped(
+                &engine,
+                pristine.total_used(),
+                pristine.shared_used(),
+            );
+        }
+    }
+}
+
+#[test]
+fn post_final_checkpoint_actions_lose_exactly_one_emitting_position() {
+    for action in [
+        CheckpointAction::Cancel,
+        CheckpointAction::ExpireDeadline,
+        CheckpointAction::CancelAndExpireDeadline,
+    ] {
+        let apply_count = Arc::new(AtomicUsize::new(0));
+        let expert_count = Arc::new(AtomicUsize::new(0));
+        let mut engine =
+            new_checkpoint_engine(1, 2, Arc::clone(&apply_count), Arc::clone(&expert_count));
+        let pristine = engine.ledger_snapshot();
+        let expires = matches!(
+            action,
+            CheckpointAction::ExpireDeadline | CheckpointAction::CancelAndExpireDeadline
+        );
+        if expires {
+            engine.advance_clock(9).expect("pre-deadline clock");
+        }
+        let request = engine
+            .try_submit(RequestSpec::new(
+                &[0],
+                2,
+                seeded_policy(71),
+                expires.then_some(10),
+            ))
+            .expect("accepted post-final target");
+        let mut plan = engine
+            .prepare_checkpoint_plan(&[CheckpointDirective::new(
+                request,
+                0,
+                CheckpointPoint::PostFinalSnapshot,
+                action,
+            )])
+            .expect("post-final checkpoint plan");
+
+        let report = engine
+            .step_with_checkpoint_plan(&mut plan)
+            .expect("post-final checkpoint step");
+        assert_eq!(
+            report,
+            StepReport {
+                promoted_requests: 1,
+                waves: 1,
+                selected_positions: 1,
+                expert_tasks: 1,
+                expert_groups: 1,
+                committed_positions: 1,
+                terminal_decisions: 1,
+            }
+        );
+        plan.ensure_complete().expect("fired post-final plan");
+        let effect = plan.records().next().unwrap().effect().unwrap();
+        assert_eq!(
+            effect.cancellation(),
+            matches!(
+                action,
+                CheckpointAction::Cancel | CheckpointAction::CancelAndExpireDeadline
+            )
+            .then_some(CancelDisposition::Requested)
+        );
+        assert_eq!(
+            effect.deadline(),
+            expires.then_some(DeadlineExpirationDisposition::AdvancedToDeadline)
+        );
+        assert_eq!(expert_count.load(Ordering::Acquire), 1);
+        assert_eq!(apply_count.load(Ordering::Acquire), 1);
+        assert!(engine.rng_state_for_test(request).unwrap().is_some());
+        let service = engine
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect("post-final service trace");
+        assert_eq!(service.events().len(), 1);
+        assert_eq!(service.events()[0].request_id(), request);
+        assert_eq!(service.events()[0].position(), 0);
+        drop(service);
+        let events = engine
+            .drain_events(request, usize::MAX)
+            .expect("post-final committed output");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id(), request);
+        assert_eq!(events[0].output_index(), 0);
+        let terminal = engine
+            .take_terminal(request)
+            .expect("post-final terminal query")
+            .expect("post-final terminal");
+        assert_eq!(
+            terminal.outcome(),
+            if action == CheckpointAction::ExpireDeadline {
+                TerminalOutcome::DeadlineExceeded
+            } else {
+                TerminalOutcome::Cancelled
+            }
+        );
+        assert_eq!(terminal.committed_positions(), 1);
+        assert_eq!(terminal.emitted_tokens(), 1);
+        assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+    }
+}
+
+#[test]
+fn post_final_checkpoint_cancellation_cannot_replace_a_completed_position() {
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let mut engine = new_checkpoint_engine(
+        1,
+        1,
+        Arc::clone(&apply_count),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let pristine = engine.ledger_snapshot();
+    let request = engine
+        .try_submit(RequestSpec::new(&[0], 1, seeded_policy(83), None))
+        .expect("accepted completing post-final target");
+    let mut plan = engine
+        .prepare_checkpoint_plan(&[CheckpointDirective::new(
+            request,
+            0,
+            CheckpointPoint::PostFinalSnapshot,
+            CheckpointAction::Cancel,
+        )])
+        .expect("completing post-final plan");
+    let report = engine
+        .step_with_checkpoint_plan(&mut plan)
+        .expect("completing post-final step");
+    assert_eq!(report.committed_positions, 1);
+    assert_eq!(report.terminal_decisions, 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        plan.records()
+            .next()
+            .unwrap()
+            .effect()
+            .unwrap()
+            .cancellation(),
+        Some(CancelDisposition::Requested)
+    );
+    assert_eq!(engine.drain_events(request, usize::MAX).unwrap().len(), 1);
+    let terminal = engine.take_terminal(request).unwrap().unwrap();
+    assert_eq!(terminal.outcome(), TerminalOutcome::Completed);
+    assert_eq!(terminal.committed_positions(), 1);
+    assert_eq!(terminal.emitted_tokens(), 1);
+    assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn output_blocked_cancellation_and_deadline_preserve_the_committed_prefix() {
+    for action in [
+        CheckpointAction::Cancel,
+        CheckpointAction::ExpireDeadline,
+        CheckpointAction::CancelAndExpireDeadline,
+    ] {
+        let apply_count = Arc::new(AtomicUsize::new(0));
+        let expert_count = Arc::new(AtomicUsize::new(0));
+        let adapter = GatedAdapter::with_expert_count(
+            Arc::new(CommitGate::passthrough()),
+            Arc::clone(&apply_count),
+            Arc::clone(&expert_count),
+        );
+        let mut limits = SchedulerLimits::tiny();
+        limits.batch_width = 1;
+        limits.waves_per_step = 1;
+        limits.output_capacity_per_request = 1;
+        let config = SchedulerConfig::new(&adapter, limits).expect("output-blocked config");
+        let mut engine = SchedulerEngine::new(adapter, config).expect("output-blocked engine");
+        let pristine = engine.ledger_snapshot();
+        let expires = matches!(
+            action,
+            CheckpointAction::ExpireDeadline | CheckpointAction::CancelAndExpireDeadline
+        );
+        if expires {
+            engine.advance_clock(9).expect("pre-deadline clock");
+        }
+        let request = engine
+            .try_submit(RequestSpec::new(
+                &[0],
+                2,
+                seeded_policy(89),
+                expires.then_some(10),
+            ))
+            .expect("accepted output-blocked request");
+        let first = engine.step().expect("fill one output slot");
+        assert_eq!(first.committed_positions, 1);
+        assert_eq!(first.terminal_decisions, 0);
+        assert_eq!(
+            engine.request_phase(request).expect("blocked phase"),
+            RequestPhase::OutputBlocked
+        );
+        let rng_before = engine
+            .rng_state_for_test(request)
+            .expect("blocked RNG state")
+            .expect("first sampled output commits RNG");
+        let service_before = engine
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect("blocked service trace")
+            .events()
+            .to_vec();
+        assert_eq!(service_before.len(), 1);
+
+        if matches!(
+            action,
+            CheckpointAction::Cancel | CheckpointAction::CancelAndExpireDeadline
+        ) {
+            assert_eq!(
+                engine.cancel(request).expect("cancel blocked request"),
+                CancelDisposition::Requested
+            );
+        }
+        if expires {
+            engine
+                .advance_clock(10)
+                .expect("inclusive blocked deadline");
+        }
+        let resolved = engine.step().expect("resolve blocked control");
+        assert_eq!(
+            resolved,
+            StepReport {
+                promoted_requests: 0,
+                waves: 0,
+                selected_positions: 0,
+                expert_tasks: 0,
+                expert_groups: 0,
+                committed_positions: 0,
+                terminal_decisions: 1,
+            }
+        );
+        assert_eq!(expert_count.load(Ordering::Acquire), 1);
+        assert_eq!(apply_count.load(Ordering::Acquire), 1);
+        assert_eq!(
+            engine.rng_state_for_test(request).unwrap(),
+            Some(rng_before)
+        );
+        assert_eq!(
+            engine
+                .service_trace_since(ServiceTraceCursor::origin())
+                .expect("terminal blocked service trace")
+                .events(),
+            service_before
+        );
+        assert_no_active_request_ownership(&engine);
+
+        let events = engine
+            .drain_events(request, usize::MAX)
+            .expect("drain committed blocked prefix");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id(), request);
+        assert_eq!(events[0].output_index(), 0);
+        let terminal = engine
+            .take_terminal(request)
+            .expect("blocked terminal query")
+            .expect("blocked terminal");
+        assert_eq!(
+            terminal.outcome(),
+            if action == CheckpointAction::ExpireDeadline {
+                TerminalOutcome::DeadlineExceeded
+            } else {
+                TerminalOutcome::Cancelled
+            }
+        );
+        assert_eq!(terminal.committed_positions(), 1);
+        assert_eq!(terminal.emitted_tokens(), 1);
+        assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+    }
 }
 
 #[test]

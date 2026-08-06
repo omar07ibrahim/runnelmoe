@@ -15,6 +15,8 @@ use std::{
     },
 };
 
+use std::sync::Weak;
+
 use crate::{
     error::{SchedulerError, SchedulerResult},
     request::CancelDisposition,
@@ -152,6 +154,40 @@ impl ControlSnapshot {
 
 struct ControlTable {
     words: Box<[AtomicU64]>,
+}
+
+#[derive(Clone)]
+#[cfg_attr(
+    not(any(test, feature = "deterministic-checkpoint-instrumentation")),
+    allow(
+        dead_code,
+        reason = "weak engine-domain binding is used only by checkpoint instrumentation"
+    )
+)]
+pub(crate) struct ControlDomain {
+    table: Weak<ControlTable>,
+}
+
+impl ControlDomain {
+    #[cfg_attr(
+        not(any(test, feature = "deterministic-checkpoint-instrumentation")),
+        allow(
+            dead_code,
+            reason = "weak engine-domain binding is used only by checkpoint instrumentation"
+        )
+    )]
+    pub(crate) fn same_table(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.table, &other.table)
+    }
+}
+
+impl fmt::Debug for ControlDomain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlDomain")
+            .field("identity", &"<redacted>")
+            .finish()
+    }
 }
 
 impl fmt::Debug for ControlTable {
@@ -599,6 +635,19 @@ impl fmt::Debug for ControlRegistry {
 }
 
 impl ControlRegistry {
+    #[cfg_attr(
+        not(any(test, feature = "deterministic-checkpoint-instrumentation")),
+        allow(
+            dead_code,
+            reason = "weak engine-domain binding is used only by checkpoint instrumentation"
+        )
+    )]
+    pub(crate) fn checkpoint_domain(&self) -> ControlDomain {
+        ControlDomain {
+            table: Arc::downgrade(&self.table),
+        }
+    }
+
     /// Fallibly preallocates the complete control table and lifecycle free list.
     pub(crate) fn try_with_capacity(capacity: usize) -> SchedulerResult<Self> {
         if capacity == 0 {
