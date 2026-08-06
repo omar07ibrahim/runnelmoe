@@ -246,3 +246,29 @@ independent reviews, host caveats, and claim boundaries are in the
 [M4 review](reviews/M4_REVIEW.md). CI byte-regenerates the summary and both
 figures. Preserve the implementation commit with a merge commit; squashing or
 rebasing would break historical harness custody.
+
+## M5 genuine actor-race verification
+
+The feature-gated scheduler race runs exactly 32 fresh two-producer
+repetitions and publishes one bounded capture into a private tmpfs directory.
+The authoritative verifier consumes that Rust capture in one direction: Rust
+does not receive a Python digest, transcript, accepted set, or other derived
+artifact. Run the CI gate exactly with:
+
+```console
+race_dir="$(mktemp -d /dev/shm/runnel-actor-race.XXXXXX)"
+test "$(stat -c %a "$race_dir")" = 700
+RUNNEL_ACTOR_RACE_CAPTURE="$race_dir/capture.json" \
+  cargo test -p runnel-scheduler --test actor_script \
+    --no-default-features --features actor-stress-instrumentation \
+    race::tests::genuine_actor_race_capture_runs_exactly_32_fresh_repetitions \
+    --locked -- --exact
+test "$(stat -c %a "$race_dir/capture.json")" = 600
+python -m oracle.actor_race_verify "$race_dir/capture.json"
+```
+
+The default Python command enables the mandatory independent PyTorch model
+gate and is the only publishable mode. `--no-model` validates structural
+history for diagnosis but reports `NONPUBLISHABLE` and cannot support model
+parity or token-prefix claims. The command above is a correctness gate, not an
+accepted timing result or performance claim.

@@ -145,7 +145,7 @@ jobs:
 
   oracle:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -190,5 +190,16 @@ jobs:
               --no-default-features --features actor-stress-instrumentation \
               deterministic_actor_semantic_golden_is_bounded_and_structurally_sound \
               --locked
+      - name: Cross-check the genuine actor race histories
+        run: |
+          race_dir="$(mktemp -d /dev/shm/runnel-actor-race.XXXXXX)"
+          test "$(stat -c %a "$race_dir")" = 700
+          RUNNEL_ACTOR_RACE_CAPTURE="$race_dir/capture.json" \
+            cargo test -p runnel-scheduler --test actor_script \
+              --no-default-features --features actor-stress-instrumentation \
+              race::tests::genuine_actor_race_capture_runs_exactly_32_fresh_repetitions \
+              --locked -- --exact
+          test "$(stat -c %a "$race_dir/capture.json")" = 600
+          python -m oracle.actor_race_verify "$race_dir/capture.json"
       - name: Test the independent oracle
         run: python -m unittest discover -s oracle/tests -v

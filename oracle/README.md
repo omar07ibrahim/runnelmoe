@@ -126,6 +126,34 @@ physical diagnostics remain historical observations subject to bounds rather
 than exact live equality. The binary transcript is an exchange artifact, not a
 repository artifact.
 
+## Genuine two-producer actor race oracle
+
+`actor_race_verify.py` checks the separate genuine-race capture. The Rust test
+publishes exactly 32 fresh repetitions into a private tmpfs directory. The
+default verifier validates every repetition's authenticated partial-order and
+lifecycle history, then independently recomputes all 64 model sequences with
+PyTorch and checks each accepted terminal sequence against that model result.
+Run the same one-way Rust-to-Python gate used by CI from the repository root:
+
+```console
+race_dir="$(mktemp -d /dev/shm/runnel-actor-race.XXXXXX)"
+test "$(stat -c %a "$race_dir")" = 700
+RUNNEL_ACTOR_RACE_CAPTURE="$race_dir/capture.json" \
+  cargo test -p runnel-scheduler --test actor_script \
+    --no-default-features --features actor-stress-instrumentation \
+    race::tests::genuine_actor_race_capture_runs_exactly_32_fresh_repetitions \
+    --locked -- --exact
+test "$(stat -c %a "$race_dir/capture.json")" = 600
+python -m oracle.actor_race_verify "$race_dir/capture.json"
+```
+
+Model validation is enabled by default and is mandatory for publishable race
+evidence. Passing `--no-model` is a structural-debugging aid whose result is
+explicitly `NONPUBLISHABLE`; it cannot authenticate token-prefix claims. The
+gate creates no semantic digest or transcript, and Python output is never fed
+back to Rust. This command is a correctness check, not a timing benchmark or a
+measured-result claim.
+
 ## Independent cache-policy oracle
 
 `cache_policy.py` is a separate standard-library reference for the M3 online
