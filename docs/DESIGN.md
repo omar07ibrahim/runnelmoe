@@ -273,6 +273,19 @@ evidence remain incomplete until the rest of M5 lands. Weights remain eagerly
 resident in M5, so live cache-leased expert execution remains an explicit
 system gap.
 
+The service trace is a bounded semantic commit log, not a timer. Its public
+direct-engine surface borrows an immutable suffix from an opaque ordinal cursor;
+the caller must retain that cursor with the same engine, or read from origin for
+complete evidence. Reads never allocate, drain, reset, or alter ledger
+ownership. Events contain
+only the opaque request ID, zero-based position, and stable phase bit
+(`0=prefill`, `1=decode`). The final prompt position is prefill even when it
+publishes the first output. Exact capacity remains a complete prefix until one
+more successful commit cannot be retained; that event makes overflow sticky,
+invalidates evidence completeness, and never changes model behavior. Successful
+shutdown destroys the trace and releases its fixed shared charge, so capture
+must finish before shutdown.
+
 Two versioned policies share that one transaction path and one validated
 resource envelope. `deficit-continuous-expert-coalesce-v1` is the default: a
 round contains every eligible member and may select up to the configured wave
@@ -322,9 +335,11 @@ host paths. HTTP mapping will be documented with M6.
 
 ## Observability
 
-Trace events use monotonic timestamps, stable request pseudonyms, page/object
-IDs, byte counts, reason, queue/wait/compute durations, cache decision, and
-outcome. Prompt and generated content are absent by default. Metrics use
+Operational data-plane traces use monotonic timestamps, stable request
+pseudonyms, page/object IDs, byte counts, reason, queue/wait/compute durations,
+cache decision, and outcome. The semantic scheduler service log described
+above is explicitly untimed. Prompt and generated content are absent by
+default. Metrics use
 bounded labels; object, expert, and request IDs remain in sampled traces rather
 than Prometheus labels.
 

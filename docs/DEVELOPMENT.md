@@ -294,7 +294,40 @@ cargo test -p runnel-scheduler --test engine \
 ```
 
 These are policy/correctness gates, not performance evidence. The M5 capture
-harness and independently replayed service/ledger streams remain outstanding.
+harness, full service replay workloads, and ledger stream remain outstanding.
+
+## M5 bounded service-trace verification
+
+`SchedulerEngine::service_trace_since` returns an allocation-free borrowed
+suffix of the append-only successful-commit prefix. Retain only its returned
+cursor with the same engine, or read from origin for complete evidence; cursors
+are opaque ordinals rather than engine-authentication tokens. The status
+distinguishes an exactly full, complete trace
+from sticky overflow; reading never clears occupancy or changes the static
+`trace_capacity * 128` logical charge. Event `Debug` output redacts request
+identity and position. Callers that need evidence must serialize the final
+healthy prefix before successful shutdown releases the trace storage.
+
+Focused tests cover incremental cursors, the frozen phase boundary, out-of-range
+cursors, exact-full versus overflow, behavioral parity across trace
+limits, cancellation/deadline suppression, post-commit adapter failure, debug
+redaction, and shutdown accounting:
+
+```console
+cargo test -p runnel-scheduler --test engine \
+  public_service_trace_is_incremental_phase_exact_and_debug_redacted \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  trace_overflow_is_sticky_accounted_and_behavior_neutral \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  suppressed_control_decisions_do_not_append_service_events \
+  --locked --offline -- --exact
+```
+
+This is semantic scheduler evidence, not a wall-clock timing source. It omits
+tokens, prompts, sampling state, routes, deadlines, adapter identities, and
+timestamps.
 
 ## M5 genuine actor-race verification
 

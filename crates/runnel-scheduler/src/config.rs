@@ -7,7 +7,10 @@ use runnel_runtime::{
     StateLayoutAccounting,
 };
 
-use crate::error::{ErrorCategory, SchedulerError, SchedulerResult};
+use crate::{
+    error::{ErrorCategory, SchedulerError, SchedulerResult},
+    trace::SERVICE_TRACE_EVENT_CHARGE_BYTES,
+};
 
 pub const LEDGER_ALIGNMENT_BYTES: u64 = 64;
 pub const MAX_WORKERS: u64 = 64;
@@ -33,7 +36,6 @@ const REQUEST_SLOT_BYTES: u64 = 64;
 const OUTPUT_EVENT_BYTES: u64 = 64;
 const TERMINAL_SLOT_BYTES: u64 = 64;
 const EXPERT_TASK_ENVELOPE_BYTES: u64 = 64;
-const TRACE_EVENT_BYTES: u64 = 128;
 const PROMPT_TOKEN_BYTES: u64 = 4;
 
 /// Deterministic scheduler policy selected when an engine is constructed.
@@ -1024,7 +1026,11 @@ fn shared_static_charges(
     )?;
     ensure_host_allocation(coalesced_batch, "coalesced batch capacity")?;
 
-    let trace = checked_mul(limits.trace_capacity, TRACE_EVENT_BYTES, "trace capacity")?;
+    let trace = checked_mul(
+        limits.trace_capacity,
+        SERVICE_TRACE_EVENT_CHARGE_BYTES,
+        "trace capacity",
+    )?;
     ensure_host_allocation(trace, "trace capacity")?;
     let admission_reserve =
         round_charge(limits.admission_reserve_bytes, "admission reserve capacity")?;

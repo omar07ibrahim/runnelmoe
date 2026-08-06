@@ -18,7 +18,11 @@ M5 is in progress. Its published synchronous slice now includes paged
 transactional decoder state, deterministic sampling, bounded FIFO admission,
 equal-weight token-quantum DRR, expert-sorted continuous batches, exact logical
 ownership accounting, output backpressure, deadlines, cancellation, and
-failure-atomic cleanup. Generation-bound atomic controls and a live
+failure-atomic cleanup. The direct engine now exposes its already charged
+service history as an allocation-free, append-only cursor view: its fixed
+prefix records only opaque request identity, position, and the frozen
+prefill/decode bit, while sticky overflow invalidates evidence without changing
+execution. Generation-bound atomic controls and a live
 cancel/deadline check inside the adapter's validated commit callback prevent a
 late signal from partially publishing model state, RNG, output, or service
 credit. Each admitted request now has one generation-tagged, pre-reserved

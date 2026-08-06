@@ -20,6 +20,7 @@ mod id;
 mod ledger;
 mod request;
 mod ring;
+mod trace;
 mod wave;
 
 #[cfg(any(test, feature = "actor-stress-instrumentation"))]
@@ -56,4 +57,7 @@ pub use request::{
     AcceptedAdmission, BatchAdmission, BatchDeadline, BatchRequestSpec, CancelDisposition,
     EngineSnapshot, OutputEvent, RejectedAdmission, RequestPhase, RequestSpec, ShutdownReport,
     StepReport, TerminalOutcome, TerminalResult,
+};
+pub use trace::{
+    ServicePhase, ServiceTraceCursor, ServiceTraceEvent, ServiceTraceRead, ServiceTraceStatus,
 };

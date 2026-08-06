@@ -2,7 +2,7 @@
 
 - Status: accepted; implementation in progress; measurement pending
 - Date: 2026-08-03
-- Last amended: 2026-08-05 (stress-protocol, transcript, and race-evidence clarifications)
+- Last amended: 2026-08-06 (policy, service-trace, and stress-evidence clarifications)
 - Milestone: M5
 
 ## Context
@@ -149,8 +149,8 @@ reservation, and request phase before entering the scoped callback. A held
 generation-tagged endpoint guard excludes both receiver mutation and endpoint
 recycle from reservation through publication. Inside the callback the final
 live clock/control snapshot gates the infallible adapter apply, DRR debit, RNG,
-phase, and trace update without further fallible work, panic, or yield. The
-endpoint guard remains held after the callback so an adapter error returned
+phase, and append-only trace update without further fallible work, panic, or
+yield. The endpoint guard remains held after the callback so an adapter error returned
 after applying can be classified as terminal before the optional output and
 terminal payload become visible together. Runtime types never validate
 scheduler-owned capacity. This two-layer fallible-permit/infallible-apply split
@@ -527,7 +527,7 @@ The owner/lifetime transitions are closed:
 | worker scratch | shared static partition through scheduler shutdown; worker ownership changes do not remove its charge |
 | sampling scratch | shared static partition through scheduler shutdown; logits and sampling workspace occupancy change without changing its reserved capacity |
 | coalesced batch capacity | shared static partition through shutdown; includes 64 bytes per task identity plus adapter contribution buffers and is charged once, never per participating request |
-| trace capacity | shared static partition through shutdown at 128 bytes per bounded slot; draining changes occupancy, not capacity charge |
+| trace capacity | shared static partition through shutdown at 128 bytes per bounded slot; borrowed cursor reads leave both append-only occupancy and capacity charge unchanged, and successful shutdown discards the storage |
 | model resident partition | validated static partition present when the scheduler is constructed |
 | page-pool partition | exact configured M2 cache payload capacity when a cache is attached, otherwise zero |
 | admission reserve | shared semantic headroom through scheduler lifetime; typed construction requires the maximum requested Vec-payload peak across direct batch preparation phases, while allocator overhead and RSS remain separate observations |
@@ -621,13 +621,14 @@ churner index `16 + t`, again as `P(1)` with one output token, and requires
 acceptance. It then calls exactly one bounded scheduler step and requires that
 the step commit exactly one model position and append exactly one service
 event. Before the next turn, it visits retained requests in ascending request
-ID, nonblocking-drains every available output event, and acknowledges every
-terminal churner; if the anchor is terminal, it records its result, drains it,
-and acknowledges EOF in the same pass. The following turn's bounded step reaps
-those ready records during its control prefix before committing its sole
-service event. After the final turn, cleanup performs the corresponding reap
-before shutdown. No sink operation may execute model work, and lifecycle reaps
-are not service turns.
+ID, acknowledges any terminal result, nonblocking-drains every available output
+event, and acknowledges EOF in the same pass. The second direct-engine
+acknowledgement synchronously reaps a terminal record; the following turn's
+bounded step observes that freed slot before committing its sole service event.
+If the anchor is terminal, the same ordered pass records and reaps it. After
+the final turn, cleanup performs the corresponding acknowledgements before
+shutdown. No sink operation may execute model work, and lifecycle reaps are not
+service turns.
 
 The valid trace has exactly 1,000 service events. Anchor positions zero through
 22 each appear exactly once, its first service occurs no later than turn 15,
@@ -857,7 +858,13 @@ continuous-arrival-1000        actor-concurrency-stress
 
 `runs` and `requests` are rectangular. Each `service` row contains the complete
 valid prefix as compact arrays of request index and phase bit, rather than one
-JSON object per token. Each `ledger` row contains initial category totals and
+JSON object per token. The phase mapping is frozen as `0=prefill` and
+`1=decode`; a zero-based position is prefill exactly when it is less than the
+prompt length, so the final prompt position remains prefill when it publishes
+the first output. The direct engine exposes this append-only prefix through a
+borrowed cursor view. Exact capacity is healthy until another successful commit
+sets sticky overflow; reads never drain or reset it. Each `ledger` row contains
+initial category totals and
 compact arrays of `(sequence, category_id, owner_id, signed_delta)`; static
 preallocated token buffers avoid per-token byte transitions. Parent and child
 flush framed canonical records after every request or bounded event chunk. A

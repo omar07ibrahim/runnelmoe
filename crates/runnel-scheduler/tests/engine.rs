@@ -6,9 +6,9 @@ use runnel_runtime::{
     RuntimeError, SampleConfig, SamplingPolicy, StateLayoutAccounting,
 };
 use runnel_scheduler::{
-    BatchRequestSpec, CancelDisposition, ErrorCategory, RequestPhase, RequestSpec, SchedulerConfig,
-    SchedulerEngine, SchedulerError, SchedulerLimits, SchedulingPolicy, StepReport,
-    TerminalOutcome,
+    BatchRequestSpec, CancelDisposition, ErrorCategory, LedgerCategory, RequestPhase, RequestSpec,
+    SchedulerConfig, SchedulerEngine, SchedulerError, SchedulerLimits, SchedulingPolicy,
+    ServicePhase, ServiceTraceCursor, StepReport, TerminalOutcome,
 };
 
 static NEXT_MODEL_ID: CheckedCounter = CheckedCounter::new(1);
@@ -437,6 +437,306 @@ fn drain_tokens(
 
 fn phase(engine: &SchedulerEngine<MockAdapter>, id: runnel_scheduler::RequestId) -> RequestPhase {
     engine.request_phase(id).expect("request remains retained")
+}
+
+#[test]
+fn public_service_trace_is_incremental_phase_exact_and_debug_redacted() {
+    assert_eq!(ServicePhase::Prefill.evidence_bit(), 0);
+    assert_eq!(ServicePhase::Decode.evidence_bit(), 1);
+    assert_eq!(ServicePhase::Prefill.as_str(), "prefill");
+    assert_eq!(ServicePhase::Decode.as_str(), "decode");
+
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 1;
+    limits.waves_per_step = 1;
+    limits.max_active_requests = 1;
+    limits.trace_capacity = 4;
+    let mut engine = new_engine_with_limits(limits);
+    let empty = engine
+        .service_trace_since(ServiceTraceCursor::origin())
+        .expect("initial trace view");
+    assert!(empty.events().is_empty());
+    assert_eq!(empty.start_cursor(), ServiceTraceCursor::origin());
+    assert_eq!(empty.next_cursor(), ServiceTraceCursor::origin());
+    assert_eq!(empty.status().retained_events(), 0);
+    assert_eq!(empty.status().event_limit(), 4);
+    assert!(empty.status().healthy());
+    drop(empty);
+
+    let id = engine
+        .try_submit(RequestSpec::new(&[0, 1], 3, SamplingPolicy::Greedy, None))
+        .expect("trace request accepted");
+    let expected_phases = [
+        ServicePhase::Prefill,
+        ServicePhase::Prefill,
+        ServicePhase::Decode,
+        ServicePhase::Decode,
+    ];
+    let mut cursor = ServiceTraceCursor::origin();
+    for (position, expected_phase) in expected_phases.into_iter().enumerate() {
+        let report = engine.step().expect("single-position trace step");
+        assert_eq!(report.selected_positions, 1);
+        assert_eq!(report.committed_positions, 1);
+        let read = engine
+            .service_trace_since(cursor)
+            .expect("incremental trace read");
+        assert_eq!(read.events().len(), 1);
+        let event = read.events()[0];
+        assert_eq!(event.request_id(), id);
+        assert_eq!(event.position(), position);
+        assert_eq!(event.phase(), expected_phase);
+        assert_eq!(read.status().retained_events(), position + 1);
+        assert!(read.status().healthy());
+        assert_eq!(
+            format!("{event:?}"),
+            format!(
+                "ServiceTraceEvent {{ request_id: \"<redacted>\", position: \"<redacted>\", phase: {expected_phase:?} }}"
+            )
+        );
+        assert!(!format!("{read:?}").contains("RequestId"));
+        cursor = read.next_cursor();
+    }
+
+    let frontier = engine
+        .service_trace_since(cursor)
+        .expect("frontier trace read");
+    assert!(frontier.events().is_empty());
+    assert_eq!(frontier.start_cursor(), cursor);
+    assert_eq!(frontier.next_cursor(), cursor);
+    assert!(frontier.status().healthy());
+    drop(frontier);
+
+    let empty_engine = tiny_engine();
+    let invalid = empty_engine
+        .service_trace_since(cursor)
+        .expect_err("cursor beyond retained prefix must fail closed");
+    assert_eq!(invalid.category(), ErrorCategory::InvalidRequest);
+    assert!(
+        empty_engine
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect("invalid read is nonmutating")
+            .events()
+            .is_empty()
+    );
+
+    assert_eq!(drain_tokens(&mut engine, id), [2, 3, 0]);
+    assert_eq!(
+        engine
+            .take_terminal(id)
+            .expect("trace terminal query")
+            .expect("trace terminal retained")
+            .outcome(),
+        TerminalOutcome::Completed
+    );
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+    assert_eq!(
+        engine
+            .shutdown()
+            .expect("trace engine shutdown")
+            .remaining_shared_bytes,
+        0
+    );
+    assert!(matches!(
+        engine
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect_err("successful shutdown destroys the trace"),
+        SchedulerError::SchedulerClosed
+    ));
+}
+
+#[test]
+fn trace_overflow_is_sticky_accounted_and_behavior_neutral() {
+    let mut small_limits = SchedulerLimits::tiny();
+    small_limits.batch_width = 1;
+    small_limits.waves_per_step = 1;
+    small_limits.max_active_requests = 1;
+    small_limits.trace_capacity = 1;
+    let mut small = new_engine_with_limits(small_limits);
+    let trace_charge = small.config().shared_static_charges().trace_bytes();
+    assert_eq!(trace_charge, 128);
+    assert_eq!(
+        small
+            .ledger_snapshot()
+            .category(LedgerCategory::Trace)
+            .used(),
+        trace_charge
+    );
+    let small_id = small
+        .try_submit(RequestSpec::new(&[0], 2, SamplingPolicy::Greedy, None))
+        .expect("small-trace request");
+    let small_first = small.step().expect("exact-full trace commit");
+    let exact_full = small
+        .service_trace_since(ServiceTraceCursor::origin())
+        .expect("exact-full trace read");
+    assert_eq!(exact_full.events().len(), 1);
+    assert_eq!(exact_full.events()[0].request_id(), small_id);
+    assert_eq!(exact_full.events()[0].position(), 0);
+    assert!(exact_full.status().healthy());
+    assert!(!exact_full.status().overflowed());
+    let full_cursor = exact_full.next_cursor();
+    drop(exact_full);
+
+    let small_second = small.step().expect("overflowing service commit");
+    let overflowed = small
+        .service_trace_since(full_cursor)
+        .expect("overflowed frontier remains readable");
+    assert!(overflowed.events().is_empty());
+    assert_eq!(overflowed.status().retained_events(), 1);
+    assert!(overflowed.status().overflowed());
+    assert!(!overflowed.status().healthy());
+    drop(overflowed);
+    assert_eq!(
+        small.step().expect("idle after overflow"),
+        StepReport::default()
+    );
+    assert!(
+        small
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect("overflow flag is sticky")
+            .status()
+            .overflowed()
+    );
+    assert_eq!(
+        small
+            .ledger_snapshot()
+            .category(LedgerCategory::Trace)
+            .used(),
+        trace_charge
+    );
+    let small_tokens = drain_tokens(&mut small, small_id);
+    let small_terminal = small
+        .take_terminal(small_id)
+        .expect("small terminal query")
+        .expect("small terminal retained");
+
+    let mut ample_limits = small_limits;
+    ample_limits.trace_capacity = 8;
+    let mut ample = new_engine_with_limits(ample_limits);
+    let ample_id = ample
+        .try_submit(RequestSpec::new(&[0], 2, SamplingPolicy::Greedy, None))
+        .expect("ample-trace request");
+    let ample_first = ample.step().expect("ample first commit");
+    let ample_second = ample.step().expect("ample second commit");
+    assert_eq!([small_first, small_second], [ample_first, ample_second]);
+    let ample_trace = ample
+        .service_trace_since(ServiceTraceCursor::origin())
+        .expect("complete ample trace");
+    assert_eq!(ample_trace.events().len(), 2);
+    assert!(ample_trace.status().healthy());
+    assert_eq!(
+        ample_trace
+            .events()
+            .iter()
+            .map(|event| (event.position(), event.phase()))
+            .collect::<Vec<_>>(),
+        [(0, ServicePhase::Prefill), (1, ServicePhase::Decode)]
+    );
+    drop(ample_trace);
+    let ample_tokens = drain_tokens(&mut ample, ample_id);
+    let ample_terminal = ample
+        .take_terminal(ample_id)
+        .expect("ample terminal query")
+        .expect("ample terminal retained");
+    assert_eq!(small_tokens, ample_tokens);
+    assert_eq!(small_terminal.outcome(), ample_terminal.outcome());
+    assert_eq!(
+        small_terminal.committed_positions(),
+        ample_terminal.committed_positions()
+    );
+    assert_eq!(
+        small_terminal.emitted_tokens(),
+        ample_terminal.emitted_tokens()
+    );
+
+    assert_eq!(
+        small
+            .shutdown()
+            .expect("small shutdown")
+            .remaining_shared_bytes,
+        0
+    );
+    assert_eq!(
+        small
+            .ledger_snapshot()
+            .category(LedgerCategory::Trace)
+            .used(),
+        0
+    );
+    assert_eq!(
+        ample
+            .shutdown()
+            .expect("ample shutdown")
+            .remaining_shared_bytes,
+        0
+    );
+}
+
+#[test]
+fn suppressed_control_decisions_do_not_append_service_events() {
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 1;
+    limits.waves_per_step = 1;
+    let mut engine = new_engine_with_limits(limits);
+    let cancelled = engine
+        .try_submit(RequestSpec::new(&[0], 2, SamplingPolicy::Greedy, None))
+        .expect("cancellable request");
+    assert_eq!(
+        engine.cancel(cancelled).expect("publish cancellation"),
+        CancelDisposition::Requested
+    );
+    assert_eq!(
+        engine
+            .step()
+            .expect("resolve cancellation")
+            .committed_positions,
+        0
+    );
+    assert!(
+        engine
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect("trace after cancellation")
+            .events()
+            .is_empty()
+    );
+    assert_eq!(
+        engine
+            .take_terminal(cancelled)
+            .expect("cancel terminal query")
+            .expect("cancel terminal retained")
+            .outcome(),
+        TerminalOutcome::Cancelled
+    );
+
+    let expired = engine
+        .try_submit(RequestSpec::new(&[0], 2, SamplingPolicy::Greedy, Some(1)))
+        .expect("deadline request");
+    engine.advance_clock(1).expect("reach inclusive deadline");
+    assert_eq!(
+        engine.step().expect("resolve deadline").committed_positions,
+        0
+    );
+    let trace = engine
+        .service_trace_since(ServiceTraceCursor::origin())
+        .expect("trace after deadline");
+    assert!(trace.events().is_empty());
+    assert!(trace.status().healthy());
+    drop(trace);
+    assert_eq!(
+        engine
+            .take_terminal(expired)
+            .expect("deadline terminal query")
+            .expect("deadline terminal retained")
+            .outcome(),
+        TerminalOutcome::DeadlineExceeded
+    );
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+    assert_eq!(
+        engine
+            .shutdown()
+            .expect("control trace shutdown")
+            .remaining_shared_bytes,
+        0
+    );
 }
 
 #[test]
@@ -1405,6 +1705,15 @@ fn adapter_error_after_commit_terminalizes_without_stranding_ownership() {
         assert_eq!(report.committed_positions, 1);
         assert_eq!(report.terminal_decisions, 1);
         assert_eq!(phase(&engine, id), RequestPhase::Terminal);
+        let trace = engine
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect("post-commit failure trace");
+        assert_eq!(trace.events().len(), 1);
+        assert_eq!(trace.events()[0].request_id(), id);
+        assert_eq!(trace.events()[0].position(), 0);
+        assert_eq!(trace.events()[0].phase(), ServicePhase::Prefill);
+        assert!(trace.status().healthy());
+        drop(trace);
         assert_eq!(drain_tokens(&mut engine, id), [1]);
         let terminal = engine
             .take_terminal(id)

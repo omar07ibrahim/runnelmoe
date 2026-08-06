@@ -36,6 +36,9 @@ use crate::{
         TerminalResult,
     },
     ring::{DrrRing, RingError},
+    trace::{
+        ServicePhase, ServiceTraceCursor, ServiceTraceEvent, ServiceTraceRead, ServiceTraceStatus,
+    },
     wave::{TaskEnvelope, WaveScratch, WaveScratchError, WaveSelection},
 };
 
@@ -1279,6 +1282,56 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         self.ledger.snapshot()
     }
 
+    /// Borrows the append-only service-trace suffix beginning at `cursor`.
+    ///
+    /// The trace records successful model-position commits in their exact
+    /// commit order. Reading never allocates, drains, resets, or changes the
+    /// fixed [`crate::LedgerCategory::Trace`] charge. A full trace remains
+    /// healthy until a later successful commit cannot be retained; overflow
+    /// is sticky and invalidates completeness without affecting scheduling.
+    /// Read the final prefix before successful shutdown, which deliberately
+    /// drops the allocation and releases its shared ledger ownership.
+    pub fn service_trace_since(
+        &self,
+        cursor: ServiceTraceCursor,
+    ) -> SchedulerResult<ServiceTraceRead<'_>> {
+        let trace = self
+            .service_trace
+            .as_ref()
+            .ok_or_else(SchedulerError::scheduler_closed)?;
+        let event_limit = self.config.trace_capacity();
+        if trace.len() > event_limit {
+            return Err(SchedulerError::internal(
+                "service trace length exceeds its configured limit",
+            ));
+        }
+        if trace.capacity() < event_limit {
+            return Err(SchedulerError::internal(
+                "service trace allocation is smaller than its configured limit",
+            ));
+        }
+        if self.trace_overflowed && trace.len() != event_limit {
+            return Err(SchedulerError::internal(
+                "overflowed service trace does not retain its complete capacity prefix",
+            ));
+        }
+        let start = cursor.event_index();
+        if start > trace.len() {
+            return Err(SchedulerError::invalid_request(
+                "service_trace_cursor",
+                "is beyond the retained trace prefix",
+            ));
+        }
+        let next_cursor = ServiceTraceCursor::from_retained_len(trace.len());
+        let status = ServiceTraceStatus::new(trace.len(), event_limit, self.trace_overflowed);
+        Ok(ServiceTraceRead::new(
+            &trace[start..],
+            cursor,
+            next_cursor,
+            status,
+        ))
+    }
+
     /// Advances bounded admission and executes up to the configured number of
     /// deterministic token waves.
     pub fn step(&mut self) -> SchedulerResult<StepReport> {
@@ -1954,6 +2007,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .as_ref()
             .ok_or_else(|| SchedulerError::internal("active request prompt is missing"))?
             .len();
+        let service_phase = if record.committed_positions < prompt_len {
+            ServicePhase::Prefill
+        } else {
+            ServicePhase::Decode
+        };
         let emits = record.max_new_tokens != 0 && next_position >= prompt_len;
         let (output_guard, terminal_guard, output_full_after_publish) = if emits {
             let guard = match endpoint.begin_output_commit() {
@@ -2035,6 +2093,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             next_decode_token,
             next_phase,
             next_adapter_revision,
+            service_phase,
             completed,
             endpoint_guard,
         }))
@@ -2060,6 +2119,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             next_decode_token,
             next_phase,
             next_adapter_revision,
+            service_phase,
             completed,
             endpoint_guard,
         } = publication;
@@ -2115,6 +2175,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .take()
             .ok_or_else(|| SchedulerError::internal("commit adapter state is missing"))?;
         let request_id = record.request_id;
+        let service_event = ServiceTraceEvent::new(request_id, position, service_phase);
         let deadline_ns = record.deadline_ns;
         let control = &record.control;
         let mut release = Some(release);
@@ -2143,10 +2204,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                             binding.expected_revision = next_adapter_revision;
                         }
                         if trace.len() < trace_capacity {
-                            trace.push(ServiceTraceEvent {
-                                request_id,
-                                position,
-                            });
+                            trace.push(service_event);
                         } else {
                             *trace_overflowed = true;
                         }
@@ -2802,6 +2860,7 @@ struct TokenPublication<'endpoint> {
     next_decode_token: Option<u32>,
     next_phase: RequestPhase,
     next_adapter_revision: u64,
+    service_phase: ServicePhase,
     completed: bool,
     endpoint_guard: PublicationGuard<'endpoint>,
 }
@@ -2813,6 +2872,7 @@ impl fmt::Debug for TokenPublication<'_> {
             .field("position", &self.position)
             .field("next_position", &self.next_position)
             .field("emits", &self.endpoint_guard.expects_output())
+            .field("service_phase", &self.service_phase)
             .field("completed", &self.completed)
             .field("endpoint", &"<held>")
             .finish_non_exhaustive()
@@ -2882,12 +2942,6 @@ struct AdapterBinding {
     model_instance_id: u64,
     state_id: u64,
     expected_revision: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ServiceTraceEvent {
-    request_id: crate::RequestId,
-    position: usize,
 }
 
 fn visible_control_outcome<A: DecoderAdapter>(
