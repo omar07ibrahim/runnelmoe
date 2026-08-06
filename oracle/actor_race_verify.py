@@ -10,23 +10,27 @@ This layer owns eight deliberately narrow responsibilities:
 * immutable accepted-identity projection and target lookup/access custody;
 * packed control-word algebra and request/control lifecycle custody;
 * endpoint terminal/EOF, FIFO output, cleanup-receiver, and recorder custody;
-* wake-signal park-epoch order, final shutdown conservation, and bounded
-  full-capture structural verification.
+* wake-signal park-epoch order and final shutdown conservation; and
+* bounded full-capture verification that layers the independent model gate
+  only after all structural repetitions pass.
 
-It deliberately leaves model-prefix semantics to the independent model gate,
-and recorder append positions are not promoted into causal order.  Action
-interval counters are mapped to explicit Invoke and Respond nodes; they are
-never promoted into a counter-derived global execution order.  In particular,
-consuming an actor command response is a separate CommandRelease event, never
-an alias for either ActorCommandRespond publication or the action's final
-Respond counter.
+The structural layer deliberately leaves model-prefix semantics to that final
+independent gate, and recorder append positions are not promoted into causal
+order.  Action interval counters are mapped to explicit Invoke and Respond
+nodes; they are never promoted into a counter-derived global execution order.
+In particular, consuming an actor command response is a separate
+CommandRelease event, never an alias for either ActorCommandRespond publication
+or the action's final Respond counter.
 """
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 import heapq
+from pathlib import Path
+import sys
 from typing import Any, NoReturn
 
 from oracle import actor_race_history, scheduler
@@ -71,6 +75,7 @@ EXPECTED_IN_RANGE_SUBMIT_COUNT = 64
 EXPECTED_EXHAUSTED_SUBMIT_COUNT = 142
 EXPECTED_TARGET_ACTION_COUNT = sum(EXPECTED_KIND_COUNTS[1:4])
 EXPECTED_OUTPUT_CAPACITY_PER_REQUEST = 2
+EXPECTED_VOCABULARY_SIZE = 32
 
 # Exact schema maximum for the finished event model.  Several classes are not
 # allocated by the submission-only layer yet, but reserving and checking their
@@ -899,6 +904,37 @@ class StructuralCaptureReport:
     schema: str
     repetition_count: int
     repetitions: tuple[StructuralRepetitionReport, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureVerificationReport:
+    """Public result without semantic evidence or graph ownership."""
+
+    structural: StructuralCaptureReport
+    model_validated: bool
+
+    @property
+    def publishable(self) -> bool:
+        """Whether this result is admissible as authoritative race evidence."""
+
+        return self.model_validated
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelPublication:
+    """Graph-free semantic input for one accepted request's model gate."""
+
+    client_index: int
+    outcome: str
+    tokens: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _StructuralVerification:
+    """Private bounded bridge from structural proof to the lazy model gate."""
+
+    report: StructuralCaptureReport
+    publications: tuple[tuple[_ModelPublication, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -5533,13 +5569,62 @@ def build_wake_shutdown_order(repetition: Any) -> WakeShutdownOrder:
     return _build_wake_shutdown_order(inputs, endpoint_order)
 
 
-def verify_capture_structure(capture: Any) -> StructuralCaptureReport:
-    """Stream all 32 repetitions through the complete structural gate.
+def _snapshot_model_publications(
+    order: WakeShutdownOrder,
+    repetition: int,
+) -> tuple[_ModelPublication, ...]:
+    """Copy only bounded model inputs out of one accepted structural graph."""
 
-    Only bounded scalar summaries survive each iteration; complete DAGs are not
-    retained across repetitions.  Model-prefix parity is a separate mandatory
-    gate and is deliberately outside this function.
-    """
+    publications = order.endpoint_order.endpoint.publications_by_client_index
+    if (
+        type(publications) is not tuple
+        or len(publications) != EXPECTED_IN_RANGE_SUBMIT_COUNT
+    ):
+        _fail(
+            f"repetition {repetition} model publication index is not an exact "
+            "64-entry tuple"
+        )
+    snapshots: list[_ModelPublication] = []
+    for client_index, publication in enumerate(publications):
+        if publication is None:
+            continue
+        if type(publication) is not RequestPublicationProjection:
+            _fail(
+                f"repetition {repetition} client publication has an invalid "
+                "exact type"
+            )
+        identity = publication.identity
+        if (
+            type(identity) is not AcceptedIdentityProjection
+            or type(identity.client_index) is not int
+            or identity.client_index != client_index
+        ):
+            _fail(
+                f"repetition {repetition} client publication index is inconsistent"
+            )
+        outcome = publication.terminal.outcome
+        if type(outcome) is not str or outcome not in {"completed", "cancelled"}:
+            _fail(f"repetition {repetition} client terminal outcome is invalid")
+        outputs = publication.outputs
+        if type(outputs) is not tuple:
+            _fail(f"repetition {repetition} client outputs are not immutable")
+        tokens: list[int] = []
+        for output in outputs:
+            if type(output) is not actor_race_history.Output:
+                _fail(f"repetition {repetition} client output has an invalid type")
+            token = _plain_int(
+                output.token_id,
+                f"repetition {repetition} client output token",
+            )
+            if token < 0 or token >= EXPECTED_VOCABULARY_SIZE:
+                _fail(f"repetition {repetition} client output token is out of range")
+            tokens.append(token)
+        snapshots.append(_ModelPublication(client_index, outcome, tuple(tokens)))
+    return tuple(snapshots)
+
+
+def _verify_capture_structure_and_project(capture: Any) -> _StructuralVerification:
+    """Prove all repetitions while retaining no graph or projection objects."""
 
     if type(capture) is not actor_race_history.Capture:
         _fail("decoded capture has an invalid exact type")
@@ -5558,6 +5643,7 @@ def verify_capture_structure(capture: Any) -> StructuralCaptureReport:
         _fail("decoded capture repetitions must be an exact 32-entry tuple")
 
     reports: list[StructuralRepetitionReport] = []
+    model_publications: list[tuple[_ModelPublication, ...]] = []
     for expected_index, repetition in enumerate(repetitions):
         if type(repetition) is not actor_race_history.Repetition:
             _fail(f"decoded repetition {expected_index} has an invalid exact type")
@@ -5565,6 +5651,7 @@ def verify_capture_structure(capture: Any) -> StructuralCaptureReport:
         if index != expected_index:
             _fail(f"repetition {expected_index} index is out of order")
         order = build_wake_shutdown_order(repetition)
+        model_publications.append(_snapshot_model_publications(order, index))
         reports.append(
             StructuralRepetitionReport(
                 index,
@@ -5578,11 +5665,152 @@ def verify_capture_structure(capture: Any) -> StructuralCaptureReport:
         # next large DAG.  Assignment would otherwise retain this order until
         # the following build returns, doubling the intended peak graph set.
         del order
-    return StructuralCaptureReport(
-        capture.schema,
-        repetition_count,
-        tuple(reports),
+    return _StructuralVerification(
+        StructuralCaptureReport(
+            capture.schema,
+            repetition_count,
+            tuple(reports),
+        ),
+        tuple(model_publications),
     )
+
+
+def verify_capture_structure(capture: Any) -> StructuralCaptureReport:
+    """Stream all 32 repetitions through the complete structural gate.
+
+    Only bounded scalar summaries survive this public entry point; complete
+    DAGs and private model-publication snapshots are not returned.
+    """
+
+    return _verify_capture_structure_and_project(capture).report
+
+
+def _load_authenticated_model_sequences() -> tuple[tuple[int, ...], ...]:
+    """Lazy-load and build the independent 64-sequence PyTorch corpus once."""
+
+    try:
+        from oracle import actor_transcript
+    except Exception as error:
+        raise ActorRaceVerificationError(
+            f"independent model gate is unavailable: {error}"
+        ) from error
+    try:
+        return actor_transcript.build_authenticated_model_sequences()
+    except actor_transcript.ActorTranscriptError as error:
+        raise ActorRaceVerificationError(
+            f"independent model gate failed: {error}"
+        ) from error
+    except Exception as error:
+        raise ActorRaceVerificationError(
+            f"independent model gate failed unexpectedly: {error}"
+        ) from error
+
+
+def _verify_model_publications(
+    publications: tuple[tuple[_ModelPublication, ...], ...],
+    sequences: tuple[tuple[int, ...], ...],
+) -> None:
+    """Require exact completed sequences and cancelled strict prefixes."""
+
+    if (
+        type(sequences) is not tuple
+        or len(sequences) != EXPECTED_IN_RANGE_SUBMIT_COUNT
+    ):
+        _fail("independent model corpus is not an exact 64-sequence tuple")
+    for client_index, sequence in enumerate(sequences):
+        if type(sequence) is not tuple or not 1 <= len(sequence) <= 16:
+            _fail("independent model corpus contains an invalid sequence")
+        for token_index, token in enumerate(sequence):
+            token = _plain_int(
+                token,
+                f"independent model sequence {client_index} token {token_index}",
+            )
+            if token < 0 or token >= EXPECTED_VOCABULARY_SIZE:
+                _fail("independent model corpus contains an out-of-range token")
+        if 0 in sequence[:-1]:
+            _fail("independent model corpus contains output after EOS")
+
+    if type(publications) is not tuple or len(publications) != EXPECTED_REPETITION_COUNT:
+        _fail("structural model snapshots are not an exact 32-entry tuple")
+    for repetition, repetition_publications in enumerate(publications):
+        if type(repetition_publications) is not tuple:
+            _fail(f"repetition {repetition} model snapshots are not immutable")
+        previous_client = -1
+        for publication in repetition_publications:
+            if type(publication) is not _ModelPublication:
+                _fail(f"repetition {repetition} model snapshot has an invalid type")
+            client_index = _plain_int(
+                publication.client_index,
+                f"repetition {repetition} model snapshot client index",
+            )
+            if (
+                client_index <= previous_client
+                or client_index >= EXPECTED_IN_RANGE_SUBMIT_COUNT
+            ):
+                _fail(f"repetition {repetition} model snapshot order is invalid")
+            previous_client = client_index
+            if type(publication.tokens) is not tuple:
+                _fail(f"repetition {repetition} model snapshot tokens are not immutable")
+            expected = sequences[client_index]
+            actual = publication.tokens
+            if type(publication.outcome) is not str:
+                _fail(f"repetition {repetition} client terminal outcome is invalid")
+            for token_index, token in enumerate(actual):
+                token = _plain_int(
+                    token,
+                    f"repetition {repetition} client {client_index} "
+                    f"token {token_index}",
+                )
+                if token < 0 or token >= EXPECTED_VOCABULARY_SIZE:
+                    _fail(
+                        f"repetition {repetition} client output token is out of range"
+                    )
+            if actual != expected[: len(actual)]:
+                _fail(
+                    f"repetition {repetition} client {client_index} output is not "
+                    "an independent tiny-v3 prefix"
+                )
+            if publication.outcome == "completed":
+                if actual != expected:
+                    _fail(
+                        f"repetition {repetition} client {client_index} completed "
+                        "before its independent sequence ended"
+                    )
+            elif publication.outcome == "cancelled":
+                if len(actual) >= len(expected):
+                    _fail(
+                        f"repetition {repetition} client {client_index} was "
+                        "cancelled after its full sequence completed"
+                    )
+            else:
+                _fail(f"repetition {repetition} client terminal outcome is invalid")
+
+
+def verify_capture(
+    capture: Any,
+    *,
+    validate_model: bool = True,
+) -> CaptureVerificationReport:
+    """Run the authoritative structural gate and, by default, its model gate."""
+
+    validate_model = _plain_bool(validate_model, "validate_model")
+    structural = _verify_capture_structure_and_project(capture)
+    if validate_model:
+        sequences = _load_authenticated_model_sequences()
+        _verify_model_publications(structural.publications, sequences)
+    return CaptureVerificationReport(structural.report, validate_model)
+
+
+def verify_capture_path(
+    path: str | Path,
+    *,
+    validate_model: bool = True,
+) -> CaptureVerificationReport:
+    """Safely read and authoritatively verify one canonical capture path."""
+
+    validate_model = _plain_bool(validate_model, "validate_model")
+    capture = actor_race_history.load_capture(path)
+    return verify_capture(capture, validate_model=validate_model)
 
 
 def producer_action_interval_edges(
@@ -5633,3 +5861,44 @@ def producer_action_interval_edges(
             )
         last[producer] = (position, response)
     return tuple(constraints)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the publishable model-enabled verifier or an explicit diagnostic."""
+
+    parser = argparse.ArgumentParser(
+        description="verify one bounded canonical actor race-history capture"
+    )
+    parser.add_argument("capture", type=Path, help="canonical race-history capture")
+    parser.add_argument(
+        "--no-model",
+        action="store_true",
+        help=(
+            "structural diagnostics only; NONPUBLISHABLE and not admissible "
+            "as race evidence"
+        ),
+    )
+    arguments = parser.parse_args(argv)
+    try:
+        report = verify_capture_path(
+            arguments.capture,
+            validate_model=not arguments.no_model,
+        )
+    except (
+        actor_race_history.ActorRaceHistoryError,
+        ActorRaceVerificationError,
+    ) as error:
+        print(f"actor race verifier: {error}", file=sys.stderr)
+        return 1
+    if report.publishable:
+        print("actor race verifier: PASS publishable (model gate enabled)")
+    else:
+        print(
+            "actor race verifier: PASS NONPUBLISHABLE structural-only "
+            "diagnostic (--no-model)"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

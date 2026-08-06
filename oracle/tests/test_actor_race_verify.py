@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass, fields, is_dataclass, replace
 import gc
+import io
 from itertools import permutations
+from pathlib import Path
 import random
 from types import SimpleNamespace
 import unittest
@@ -4815,7 +4818,10 @@ class WakeShutdownOrderTests(unittest.TestCase):
                 self.graph = SimpleNamespace(node_count=4_000, edges=())
                 self.lifecycle = SimpleNamespace(in_action_order=(None,) * 139)
                 self.endpoint_order = SimpleNamespace(
-                    endpoint=SimpleNamespace(requests_by_request_id=())
+                    endpoint=SimpleNamespace(
+                        requests_by_request_id=(),
+                        publications_by_client_index=(None,) * 64,
+                    )
                 )
 
         live: weakref.WeakSet[EphemeralOrder] = weakref.WeakSet()
@@ -4841,6 +4847,416 @@ class WakeShutdownOrderTests(unittest.TestCase):
         self.assertEqual(build_mock.call_count, 32)
         self.assertEqual(len(report.repetitions), 32)
         self.assertEqual(len(live), 0)
+
+
+class AuthoritativeCaptureGateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repetition = _exact_wake_shutdown_repetition()
+        cls.order = actor_race_verify.build_wake_shutdown_order(cls.repetition)
+        repetitions = tuple(
+            replace(cls.repetition, repetition=index)
+            for index in range(actor_race_verify.EXPECTED_REPETITION_COUNT)
+        )
+        cls.capture = actor_race_history.Capture(
+            actor_race_verify.EXPECTED_REPETITION_COUNT,
+            repetitions,
+            actor_race_verify._EXPECTED_CAPTURE_SCHEMA,
+            actor_race_verify._EXPECTED_WORKLOAD,
+        )
+        cls.sequences = tuple(
+            ((client_index % 31) + 1,)
+            for client_index in range(
+                actor_race_verify.EXPECTED_IN_RANGE_SUBMIT_COUNT
+            )
+        )
+
+    @staticmethod
+    def _publication_grid(
+        *publications: actor_race_verify._ModelPublication,
+    ) -> tuple[tuple[actor_race_verify._ModelPublication, ...], ...]:
+        return (tuple(publications),) + ((),) * (
+            actor_race_verify.EXPECTED_REPETITION_COUNT - 1
+        )
+
+    def test_default_runs_all_structures_before_one_model_build(self) -> None:
+        events: list[int | str] = []
+
+        def build(
+            repetition: actor_race_history.Repetition,
+        ) -> actor_race_verify.WakeShutdownOrder:
+            events.append(repetition.repetition)
+            return self.order
+
+        def load_model() -> tuple[tuple[int, ...], ...]:
+            self.assertEqual(
+                events,
+                list(range(actor_race_verify.EXPECTED_REPETITION_COUNT)),
+            )
+            events.append("model")
+            return self.sequences
+
+        with mock.patch.object(
+            actor_race_verify,
+            "build_wake_shutdown_order",
+            side_effect=build,
+        ) as structural_build:
+            with mock.patch.object(
+                actor_race_verify,
+                "_load_authenticated_model_sequences",
+                side_effect=load_model,
+            ) as model_build:
+                report = actor_race_verify.verify_capture(self.capture)
+        self.assertEqual(structural_build.call_count, 32)
+        model_build.assert_called_once_with()
+        self.assertEqual(events[-1], "model")
+        self.assertTrue(report.model_validated)
+        self.assertTrue(report.publishable)
+
+    def test_last_structural_failure_never_reaches_model_import(self) -> None:
+        visited: list[int] = []
+
+        def build(
+            repetition: actor_race_history.Repetition,
+        ) -> actor_race_verify.WakeShutdownOrder:
+            visited.append(repetition.repetition)
+            if repetition.repetition == 31:
+                raise actor_race_verify.ActorRaceVerificationError(
+                    "synthetic final structural failure"
+                )
+            return self.order
+
+        with mock.patch.object(
+            actor_race_verify,
+            "build_wake_shutdown_order",
+            side_effect=build,
+        ):
+            with mock.patch.object(
+                actor_race_verify,
+                "_load_authenticated_model_sequences",
+            ) as model_build:
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    "final structural failure",
+                ):
+                    actor_race_verify.verify_capture(self.capture)
+        self.assertEqual(visited, list(range(32)))
+        model_build.assert_not_called()
+
+    def test_private_bridge_contains_only_graph_free_scalar_snapshots(self) -> None:
+        with mock.patch.object(
+            actor_race_verify,
+            "build_wake_shutdown_order",
+            return_value=self.order,
+        ):
+            verified = actor_race_verify._verify_capture_structure_and_project(
+                self.capture
+            )
+        self.assertEqual(len(verified.publications), 32)
+
+        forbidden = (
+            actor_race_verify.ReasonedDAG,
+            actor_race_verify.WakeShutdownOrder,
+            actor_race_verify.RequestPublicationProjection,
+            actor_race_verify.AcceptedIdentityProjection,
+        )
+        visited: set[int] = set()
+
+        def assert_graph_free(value: object) -> None:
+            if isinstance(value, (str, int, bool, type(None))):
+                return
+            identity = id(value)
+            if identity in visited:
+                return
+            visited.add(identity)
+            self.assertNotIsInstance(value, forbidden)
+            if is_dataclass(value):
+                for field in fields(value):
+                    assert_graph_free(getattr(value, field.name))
+            elif type(value) is tuple:
+                for item in value:
+                    assert_graph_free(item)
+
+        assert_graph_free(verified)
+        for repetition in verified.publications:
+            for publication in repetition:
+                self.assertIs(type(publication), actor_race_verify._ModelPublication)
+                self.assertIs(type(publication.client_index), int)
+                self.assertIs(type(publication.outcome), str)
+                self.assertIs(type(publication.tokens), tuple)
+                self.assertTrue(all(type(token) is int for token in publication.tokens))
+
+    def test_completed_and_cancelled_model_semantics_are_exact(self) -> None:
+        sequences = list(self.sequences)
+        sequences[7] = (5, 6)
+        corpus = tuple(sequences)
+        passing = (
+            actor_race_verify._ModelPublication(7, "completed", (5, 6)),
+            actor_race_verify._ModelPublication(7, "cancelled", ()),
+            actor_race_verify._ModelPublication(7, "cancelled", (5,)),
+        )
+        for publication in passing:
+            with self.subTest(passing=publication):
+                actor_race_verify._verify_model_publications(
+                    self._publication_grid(publication),
+                    corpus,
+                )
+
+        failing = (
+            (
+                actor_race_verify._ModelPublication(7, "completed", (5,)),
+                "completed before",
+            ),
+            (
+                actor_race_verify._ModelPublication(7, "cancelled", (5, 6)),
+                "cancelled after",
+            ),
+            (
+                actor_race_verify._ModelPublication(7, "cancelled", (6,)),
+                "not an independent",
+            ),
+            (
+                actor_race_verify._ModelPublication(7, "foreign", (5,)),
+                "outcome is invalid",
+            ),
+        )
+        for publication, diagnostic in failing:
+            with self.subTest(failing=publication):
+                with self.assertRaisesRegex(
+                    actor_race_verify.ActorRaceVerificationError,
+                    diagnostic,
+                ):
+                    actor_race_verify._verify_model_publications(
+                        self._publication_grid(publication),
+                        corpus,
+                    )
+
+    def test_model_corpus_and_snapshot_shells_fail_closed(self) -> None:
+        malformed_corpora: tuple[object, ...] = (
+            list(self.sequences),
+            self.sequences[:-1],
+            (*self.sequences[:3], [4], *self.sequences[4:]),
+            (*self.sequences[:3], (), *self.sequences[4:]),
+            (*self.sequences[:3], (True,), *self.sequences[4:]),
+            (*self.sequences[:3], (32,), *self.sequences[4:]),
+        )
+        for corpus in malformed_corpora:
+            with self.subTest(corpus_type=type(corpus)):
+                with self.assertRaises(actor_race_verify.ActorRaceVerificationError):
+                    actor_race_verify._verify_model_publications(
+                        ((),) * actor_race_verify.EXPECTED_REPETITION_COUNT,
+                        corpus,  # type: ignore[arg-type]
+                    )
+
+        duplicate = (
+            actor_race_verify._ModelPublication(7, "cancelled", ()),
+            actor_race_verify._ModelPublication(7, "cancelled", ()),
+        )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "snapshot order is invalid",
+        ):
+            actor_race_verify._verify_model_publications(
+                self._publication_grid(*duplicate),
+                self.sequences,
+            )
+        with self.assertRaisesRegex(
+            actor_race_verify.ActorRaceVerificationError,
+            "must be an integer",
+        ):
+            actor_race_verify._verify_model_publications(
+                self._publication_grid(
+                    actor_race_verify._ModelPublication(
+                        0,
+                        "cancelled",
+                        (True,),
+                    )
+                ),
+                ((1, 2), *self.sequences[1:]),
+            )
+
+    def test_model_error_translation_preserves_baseexception_control_flow(self) -> None:
+        from oracle import actor_transcript
+
+        transcript_failure = actor_transcript.ActorTranscriptError("synthetic")
+        with mock.patch.object(
+            actor_transcript,
+            "build_authenticated_model_sequences",
+            side_effect=transcript_failure,
+        ):
+            with self.assertRaisesRegex(
+                actor_race_verify.ActorRaceVerificationError,
+                "independent model gate failed: synthetic",
+            ) as caught:
+                actor_race_verify._load_authenticated_model_sequences()
+        self.assertIs(caught.exception.__cause__, transcript_failure)
+
+        ordinary = RuntimeError("native loader")
+        with mock.patch.object(
+            actor_transcript,
+            "build_authenticated_model_sequences",
+            side_effect=ordinary,
+        ):
+            with self.assertRaises(actor_race_verify.ActorRaceVerificationError) as caught:
+                actor_race_verify._load_authenticated_model_sequences()
+        self.assertIs(caught.exception.__cause__, ordinary)
+
+        class Fatal(BaseException):
+            pass
+
+        fatal = Fatal("control flow")
+        with mock.patch.object(
+            actor_transcript,
+            "build_authenticated_model_sequences",
+            side_effect=fatal,
+        ):
+            with self.assertRaises(Fatal) as caught:
+                actor_race_verify._load_authenticated_model_sequences()
+        self.assertIs(caught.exception, fatal)
+
+    def test_validate_model_requires_exact_bool_and_false_is_nonpublishable(self) -> None:
+        for malformed in (0, 1, None, "yes"):
+            with self.subTest(malformed=malformed):
+                with mock.patch.object(
+                    actor_race_verify,
+                    "_verify_capture_structure_and_project",
+                ) as structural:
+                    with self.assertRaisesRegex(
+                        actor_race_verify.ActorRaceVerificationError,
+                        "validate_model must be a boolean",
+                    ):
+                        actor_race_verify.verify_capture(
+                            self.capture,
+                            validate_model=malformed,  # type: ignore[arg-type]
+                        )
+                structural.assert_not_called()
+
+        with mock.patch.object(
+            actor_race_verify,
+            "build_wake_shutdown_order",
+            return_value=self.order,
+        ):
+            with mock.patch.object(
+                actor_race_verify,
+                "_load_authenticated_model_sequences",
+            ) as model_build:
+                report = actor_race_verify.verify_capture(
+                    self.capture,
+                    validate_model=False,
+                )
+        model_build.assert_not_called()
+        self.assertFalse(report.model_validated)
+        self.assertFalse(report.publishable)
+
+    def test_path_entry_delegates_only_to_safe_capture_loader(self) -> None:
+        path = Path("bounded-race-capture.json")
+        expected = actor_race_verify.CaptureVerificationReport(
+            actor_race_verify.StructuralCaptureReport(
+                actor_race_verify._EXPECTED_CAPTURE_SCHEMA,
+                actor_race_verify.EXPECTED_REPETITION_COUNT,
+                (),
+            ),
+            False,
+        )
+        with mock.patch.object(
+            actor_race_history,
+            "load_capture",
+            return_value=self.capture,
+        ) as safe_load:
+            with mock.patch.object(
+                actor_race_verify,
+                "verify_capture",
+                return_value=expected,
+            ) as verify:
+                actual = actor_race_verify.verify_capture_path(
+                    path,
+                    validate_model=False,
+                )
+        safe_load.assert_called_once_with(path)
+        verify.assert_called_once_with(self.capture, validate_model=False)
+        self.assertIs(actual, expected)
+
+        with mock.patch.object(actor_race_history, "load_capture") as safe_load:
+            with self.assertRaisesRegex(
+                actor_race_verify.ActorRaceVerificationError,
+                "validate_model must be a boolean",
+            ):
+                actor_race_verify.verify_capture_path(
+                    path,
+                    validate_model=1,  # type: ignore[arg-type]
+                )
+        safe_load.assert_not_called()
+
+    def test_cli_defaults_publishable_and_marks_no_model_nonpublishable(self) -> None:
+        structural = actor_race_verify.StructuralCaptureReport(
+            actor_race_verify._EXPECTED_CAPTURE_SCHEMA,
+            actor_race_verify.EXPECTED_REPETITION_COUNT,
+            (),
+        )
+        cases = (
+            (
+                ["capture.json"],
+                True,
+                actor_race_verify.CaptureVerificationReport(structural, True),
+                "actor race verifier: PASS publishable (model gate enabled)\n",
+            ),
+            (
+                ["capture.json", "--no-model"],
+                False,
+                actor_race_verify.CaptureVerificationReport(structural, False),
+                (
+                    "actor race verifier: PASS NONPUBLISHABLE structural-only "
+                    "diagnostic (--no-model)\n"
+                ),
+            ),
+        )
+        for argv, validate_model, report, expected_output in cases:
+            with self.subTest(argv=argv):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    actor_race_verify,
+                    "verify_capture_path",
+                    return_value=report,
+                ) as verify:
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        status = actor_race_verify.main(argv)
+                self.assertEqual(status, 0)
+                verify.assert_called_once_with(
+                    Path("capture.json"),
+                    validate_model=validate_model,
+                )
+                self.assertEqual(stdout.getvalue(), expected_output)
+                self.assertEqual(stderr.getvalue(), "")
+                rendered = stdout.getvalue() + stderr.getvalue()
+                self.assertNotIn("sha256:", rendered)
+                self.assertNotIn("token", rendered.lower())
+                self.assertNotIn("accepted", rendered.lower())
+                self.assertNotIn("request_id", rendered.lower())
+                self.assertNotIn("node_count", rendered.lower())
+
+    def test_cli_normalizes_expected_errors_without_a_traceback(self) -> None:
+        failures = (
+            actor_race_history.ActorRaceHistoryError("synthetic history failure"),
+            actor_race_verify.ActorRaceVerificationError(
+                "synthetic verification failure"
+            ),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    actor_race_verify,
+                    "verify_capture_path",
+                    side_effect=failure,
+                ):
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        status = actor_race_verify.main(["capture.json"])
+                self.assertEqual(status, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(str(failure), stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
 
 
 class SubmissionProtocolOrderTests(unittest.TestCase):
