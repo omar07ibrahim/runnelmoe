@@ -31,6 +31,9 @@ TRANSCRIPT_DOMAIN = b"runnel-m5-actor-semantic-transcript-v2\0"
 MAX_CAPTURE_BYTES = 1024 * 1024
 MAX_TINY_SPEC_BYTES = 256 * 1024
 EXPECTED_DIGEST_BYTES = 72
+EXPECTED_DESCRIPTOR_VECTOR_ID = (
+    "sha256:d902ecf3377310de99471f41287f62730671263b8e339ac03b87ee5d6edef42b"
+)
 MAX_U8 = (1 << 8) - 1
 MAX_U32 = (1 << 32) - 1
 MAX_U64 = (1 << 64) - 1
@@ -1263,6 +1266,265 @@ def transcript_digest(capture: ValidatedCapture | Any) -> str:
     return f"sha256:{hashlib.sha256(serialize_transcript(capture)).hexdigest()}"
 
 
+def _authenticated_model_descriptors() -> tuple[tuple[tuple[int, ...], int], ...]:
+    """Regenerate, authenticate, and snapshot the exact 64 model requests."""
+
+    try:
+        descriptors = scheduler.build_descriptors()
+    except (OverflowError, RuntimeError, TypeError, ValueError) as error:
+        _fail(f"cannot regenerate model-prefix descriptors: {error}")
+    _require(
+        type(descriptors) is list and len(descriptors) == REQUEST_COUNT,
+        "model-prefix descriptors must be an exact 64-entry list",
+    )
+    try:
+        identity = scheduler.sequence_identity(descriptors)
+    except scheduler.SchedulerFixtureError as error:
+        _fail(f"cannot authenticate model-prefix descriptors: {error}")
+    _require(
+        identity == EXPECTED_DESCRIPTOR_VECTOR_ID,
+        "model-prefix descriptor identity differs from the frozen corpus",
+    )
+
+    expected_keys = {
+        "deadline_ns",
+        "index",
+        "max_new_tokens",
+        "prompt",
+        "sampling",
+    }
+    snapshots: list[tuple[tuple[int, ...], int]] = []
+    for client_index, descriptor in enumerate(descriptors):
+        label = f"model-prefix descriptor {client_index}"
+        _require(
+            type(descriptor) is dict and set(descriptor) == expected_keys,
+            f"{label} does not use its closed schema",
+        )
+        index = _plain_int(descriptor["index"], f"{label} index")
+        maximum = _plain_int(
+            descriptor["max_new_tokens"],
+            f"{label} max_new_tokens",
+        )
+        prompt = descriptor["prompt"]
+        _require(index == client_index, f"{label} index is out of order")
+        _require(
+            descriptor["deadline_ns"] is None
+            and type(descriptor["sampling"]) is str
+            and descriptor["sampling"] == "greedy",
+            f"{label} policy fields differ from the frozen workload",
+        )
+        _require(
+            type(prompt) is list and 1 <= len(prompt) <= 4,
+            f"{label} prompt must be an exact list with 1..4 tokens",
+        )
+        prompt_snapshot: list[int] = []
+        for token_index, token in enumerate(prompt):
+            token = _plain_int(token, f"{label} prompt token {token_index}")
+            _require(
+                1 <= token < VOCABULARY_SIZE,
+                f"{label} prompt token is outside the tiny-v3 vocabulary",
+            )
+            prompt_snapshot.append(token)
+        _require(1 <= maximum <= 16, f"{label} max_new_tokens is outside 1..16")
+        _require(
+            len(prompt_snapshot) + maximum - 1 <= 16,
+            f"{label} exceeds the frozen 16-position model envelope",
+        )
+        snapshots.append((tuple(prompt_snapshot), maximum))
+    return tuple(snapshots)
+
+
+def _validated_generated_sequence(
+    raw: Any,
+    prompt: tuple[int, ...],
+    maximum: int,
+    client_index: int,
+) -> tuple[int, ...]:
+    """Validate one closed ``greedy_generate`` result before retaining tokens."""
+
+    label = f"model-prefix sequence {client_index}"
+    _require(
+        type(raw) is tuple and len(raw) == 4,
+        f"{label} generator result must be an exact four-tuple",
+    )
+    full_ids, generated, _logit_steps, stop_reason = raw
+    _require(type(full_ids) is list, f"{label} full IDs must be an exact list")
+    _require(type(generated) is list, f"{label} generated IDs must be an exact list")
+    _require(
+        type(stop_reason) is str,
+        f"{label} stop reason must be an exact string",
+    )
+    _require(
+        1 <= len(generated) <= maximum,
+        f"{label} generated length is outside its descriptor bound",
+    )
+    tokens: list[int] = []
+    for token_index, token in enumerate(generated):
+        token = _plain_int(token, f"{label} token {token_index}")
+        _require(
+            0 <= token < VOCABULARY_SIZE,
+            f"{label} token is outside the tiny-v3 vocabulary",
+        )
+        tokens.append(token)
+    _require(
+        EOS_TOKEN_ID not in tokens[:-1],
+        f"{label} generated output after EOS",
+    )
+    full_snapshot: list[int] = []
+    for token_index, token in enumerate(full_ids):
+        token = _plain_int(token, f"{label} full token {token_index}")
+        _require(
+            0 <= token < VOCABULARY_SIZE,
+            f"{label} full token is outside the tiny-v3 vocabulary",
+        )
+        full_snapshot.append(token)
+    _require(
+        tuple(full_snapshot) == (*prompt, *tokens),
+        f"{label} full IDs do not equal prompt plus generated IDs",
+    )
+    if tokens[-1] == EOS_TOKEN_ID:
+        _require(stop_reason == "eos", f"{label} EOS stop reason is inconsistent")
+    else:
+        _require(
+            stop_reason == "max_new_tokens" and len(tokens) == maximum,
+            f"{label} limit stop reason or length is inconsistent",
+        )
+    return tuple(tokens)
+
+
+def build_authenticated_model_sequences() -> tuple[tuple[int, ...], ...]:
+    """Build all 64 frozen tiny-v3 sequences with the independent oracle.
+
+    Descriptor and spec authentication occur before any model result is
+    accepted. PyTorch remains a lazy dependency, runs deterministically with one
+    intra-op thread, and has its process-global settings restored on every exit.
+    """
+
+    descriptors = _authenticated_model_descriptors()
+    try:
+        import torch
+
+        from oracle.generate import greedy_generate
+        from oracle.runnel_oracle import TinyMoEOracle, load_fixture_spec
+    except (ImportError, OSError, RuntimeError) as error:
+        _fail(f"PyTorch model-prefix validation is unavailable: {error}")
+
+    try:
+        previous_threads = torch.get_num_threads()
+        previous_deterministic = torch.are_deterministic_algorithms_enabled()
+        previous_warn_only = (
+            torch.is_deterministic_algorithms_warn_only_enabled()
+        )
+    except (
+        AttributeError,
+        OSError,
+        OverflowError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(f"cannot inspect PyTorch model-prefix settings: {error}")
+
+    sequences: tuple[tuple[int, ...], ...] | None = None
+    failure: BaseException | None = None
+    try:
+        torch.set_num_threads(1)
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        spec = _load_authenticated_tiny_spec(load_fixture_spec)
+        model = TinyMoEOracle(spec)
+        generated_sequences: list[tuple[int, ...]] = []
+        for client_index, (prompt, maximum) in enumerate(descriptors):
+            raw = greedy_generate(model, list(prompt), maximum)
+            generated_sequences.append(
+                _validated_generated_sequence(
+                    raw,
+                    prompt,
+                    maximum,
+                    client_index,
+                )
+            )
+        sequences = tuple(generated_sequences)
+    except BaseException as error:
+        failure = error
+
+    restore_errors: list[tuple[str, BaseException]] = []
+    try:
+        torch.use_deterministic_algorithms(
+            previous_deterministic,
+            warn_only=previous_warn_only,
+        )
+    except BaseException as error:
+        restore_errors.append(("deterministic algorithms", error))
+    try:
+        torch.set_num_threads(previous_threads)
+    except BaseException as error:
+        restore_errors.append(("thread count", error))
+    restore_message = (
+        "cannot restore PyTorch model-prefix settings: "
+        + "; ".join(f"{label}: {error}" for label, error in restore_errors)
+        if restore_errors
+        else ""
+    )
+
+    fatal_restore = next(
+        (
+            error
+            for _label, error in restore_errors
+            if not isinstance(error, Exception)
+        ),
+        None,
+    )
+    if fatal_restore is not None:
+        if failure is not None:
+            fatal_restore.add_note(
+                f"model-prefix generation also failed: {type(failure).__name__}: {failure}"
+            )
+        for label, error in restore_errors:
+            if error is not fatal_restore:
+                fatal_restore.add_note(
+                    f"additional {label} restoration failure: "
+                    f"{type(error).__name__}: {error}"
+                )
+        raise fatal_restore.with_traceback(fatal_restore.__traceback__)
+
+    if failure is not None:
+        if isinstance(failure, ActorTranscriptError):
+            if restore_errors:
+                raise ActorTranscriptError(f"{failure}; {restore_message}") from failure
+            raise failure.with_traceback(failure.__traceback__)
+        if isinstance(
+            failure,
+            (AttributeError, OSError, OverflowError, RuntimeError, TypeError, ValueError),
+        ):
+            message = f"independent tiny-v3 model-prefix generation failed: {failure}"
+            if restore_errors:
+                message = f"{message}; {restore_message}"
+            raise ActorTranscriptError(message) from failure
+        if restore_errors:
+            failure.add_note(restore_message)
+        raise failure.with_traceback(failure.__traceback__)
+    if restore_errors:
+        first_restore_error = restore_errors[0][1]
+        for label, error in restore_errors[1:]:
+            first_restore_error.add_note(f"additional {label} restoration failure: {error}")
+        if isinstance(first_restore_error, Exception):
+            raise ActorTranscriptError(restore_message) from first_restore_error
+        raise first_restore_error.with_traceback(first_restore_error.__traceback__)
+    _require(sequences is not None, "model-prefix generation produced no corpus")
+    _require(
+        type(sequences) is tuple
+        and len(sequences) == REQUEST_COUNT
+        and all(type(sequence) is tuple for sequence in sequences),
+        "model-prefix corpus is not an immutable 64-sequence tuple",
+    )
+    _require(
+        sum(len(sequence) for sequence in sequences)
+        <= sum(maximum for _prompt, maximum in descriptors),
+        "model-prefix corpus exceeds its authenticated token bound",
+    )
+    return sequences
+
+
 def validate_model_output_prefixes(capture: ValidatedCapture | Any) -> None:
     """Check captured tokens against the independent tiny-v3 PyTorch oracle.
 
@@ -1274,41 +1536,14 @@ def validate_model_output_prefixes(capture: ValidatedCapture | Any) -> None:
     """
 
     validated = _validated(capture)
-    try:
-        import torch
-
-        from oracle.generate import greedy_generate
-        from oracle.runnel_oracle import TinyMoEOracle, load_fixture_spec
-    except ImportError as error:
-        _fail(f"PyTorch model-prefix validation is unavailable: {error}")
-
-    previous_threads = torch.get_num_threads()
-    previous_deterministic = torch.are_deterministic_algorithms_enabled()
-    try:
-        torch.set_num_threads(1)
-        torch.use_deterministic_algorithms(True)
-        spec = _load_authenticated_tiny_spec(load_fixture_spec)
-        model = TinyMoEOracle(spec)
-        expected_outputs = []
-        for descriptor in scheduler.build_descriptors():
-            _, generated, _, _ = greedy_generate(
-                model,
-                list(descriptor["prompt"]),
-                descriptor["max_new_tokens"],
-            )
-            expected_outputs.append(generated)
-    except (OSError, RuntimeError, ValueError) as error:
-        _fail(f"independent tiny-v3 model-prefix validation failed: {error}")
-    finally:
-        torch.use_deterministic_algorithms(previous_deterministic)
-        torch.set_num_threads(previous_threads)
+    expected_outputs = build_authenticated_model_sequences()
 
     observed: dict[int, list[int]] = {}
     for output in validated.outputs:
         observed.setdefault(output.client_index, []).append(output.token_id)
     terminals = {terminal.client_index: terminal for terminal in validated.terminals}
     for client_index, terminal in terminals.items():
-        actual = observed.get(client_index, [])
+        actual = tuple(observed.get(client_index, []))
         expected = expected_outputs[client_index]
         _require(
             actual == expected[: len(actual)],

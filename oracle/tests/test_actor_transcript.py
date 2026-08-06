@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from contextlib import redirect_stderr, redirect_stdout
 import copy
 import hashlib
@@ -224,6 +225,73 @@ def _add_output(
     capture["diagnostics"]["observer_count"] += 1  # type: ignore[index,operator]
 
 
+def _valid_fake_generate(
+    _model: object, prompt: list[int], maximum: int
+) -> tuple[list[int], list[int], list[object], str]:
+    generated = [7] * maximum
+    return prompt + generated, generated, [], "max_new_tokens"
+
+
+def _fake_model_modules(
+    greedy_generate: object = _valid_fake_generate,
+) -> tuple[dict[str, types.ModuleType], dict[str, object]]:
+    state: dict[str, object] = {
+        "deterministic": False,
+        "events": [],
+        "loaded_specs": [],
+        "models": [],
+        "threads": 4,
+        "warn_only": False,
+    }
+    fake_torch = types.ModuleType("torch")
+    fake_torch.get_num_threads = lambda: state["threads"]  # type: ignore[attr-defined]
+    fake_torch.are_deterministic_algorithms_enabled = (  # type: ignore[attr-defined]
+        lambda: state["deterministic"]
+    )
+    fake_torch.is_deterministic_algorithms_warn_only_enabled = (  # type: ignore[attr-defined]
+        lambda: state["warn_only"]
+    )
+
+    def set_threads(value: int) -> None:
+        state["events"].append(("threads", value))  # type: ignore[union-attr]
+        state["threads"] = value
+
+    def set_deterministic(value: bool, *, warn_only: bool = False) -> None:
+        state["events"].append(  # type: ignore[union-attr]
+            ("deterministic", value, warn_only)
+        )
+        state["deterministic"] = value
+        state["warn_only"] = warn_only
+
+    fake_torch.set_num_threads = set_threads  # type: ignore[attr-defined]
+    fake_torch.use_deterministic_algorithms = set_deterministic  # type: ignore[attr-defined]
+
+    fake_generate = types.ModuleType("oracle.generate")
+    fake_generate.greedy_generate = greedy_generate  # type: ignore[attr-defined]
+    fake_oracle = types.ModuleType("oracle.runnel_oracle")
+
+    def load_fixture_spec(path: str) -> object:
+        spec = object()
+        state["loaded_specs"].append((path, spec))  # type: ignore[union-attr]
+        return spec
+
+    def tiny_model(spec: object) -> object:
+        model = object()
+        state["models"].append((spec, model))  # type: ignore[union-attr]
+        return model
+
+    fake_oracle.load_fixture_spec = load_fixture_spec  # type: ignore[attr-defined]
+    fake_oracle.TinyMoEOracle = tiny_model  # type: ignore[attr-defined]
+    return (
+        {
+            "torch": fake_torch,
+            "oracle.generate": fake_generate,
+            "oracle.runnel_oracle": fake_oracle,
+        },
+        state,
+    )
+
+
 class ActorTranscriptTests(unittest.TestCase):
     def test_committed_capture_has_independent_artifact_and_semantic_custody(self) -> None:
         self.assertFalse(COMMITTED_CAPTURE_PATH.is_symlink())
@@ -375,26 +443,8 @@ class ActorTranscriptTests(unittest.TestCase):
         _add_output(document, 0, 7)
         validated = actor_transcript.validate_capture(document)
 
-        fake_torch = types.ModuleType("torch")
-        fake_torch.get_num_threads = lambda: 4  # type: ignore[attr-defined]
-        fake_torch.set_num_threads = lambda _threads: None  # type: ignore[attr-defined]
-        fake_torch.are_deterministic_algorithms_enabled = lambda: False  # type: ignore[attr-defined]
-        fake_torch.use_deterministic_algorithms = lambda _enabled: None  # type: ignore[attr-defined]
-        fake_generate = types.ModuleType("oracle.generate")
-        fake_generate.greedy_generate = (  # type: ignore[attr-defined]
-            lambda _model, prompt, _maximum: (prompt + [7, 8], [7, 8], [], "limit")
-        )
-        fake_oracle = types.ModuleType("oracle.runnel_oracle")
-        fake_oracle.TinyMoEOracle = lambda _spec: object()  # type: ignore[attr-defined]
-        fake_oracle.load_fixture_spec = lambda _path: object()  # type: ignore[attr-defined]
-        with mock.patch.dict(
-            "sys.modules",
-            {
-                "torch": fake_torch,
-                "oracle.generate": fake_generate,
-                "oracle.runnel_oracle": fake_oracle,
-            },
-        ):
+        modules, _ = _fake_model_modules()
+        with mock.patch.dict("sys.modules", modules):
             actor_transcript.validate_model_output_prefixes(validated)
             wrong = copy.deepcopy(document)
             wrong["observations"][0]["token_id"] = 9  # type: ignore[index]
@@ -402,24 +452,12 @@ class ActorTranscriptTests(unittest.TestCase):
                 actor_transcript.validate_model_output_prefixes(wrong)
 
             full_but_cancelled = copy.deepcopy(document)
-            full_but_cancelled["observations"].insert(  # type: ignore[union-attr]
-                1,
-                {
-                    "kind": "output",
-                    "output_index": 1,
-                    "request_id": 1,
-                    "token_id": 8,
-                },
-            )
-            terminal = next(
-                observation
-                for observation in full_but_cancelled["observations"]  # type: ignore[index]
-                if observation["kind"] == "terminal"  # type: ignore[index]
-            )
-            terminal["committed_positions"] += 1  # type: ignore[index,operator]
-            terminal["emitted_tokens"] = 2  # type: ignore[index]
-            full_but_cancelled["diagnostics"]["observer_count"] += 1  # type: ignore[index,operator]
-            with self.assertRaises(actor_transcript.ActorTranscriptError):
+            self.assertEqual(scheduler.build_descriptors()[3]["max_new_tokens"], 1)
+            _add_output(full_but_cancelled, 3, 7)
+            with self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                "cancelled after its full sequence completed",
+            ):
                 actor_transcript.validate_model_output_prefixes(full_but_cancelled)
 
             with tempfile.TemporaryDirectory() as directory:
@@ -432,6 +470,383 @@ class ActorTranscriptTests(unittest.TestCase):
                         actor_transcript.ActorTranscriptError, "digest differs"
                     ):
                         actor_transcript.validate_model_output_prefixes(validated)
+
+    def test_authenticated_model_builder_returns_exact_immutable_corpus(self) -> None:
+        descriptors = scheduler.build_descriptors()
+        calls: list[tuple[object, list[int], int]] = []
+
+        def generate(
+            model: object, prompt: list[int], maximum: int
+        ) -> tuple[list[int], list[int], list[object], str]:
+            calls.append((model, list(prompt), maximum))
+            return _valid_fake_generate(model, prompt, maximum)
+
+        modules, state = _fake_model_modules(generate)
+        with mock.patch.object(
+            actor_transcript.scheduler,
+            "build_descriptors",
+            wraps=actor_transcript.scheduler.build_descriptors,
+        ) as build_once, mock.patch.dict("sys.modules", modules):
+            sequences = actor_transcript.build_authenticated_model_sequences()
+
+        build_once.assert_called_once_with()
+        self.assertIs(type(sequences), tuple)
+        self.assertEqual(len(sequences), actor_transcript.REQUEST_COUNT)
+        self.assertTrue(all(type(sequence) is tuple for sequence in sequences))
+        self.assertEqual(
+            sequences,
+            tuple((7,) * descriptor["max_new_tokens"] for descriptor in descriptors),
+        )
+        self.assertEqual(len(calls), actor_transcript.REQUEST_COUNT)
+        model = state["models"][0][1]  # type: ignore[index]
+        self.assertEqual(
+            calls,
+            [
+                (model, descriptor["prompt"], descriptor["max_new_tokens"])
+                for descriptor in descriptors
+            ],
+        )
+        self.assertEqual(len(state["loaded_specs"]), 1)  # type: ignore[arg-type]
+        self.assertEqual(len(state["models"]), 1)  # type: ignore[arg-type]
+        self.assertEqual(state["threads"], 4)
+        self.assertIs(state["deterministic"], False)
+        self.assertEqual(
+            state["events"],
+            [
+                ("threads", 1),
+                ("deterministic", True, False),
+                ("deterministic", False, False),
+                ("threads", 4),
+            ],
+        )
+
+    def test_model_descriptor_authentication_reads_one_exact_list_once(self) -> None:
+        descriptors = scheduler.build_descriptors()
+        mutated = copy.deepcopy(descriptors)
+        mutated[0]["prompt"][0] = 2 if mutated[0]["prompt"][0] != 2 else 3
+        with mock.patch.object(
+            actor_transcript.scheduler,
+            "build_descriptors",
+            side_effect=(mutated, descriptors),
+        ) as build_once:
+            with self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                "descriptor identity differs from the frozen corpus",
+            ):
+                actor_transcript.build_authenticated_model_sequences()
+        build_once.assert_called_once_with()
+
+        with mock.patch.object(
+            actor_transcript.scheduler,
+            "build_descriptors",
+            return_value=tuple(descriptors),
+        ) as build_once:
+            with self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                "exact 64-entry list",
+            ):
+                actor_transcript.build_authenticated_model_sequences()
+        build_once.assert_called_once_with()
+
+    def test_generated_sequence_helper_rejects_hostile_results(self) -> None:
+        prompt = (1, 22)
+        maximum = 3
+        valid = ([1, 22, 7, 7, 7], [7, 7, 7], [], "max_new_tokens")
+        self.assertEqual(
+            actor_transcript._validated_generated_sequence(valid, prompt, maximum, 0),
+            (7, 7, 7),
+        )
+        self.assertEqual(
+            actor_transcript._validated_generated_sequence(
+                ([1, 22, 7, 0], [7, 0], [], "eos"),
+                prompt,
+                maximum,
+                0,
+            ),
+            (7, 0),
+        )
+
+        cases = (
+            ("container", list(valid), "exact four-tuple"),
+            ("empty", ([1, 22], [], [], "max_new_tokens"), "generated length"),
+            (
+                "too-long",
+                ([1, 22, 7, 7, 7, 7], [7, 7, 7, 7], [], "max_new_tokens"),
+                "generated length",
+            ),
+            (
+                "boolean-token",
+                ([1, 22, True, 7, 7], [True, 7, 7], [], "max_new_tokens"),
+                "must be an integer",
+            ),
+            (
+                "out-of-range-token",
+                ([1, 22, 32, 7, 7], [32, 7, 7], [], "max_new_tokens"),
+                "outside the tiny-v3 vocabulary",
+            ),
+            (
+                "continued-after-eos",
+                ([1, 22, 0, 7, 7], [0, 7, 7], [], "max_new_tokens"),
+                "generated output after EOS",
+            ),
+            ("eos-reason", ([1, 22, 0], [0], [], "max_new_tokens"), "EOS stop reason"),
+            (
+                "short-limit",
+                ([1, 22, 7], [7], [], "max_new_tokens"),
+                "limit stop reason or length",
+            ),
+            (
+                "wrong-full-ids",
+                ([1, 22], [7, 7, 7], [], "max_new_tokens"),
+                "prompt plus generated IDs",
+            ),
+            (
+                "boolean-full-id",
+                ([True, 22, 7, 7, 7], [7, 7, 7], [], "max_new_tokens"),
+                "must be an integer",
+            ),
+            (
+                "wrong-limit-reason",
+                ([1, 22, 7, 7, 7], [7, 7, 7], [], "eos"),
+                "limit stop reason or length",
+            ),
+        )
+        for label, raw, error in cases:
+            with self.subTest(label=label), self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                error,
+            ):
+                actor_transcript._validated_generated_sequence(
+                    raw,
+                    prompt,
+                    maximum,
+                    0,
+                )
+
+    def test_model_builder_normalizes_failures_and_restores_settings(self) -> None:
+        def fail_generation(
+            _model: object, _prompt: list[int], _maximum: int
+        ) -> tuple[list[int], list[int], list[object], str]:
+            raise RuntimeError("synthetic model failure")
+
+        modules, state = _fake_model_modules(fail_generation)
+        with mock.patch.dict("sys.modules", modules):
+            with self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                "independent tiny-v3 model-prefix generation failed: synthetic model failure",
+            ):
+                actor_transcript.build_authenticated_model_sequences()
+        self.assertEqual(state["threads"], 4)
+        self.assertIs(state["deterministic"], False)
+        self.assertEqual(
+            state["events"],
+            [
+                ("threads", 1),
+                ("deterministic", True, False),
+                ("deterministic", False, False),
+                ("threads", 4),
+            ],
+        )
+
+        with mock.patch.dict("sys.modules", {"torch": None}):
+            with self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                "PyTorch model-prefix validation is unavailable",
+            ):
+                actor_transcript.build_authenticated_model_sequences()
+
+    def test_model_builder_restores_exact_warn_only_state(self) -> None:
+        modules, state = _fake_model_modules()
+        state["deterministic"] = True
+        state["warn_only"] = True
+        with mock.patch.dict("sys.modules", modules):
+            actor_transcript.build_authenticated_model_sequences()
+        self.assertEqual(state["threads"], 4)
+        self.assertIs(state["deterministic"], True)
+        self.assertIs(state["warn_only"], True)
+        self.assertEqual(
+            state["events"],
+            [
+                ("threads", 1),
+                ("deterministic", True, False),
+                ("deterministic", True, True),
+                ("threads", 4),
+            ],
+        )
+
+    def test_model_builder_restores_after_unexpected_base_exceptions(self) -> None:
+        for failure in (KeyError("unexpected generator key"), KeyboardInterrupt()):
+            def fail_generation(
+                _model: object,
+                _prompt: list[int],
+                _maximum: int,
+                *,
+                exception: BaseException = failure,
+            ) -> tuple[list[int], list[int], list[object], str]:
+                raise exception
+
+            modules, state = _fake_model_modules(fail_generation)
+            with self.subTest(failure=type(failure).__name__):
+                with mock.patch.dict("sys.modules", modules):
+                    with self.assertRaises(type(failure)):
+                        actor_transcript.build_authenticated_model_sequences()
+                self.assertEqual(state["threads"], 4)
+                self.assertIs(state["deterministic"], False)
+                self.assertIs(state["warn_only"], False)
+
+    def test_model_builder_attempts_both_restorations_after_failures(self) -> None:
+        modules, state = _fake_model_modules()
+        torch = modules["torch"]
+        original_set_deterministic = torch.use_deterministic_algorithms  # type: ignore[attr-defined]
+
+        def fail_enable(value: bool, *, warn_only: bool = False) -> None:
+            if value:
+                raise RuntimeError("cannot enable deterministic algorithms")
+            original_set_deterministic(value, warn_only=warn_only)
+
+        torch.use_deterministic_algorithms = fail_enable  # type: ignore[attr-defined]
+        with mock.patch.dict("sys.modules", modules):
+            with self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                "cannot enable deterministic algorithms",
+            ):
+                actor_transcript.build_authenticated_model_sequences()
+        self.assertEqual(state["threads"], 4)
+        self.assertIs(state["deterministic"], False)
+
+        modules, state = _fake_model_modules()
+        torch = modules["torch"]
+        original_set_deterministic = torch.use_deterministic_algorithms  # type: ignore[attr-defined]
+
+        def fail_only_restore(value: bool, *, warn_only: bool = False) -> None:
+            if not value:
+                raise OSError("standalone deterministic restoration failed")
+            original_set_deterministic(value, warn_only=warn_only)
+
+        torch.use_deterministic_algorithms = fail_only_restore  # type: ignore[attr-defined]
+        with mock.patch.dict("sys.modules", modules):
+            with self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                "cannot restore PyTorch model-prefix settings: "
+                "deterministic algorithms: standalone deterministic "
+                "restoration failed",
+            ) as raised:
+                actor_transcript.build_authenticated_model_sequences()
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertEqual(state["threads"], 4)
+        self.assertIs(state["deterministic"], True)
+
+        def fail_generation(
+            _model: object, _prompt: list[int], _maximum: int
+        ) -> tuple[list[int], list[int], list[object], str]:
+            raise RuntimeError("generation failed before restoration")
+
+        modules, state = _fake_model_modules(fail_generation)
+        torch = modules["torch"]
+        original_set_deterministic = torch.use_deterministic_algorithms  # type: ignore[attr-defined]
+
+        def fail_restore(value: bool, *, warn_only: bool = False) -> None:
+            if not value:
+                raise OSError("deterministic restoration failed")
+            original_set_deterministic(value, warn_only=warn_only)
+
+        torch.use_deterministic_algorithms = fail_restore  # type: ignore[attr-defined]
+        with mock.patch.dict("sys.modules", modules):
+            with self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                "generation failed before restoration; cannot restore PyTorch "
+                "model-prefix settings: deterministic algorithms: "
+                "deterministic restoration failed",
+            ) as raised:
+                actor_transcript.build_authenticated_model_sequences()
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertEqual(state["threads"], 4)
+        self.assertIs(state["deterministic"], True)
+
+    def test_model_builder_normalizes_native_import_failure(self) -> None:
+        real_import = builtins.__import__
+
+        def fail_torch_import(
+            name: str,
+            globals: object = None,
+            locals: object = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> object:
+            if name == "torch":
+                raise OSError("native torch loader failed")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with mock.patch("builtins.__import__", side_effect=fail_torch_import):
+            with self.assertRaisesRegex(
+                actor_transcript.ActorTranscriptError,
+                "PyTorch model-prefix validation is unavailable: "
+                "native torch loader failed",
+            ):
+                actor_transcript.build_authenticated_model_sequences()
+
+    def test_model_builder_never_swallows_fatal_restoration_exceptions(self) -> None:
+        def fail_generation(
+            _model: object, _prompt: list[int], _maximum: int
+        ) -> tuple[list[int], list[int], list[object], str]:
+            raise RuntimeError("generation failed first")
+
+        modules, state = _fake_model_modules(fail_generation)
+        torch = modules["torch"]
+        original_set_deterministic = torch.use_deterministic_algorithms  # type: ignore[attr-defined]
+
+        def interrupt_deterministic_restore(
+            value: bool, *, warn_only: bool = False
+        ) -> None:
+            if not value:
+                raise KeyboardInterrupt("deterministic restore interrupted")
+            original_set_deterministic(value, warn_only=warn_only)
+
+        torch.use_deterministic_algorithms = interrupt_deterministic_restore  # type: ignore[attr-defined]
+        with mock.patch.dict("sys.modules", modules):
+            with self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "deterministic restore interrupted",
+            ) as raised:
+                actor_transcript.build_authenticated_model_sequences()
+        self.assertEqual(state["threads"], 4)
+        self.assertTrue(
+            any("generation failed first" in note for note in raised.exception.__notes__)
+        )
+
+        modules, state = _fake_model_modules()
+        torch = modules["torch"]
+        original_set_deterministic = torch.use_deterministic_algorithms  # type: ignore[attr-defined]
+        original_set_threads = torch.set_num_threads  # type: ignore[attr-defined]
+
+        def fail_deterministic_restore(
+            value: bool, *, warn_only: bool = False
+        ) -> None:
+            if not value:
+                raise OSError("deterministic restore failed first")
+            original_set_deterministic(value, warn_only=warn_only)
+
+        def interrupt_thread_restore(value: int) -> None:
+            if value == 4:
+                state["events"].append(("threads", value))  # type: ignore[union-attr]
+                raise KeyboardInterrupt("thread restore interrupted")
+            original_set_threads(value)
+
+        torch.use_deterministic_algorithms = fail_deterministic_restore  # type: ignore[attr-defined]
+        torch.set_num_threads = interrupt_thread_restore  # type: ignore[attr-defined]
+        with mock.patch.dict("sys.modules", modules):
+            with self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "thread restore interrupted",
+            ) as raised:
+                actor_transcript.build_authenticated_model_sequences()
+        self.assertIn(("threads", 4), state["events"])  # type: ignore[operator]
+        self.assertTrue(
+            any(
+                "deterministic restore failed first" in note
+                for note in raised.exception.__notes__
+            )
+        )
 
     def test_capture_is_bound_to_independently_regenerated_actions(self) -> None:
         mutations = []
