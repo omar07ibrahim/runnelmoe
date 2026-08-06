@@ -281,6 +281,7 @@ impl<A: DecoderAdapter> fmt::Debug for SchedulerEngine<A> {
         formatter
             .debug_struct("SchedulerEngine")
             .field("configuration", &"<redacted>")
+            .field("policy", &self.config.scheduling_policy())
             .field("closed", &snapshot.closed)
             .field("queued_requests", &snapshot.queued_requests)
             .field("active_requests", &snapshot.active_requests)
@@ -540,8 +541,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             config.max_queued_requests(),
             "queued request FIFO",
         )?;
-        let ring =
-            DrrRing::try_with_capacity(config.max_active_requests()).map_err(map_ring_error)?;
+        let ring = DrrRing::try_with_capacity_and_policy(
+            config.max_active_requests(),
+            config.scheduling_policy(),
+        )
+        .map_err(map_ring_error)?;
         let workspace = adapter
             .new_workspace()
             .map_err(|source| SchedulerError::adapter("allocating worker workspace", source))?;
@@ -1528,7 +1532,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             if self.record_for_key(key)?.request_id != visit.request_id() {
                 let _ = ring.mark_blocked(visit).map_err(map_ring_error)?;
                 return Err(SchedulerError::internal(
-                    "DRR visit identity does not match request slot",
+                    "policy visit identity does not match request slot",
                 ));
             }
 
@@ -2274,7 +2278,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         }
         if ring.contains(key) && !ring.member_matches(key, record.request_id) {
             return Err(SchedulerError::internal(
-                "terminal DRR member has a foreign request identity",
+                "terminal policy member has a foreign request identity",
             ));
         }
         let control_snapshot = record.control.fresh_snapshot()?;
@@ -3116,9 +3120,11 @@ fn try_reserve_deque<T>(
 
 fn map_ring_error(error: RingError) -> SchedulerError {
     match error {
-        RingError::AllocationFailure => SchedulerError::allocation_failure("DRR membership", 0),
+        RingError::AllocationFailure => {
+            SchedulerError::allocation_failure("scheduler membership", 0)
+        }
         RingError::CapacityExceeded => {
-            SchedulerError::internal("DRR membership capacity was exceeded")
+            SchedulerError::internal("scheduler membership capacity was exceeded")
         }
         RingError::EpochExhausted => {
             SchedulerError::resource_exhausted("round epoch identity", u64::MAX, u64::MAX)
@@ -3133,7 +3139,9 @@ fn map_ring_error(error: RingError) -> SchedulerError {
         | RingError::StaleVisit
         | RingError::OutstandingReservation
         | RingError::StaleReservation
-        | RingError::InternalInvariant => SchedulerError::internal("DRR invariant failed"),
+        | RingError::InternalInvariant => {
+            SchedulerError::internal("scheduler ring invariant failed")
+        }
     }
 }
 

@@ -281,6 +281,15 @@ cross-request expert grouping. The named candidate uses the DRR/coalesced
 policy above. The comparison isolates scheduling and grouping rather than
 numeric representation, ISA, or storage.
 
+Implementation mapping (2026-08-06): `SchedulerConfig` now binds one immutable
+versioned policy without changing validated geometry or shared charges. The
+continuous default retains the original full eligible-member DRR rounds. The
+FIFO baseline opens one-member rounds for the oldest active member while the
+same maximal active FIFO prefix remains promoted and charged; repeated rounds
+therefore target that head until removal and never bypass it while blocked,
+without a second execution or commit path. This note records implementation of
+the frozen comparison and does not amend its workload, metrics, or claim rules.
+
 ### Request state machine and token transaction
 
 The request lifecycle is:

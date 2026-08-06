@@ -36,6 +36,34 @@ const EXPERT_TASK_ENVELOPE_BYTES: u64 = 64;
 const TRACE_EVENT_BYTES: u64 = 128;
 const PROMPT_TOKEN_BYTES: u64 = 4;
 
+/// Deterministic scheduler policy selected when an engine is constructed.
+///
+/// The exact evidence names are frozen by ADR 0007. The continuous policy is
+/// the runtime default; the FIFO policy is the deliberately serial M5
+/// comparison baseline and selects at most one active request per round.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SchedulingPolicy {
+    /// Accepted FIFO order, at most one model position per wave from the
+    /// oldest request. A blocked head is retried and never bypassed; the next
+    /// member becomes eligible only after head removal.
+    FifoRunToCompletion,
+    /// Equal-weight one-position DRR with stable cross-request expert
+    /// coalescing.
+    #[default]
+    DeficitContinuousExpertCoalesce,
+}
+
+impl SchedulingPolicy {
+    /// Returns the preregistered stable evidence identifier.
+    #[must_use]
+    pub const fn evidence_id(self) -> &'static str {
+        match self {
+            Self::FifoRunToCompletion => "fifo-single-request-run-to-completion-v1",
+            Self::DeficitContinuousExpertCoalesce => "deficit-continuous-expert-coalesce-v1",
+        }
+    }
+}
+
 /// User-selected scheduler ceilings before adapter-specific validation.
 ///
 /// Values are `u64` so hostile serialized configurations are checked before
@@ -247,6 +275,7 @@ impl fmt::Debug for SharedStaticCharges {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerConfig {
     limits: SchedulerLimits,
+    scheduling_policy: SchedulingPolicy,
     worker_count: usize,
     command_capacity: usize,
     max_outstanding_requests: usize,
@@ -377,6 +406,7 @@ impl SchedulerConfig {
 
         Ok(Self {
             limits,
+            scheduling_policy: SchedulingPolicy::default(),
             worker_count: scalar.worker_count,
             command_capacity: scalar.command_capacity,
             max_outstanding_requests: scalar.max_outstanding_requests,
@@ -410,6 +440,21 @@ impl SchedulerConfig {
     #[must_use]
     pub const fn limits(&self) -> &SchedulerLimits {
         &self.limits
+    }
+
+    /// Returns a copy with an immutable scheduler policy selected.
+    ///
+    /// Policy selection changes no validated geometry or logical charge.
+    #[must_use]
+    pub const fn with_scheduling_policy(mut self, policy: SchedulingPolicy) -> Self {
+        self.scheduling_policy = policy;
+        self
+    }
+
+    /// Returns the deterministic scheduler policy bound to this config.
+    #[must_use]
+    pub const fn scheduling_policy(&self) -> SchedulingPolicy {
+        self.scheduling_policy
     }
 
     #[must_use]

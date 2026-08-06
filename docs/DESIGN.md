@@ -247,9 +247,10 @@ higher-ranked synchronous callback prevents a validated commit capability from
 escaping into an outer future; all fallible work precedes its allocation-free,
 return-free apply. The fixed 192-byte tiny-adapter scratch is reused through
 the full 1,024-position context without growth. The synchronous scheduler now
-composes adapter state, DRR credit, RNG, output, phase, and trace publication at
-one non-yielding boundary. It uses bounded FIFO admission, retained-round DRR,
-expert-sorted waves, per-request output backpressure, exact category ownership,
+composes adapter state, policy service credit, RNG, output, phase, and trace
+publication at one non-yielding boundary. It uses bounded FIFO admission, an
+immutable retained-round scheduling policy, expert-sorted waves, per-request
+output backpressure, exact category ownership,
 generation-bound atomic request controls, and prevalidated release permits for
 terminal/reap/shutdown cleanup. A live monotonic-clock and control snapshot is
 taken inside the adapter's validated commit callback; suppression drops both
@@ -271,6 +272,17 @@ adversarial interleaving matrix, independent trace/fairness replay, and accepted
 evidence remain incomplete until the rest of M5 lands. Weights remain eagerly
 resident in M5, so live cache-leased expert execution remains an explicit
 system gap.
+
+Two versioned policies share that one transaction path and one validated
+resource envelope. `deficit-continuous-expert-coalesce-v1` is the default: a
+round contains every eligible member and may select up to the configured wave
+width. `fifo-single-request-run-to-completion-v1` is the M5 measurement
+baseline: a round contains only the oldest active FIFO member, so reopening
+rounds repeatedly selects that request until removal, while other accepted
+requests remain promoted and charged. An output-blocked head is intentionally
+not bypassed by this baseline; cancellation and deadline resolution still scan
+and terminalize non-head records without giving them model service. Policy
+selection changes neither validated geometry nor static logical charges.
 
 Direct multi-request ingress is a separate two-phase engine transaction. It
 validates the full nonempty offer slice before resource selection, admits only

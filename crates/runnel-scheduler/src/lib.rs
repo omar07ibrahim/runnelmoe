@@ -1,9 +1,9 @@
 //! Bounded deterministic scheduling for model-agnostic decoder adapters.
 //!
-//! The synchronous core owns request policy, exact semantic accounting, DRR
-//! fairness, coalesced expert work, and transactional token publication. Model
-//! execution remains synchronous; endpoints use Tokio only for allocation-free
-//! wake notifications consumed by the thin actor layer.
+//! The synchronous core owns immutable FIFO/DRR policy selection, exact
+//! semantic accounting, coalesced expert work, and transactional token
+//! publication. Model execution remains synchronous; endpoints use Tokio only
+//! for allocation-free wake notifications consumed by the thin actor layer.
 
 #![forbid(unsafe_code)]
 
@@ -34,8 +34,8 @@ pub use actor::{
     Submission, TryRecvOutput,
 };
 pub use config::{
-    MAX_BATCH_WIDTH, MAX_WAVES_PER_STEP, SchedulerConfig, SchedulerLimits, SharedStaticCharges,
-    StateLayoutSummary,
+    MAX_BATCH_WIDTH, MAX_WAVES_PER_STEP, SchedulerConfig, SchedulerLimits, SchedulingPolicy,
+    SharedStaticCharges, StateLayoutSummary,
 };
 #[cfg(any(test, feature = "actor-stress-instrumentation"))]
 #[doc(hidden)]

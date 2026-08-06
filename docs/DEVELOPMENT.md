@@ -271,6 +271,31 @@ adapter-typed semantic Vec-payload requirement. It intentionally excludes
 allocator metadata and over-allocation; whole-process RSS remains an observed
 quantity. A smaller raw reserve is rejected before shared engine allocation.
 
+## M5 scheduling-policy verification
+
+`SchedulerConfig::new` defaults to the versioned continuous DRR/coalescing
+policy. `with_scheduling_policy` immutably selects the FIFO run-to-completion
+comparison baseline without changing geometry, preallocated wave capacity, or
+logical charges. Focused tests prove exact first-service order, blocked-head
+behavior, non-head cancellation cleanup, atomic common-release admission, and
+greedy/seeded output parity:
+
+```console
+cargo test -p runnel-scheduler --lib ring::tests --locked --offline
+cargo test -p runnel-scheduler --test engine \
+  explicit_policies_have_frozen_names_and_distinct_service_order \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  fifo_and_continuous_policies_preserve_per_request_token_parity \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  fifo_output_blocking_holds_the_head_while_non_head_cancellation_cleans_up \
+  --locked --offline -- --exact
+```
+
+These are policy/correctness gates, not performance evidence. The M5 capture
+harness and independently replayed service/ledger streams remain outstanding.
+
 ## M5 genuine actor-race verification
 
 The feature-gated scheduler race runs exactly 32 fresh two-producer

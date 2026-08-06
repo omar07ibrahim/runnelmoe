@@ -1,4 +1,4 @@
-//! Allocation-stable equal-weight, unit-cost deficit round robin.
+//! Allocation-stable FIFO run-to-completion and unit-cost deficit round robin.
 //!
 //! The ring deliberately separates visiting a member from resolving that
 //! visit.  A visit advances the retained cursor and marks the member visited;
@@ -8,7 +8,10 @@
 
 use std::fmt;
 
-use crate::id::{IdentityKind, RequestId, RoundEpoch, RoundEpochIssuer, SlotKey};
+use crate::{
+    config::SchedulingPolicy,
+    id::{IdentityKind, RequestId, RoundEpoch, RoundEpochIssuer, SlotKey},
+};
 
 const MAX_DEFICIT: u8 = 1;
 
@@ -169,13 +172,14 @@ struct PendingVisit {
     epoch: RoundEpoch,
 }
 
-/// Fixed-capacity deterministic DRR membership ring.
+/// Fixed-capacity deterministic scheduling membership ring.
 ///
 /// Construction is its only allocation point. Insertion, visiting, credit
 /// resolution, and removal never grow or replace the backing allocation.
 pub(crate) struct DrrRing {
     members: Vec<Member>,
     membership_capacity: usize,
+    policy: SchedulingPolicy,
     cursor: usize,
     epochs: RoundEpochIssuer,
     open_round: Option<OpenRound>,
@@ -188,6 +192,7 @@ impl fmt::Debug for DrrRing {
         formatter
             .debug_struct("DrrRing")
             .field("membership_capacity", &self.membership_capacity)
+            .field("policy", &self.policy)
             .field("member_count", &self.members.len())
             .field("cursor", &self.cursor)
             .field(
@@ -213,7 +218,19 @@ impl fmt::Debug for DrrRing {
 
 impl DrrRing {
     /// Fallibly reserves the complete membership storage.
+    #[cfg(test)]
     pub(crate) fn try_with_capacity(membership_capacity: usize) -> Result<Self, RingError> {
+        Self::try_with_capacity_and_policy(
+            membership_capacity,
+            SchedulingPolicy::DeficitContinuousExpertCoalesce,
+        )
+    }
+
+    /// Fallibly reserves membership storage for one immutable policy.
+    pub(crate) fn try_with_capacity_and_policy(
+        membership_capacity: usize,
+        policy: SchedulingPolicy,
+    ) -> Result<Self, RingError> {
         if membership_capacity == 0 {
             return Err(RingError::InvalidCapacity);
         }
@@ -224,6 +241,7 @@ impl DrrRing {
         Ok(Self {
             members,
             membership_capacity,
+            policy,
             cursor: 0,
             epochs: RoundEpochIssuer::new(),
             open_round: None,
@@ -329,11 +347,18 @@ impl DrrRing {
             IdentityKind::RoundEpoch => RingError::EpochExhausted,
             _ => RingError::InternalInvariant,
         })?;
-        let remaining = self
-            .members
-            .iter()
-            .filter(|member| member.join_epoch <= epoch)
-            .count();
+        let remaining = match self.policy {
+            SchedulingPolicy::FifoRunToCompletion => usize::from(
+                self.members
+                    .first()
+                    .is_some_and(|member| member.join_epoch <= epoch),
+            ),
+            SchedulingPolicy::DeficitContinuousExpertCoalesce => self
+                .members
+                .iter()
+                .filter(|member| member.join_epoch <= epoch)
+                .count(),
+        };
         if remaining == 0 {
             return Err(RingError::InternalInvariant);
         }
@@ -352,13 +377,22 @@ impl DrrRing {
             return Err(RingError::InternalInvariant);
         }
 
-        let member_index = (0..self.members.len())
-            .map(|offset| wrapped_index(self.cursor, offset, self.members.len()))
-            .find(|&index| {
-                let member = &self.members[index];
-                member.join_epoch <= round.epoch && member.last_visited != Some(round.epoch)
-            })
-            .ok_or(RingError::InternalInvariant)?;
+        let member_index = match self.policy {
+            SchedulingPolicy::FifoRunToCompletion => {
+                let member = self.members.first().ok_or(RingError::InternalInvariant)?;
+                if member.join_epoch > round.epoch || member.last_visited == Some(round.epoch) {
+                    return Err(RingError::InternalInvariant);
+                }
+                0
+            }
+            SchedulingPolicy::DeficitContinuousExpertCoalesce => (0..self.members.len())
+                .map(|offset| wrapped_index(self.cursor, offset, self.members.len()))
+                .find(|&index| {
+                    let member = &self.members[index];
+                    member.join_epoch <= round.epoch && member.last_visited != Some(round.epoch)
+                })
+                .ok_or(RingError::InternalInvariant)?,
+        };
 
         let member = &mut self.members[member_index];
         member.last_visited = Some(round.epoch);
@@ -474,7 +508,13 @@ impl DrrRing {
         let round = self.open_round;
         let member = &self.members[index];
         let removes_unvisited_eligible = round.is_some_and(|open| {
-            member.join_epoch <= open.epoch && member.last_visited != Some(open.epoch)
+            let belongs_to_snapshot = match self.policy {
+                SchedulingPolicy::FifoRunToCompletion => index == 0,
+                SchedulingPolicy::DeficitContinuousExpertCoalesce => true,
+            };
+            belongs_to_snapshot
+                && member.join_epoch <= open.epoch
+                && member.last_visited != Some(open.epoch)
         });
         let removes_pending = self
             .pending_visit
@@ -642,12 +682,76 @@ mod tests {
             .expect("member insertion");
     }
 
+    fn fifo_ring(capacity: usize) -> DrrRing {
+        DrrRing::try_with_capacity_and_policy(capacity, SchedulingPolicy::FifoRunToCompletion)
+            .expect("FIFO ring")
+    }
+
     fn select_and_commit(ring: &mut DrrRing) -> (RequestId, RoundProgress) {
         let visit = ring.next_visit().expect("next visit");
         let request_id = visit.request_id();
         let (reservation, progress) = ring.mark_selected(visit).expect("selection");
         ring.commit_credit(reservation).expect("commit credit");
         (request_id, progress)
+    }
+
+    #[test]
+    fn fifo_round_reselects_the_oldest_member_until_removal() {
+        let mut ring = fifo_ring(3);
+        add(&mut ring, 1);
+        add(&mut ring, 2);
+        add(&mut ring, 3);
+
+        for _ in 0..3 {
+            ring.open_round().expect("FIFO round").expect("epoch");
+            let (selected, progress) = select_and_commit(&mut ring);
+            assert_eq!(selected.get(), 1);
+            assert!(progress.is_closed());
+        }
+
+        ring.remove(key(1)).expect("remove completed FIFO head");
+        ring.open_round().expect("next FIFO round").expect("epoch");
+        let (selected, progress) = select_and_commit(&mut ring);
+        assert_eq!(selected.get(), 2);
+        assert!(progress.is_closed());
+    }
+
+    #[test]
+    fn fifo_blocked_head_never_exposes_a_runnable_sibling() {
+        let mut ring = fifo_ring(2);
+        add(&mut ring, 1);
+        add(&mut ring, 2);
+
+        ring.open_round().expect("FIFO round").expect("epoch");
+        let visit = ring.next_visit().expect("FIFO head visit");
+        assert_eq!(visit.request_id().get(), 1);
+        assert!(ring.mark_blocked(visit).expect("blocked head").is_closed());
+
+        ring.open_round().expect("next FIFO round").expect("epoch");
+        let visit = ring.next_visit().expect("same FIFO head visit");
+        assert_eq!(visit.request_id().get(), 1);
+        assert!(ring.mark_blocked(visit).expect("blocked head").is_closed());
+    }
+
+    #[test]
+    fn removing_a_fifo_non_head_does_not_close_the_head_snapshot() {
+        let mut ring = fifo_ring(3);
+        add(&mut ring, 1);
+        add(&mut ring, 2);
+        add(&mut ring, 3);
+        ring.open_round().expect("FIFO round").expect("epoch");
+
+        ring.remove(key(2)).expect("remove non-head");
+        assert!(ring.current_epoch().is_some());
+        let (selected, progress) = select_and_commit(&mut ring);
+        assert_eq!(selected.get(), 1);
+        assert!(progress.is_closed());
+
+        ring.open_round().expect("next FIFO round").expect("epoch");
+        ring.remove(key(1)).expect("remove unvisited head");
+        assert!(ring.current_epoch().is_none());
+        ring.open_round().expect("successor round").expect("epoch");
+        assert_eq!(select_and_commit(&mut ring).0.get(), 3);
     }
 
     #[test]
@@ -913,6 +1017,31 @@ mod tests {
         // not a second call into ring ordering logic.
         let expected = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         assert_eq!(observed, expected);
+        assert!(
+            ring.members.iter().all(|member| {
+                member.deficit <= MAX_DEFICIT && member.reservation_epoch.is_none()
+            })
+        );
+    }
+
+    #[test]
+    fn fifo_first_sixteen_service_trace_stays_on_the_oldest_member() {
+        let mut ring = fifo_ring(16);
+        for request_id in 1..=16 {
+            add(&mut ring, request_id);
+        }
+
+        let mut observed = [0_u64; 16];
+        for value in &mut observed {
+            ring.open_round()
+                .expect("FIFO fairness round")
+                .expect("epoch");
+            let (request_id, progress) = select_and_commit(&mut ring);
+            *value = request_id.get();
+            assert!(progress.is_closed());
+        }
+
+        assert_eq!(observed, [1; 16]);
         assert!(
             ring.members.iter().all(|member| {
                 member.deficit <= MAX_DEFICIT && member.reservation_epoch.is_none()

@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use runnel_runtime::{
     AdapterExecutionLayout, AdapterWorkIdentity, DecoderAdapter, Result as RuntimeResult,
-    RuntimeError, SamplingPolicy, StateLayoutAccounting,
+    RuntimeError, SampleConfig, SamplingPolicy, StateLayoutAccounting,
 };
 use runnel_scheduler::{
     BatchRequestSpec, CancelDisposition, ErrorCategory, RequestPhase, RequestSpec, SchedulerConfig,
-    SchedulerEngine, SchedulerError, SchedulerLimits, StepReport, TerminalOutcome,
+    SchedulerEngine, SchedulerError, SchedulerLimits, SchedulingPolicy, StepReport,
+    TerminalOutcome,
 };
 
 static NEXT_MODEL_ID: CheckedCounter = CheckedCounter::new(1);
@@ -401,8 +402,17 @@ impl DecoderAdapter for MockAdapter {
 }
 
 fn new_engine_with_limits(limits: SchedulerLimits) -> SchedulerEngine<MockAdapter> {
+    new_engine_with_policy(limits, SchedulingPolicy::default())
+}
+
+fn new_engine_with_policy(
+    limits: SchedulerLimits,
+    policy: SchedulingPolicy,
+) -> SchedulerEngine<MockAdapter> {
     let adapter = MockAdapter::new();
-    let config = SchedulerConfig::new(&adapter, limits).expect("mock scheduler config");
+    let config = SchedulerConfig::new(&adapter, limits)
+        .expect("mock scheduler config")
+        .with_scheduling_policy(policy);
     SchedulerEngine::new(adapter, config).expect("mock scheduler engine")
 }
 
@@ -427,6 +437,320 @@ fn drain_tokens(
 
 fn phase(engine: &SchedulerEngine<MockAdapter>, id: runnel_scheduler::RequestId) -> RequestPhase {
     engine.request_phase(id).expect("request remains retained")
+}
+
+#[test]
+fn explicit_policies_have_frozen_names_and_distinct_service_order() {
+    assert_eq!(
+        SchedulingPolicy::default(),
+        SchedulingPolicy::DeficitContinuousExpertCoalesce
+    );
+    assert_eq!(
+        SchedulingPolicy::FifoRunToCompletion.evidence_id(),
+        "fifo-single-request-run-to-completion-v1"
+    );
+    assert_eq!(
+        SchedulingPolicy::DeficitContinuousExpertCoalesce.evidence_id(),
+        "deficit-continuous-expert-coalesce-v1"
+    );
+
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 2;
+    limits.waves_per_step = 1;
+    limits.max_active_requests = 2;
+    limits.output_capacity_per_request = 4;
+
+    let geometry_adapter = MockAdapter::new();
+    let candidate_config =
+        SchedulerConfig::new(&geometry_adapter, limits).expect("candidate geometry");
+    let baseline_config =
+        candidate_config.with_scheduling_policy(SchedulingPolicy::FifoRunToCompletion);
+    assert_eq!(
+        candidate_config.scheduling_policy(),
+        SchedulingPolicy::DeficitContinuousExpertCoalesce
+    );
+    assert_eq!(candidate_config.limits(), baseline_config.limits());
+    assert_eq!(
+        candidate_config.shared_static_charges(),
+        baseline_config.shared_static_charges()
+    );
+    assert_eq!(
+        candidate_config.minimum_total_charge_bytes(),
+        baseline_config.minimum_total_charge_bytes()
+    );
+
+    let mut baseline = new_engine_with_policy(limits, SchedulingPolicy::FifoRunToCompletion);
+    assert_eq!(
+        baseline.config().scheduling_policy(),
+        SchedulingPolicy::FifoRunToCompletion
+    );
+    let baseline_ids = [0_u32, 1_u32].map(|token| {
+        baseline
+            .try_submit(RequestSpec::new(&[token], 3, SamplingPolicy::Greedy, None))
+            .expect("baseline request")
+    });
+    let first = baseline.step().expect("first baseline position");
+    assert_eq!(first.promoted_requests, 2);
+    assert_eq!(first.selected_positions, 1);
+    assert_eq!(first.committed_positions, 1);
+    assert_eq!(phase(&baseline, baseline_ids[0]), RequestPhase::Ready);
+    assert_eq!(phase(&baseline, baseline_ids[1]), RequestPhase::Ready);
+    assert_eq!(drain_tokens(&mut baseline, baseline_ids[0]), vec![1]);
+    assert!(drain_tokens(&mut baseline, baseline_ids[1]).is_empty());
+
+    for expected_position in 2..=3 {
+        let report = baseline.step().expect("continued baseline position");
+        assert_eq!(report.selected_positions, 1);
+        assert_eq!(report.committed_positions, 1);
+        assert_eq!(phase(&baseline, baseline_ids[1]), RequestPhase::Ready);
+        assert!(
+            drain_tokens(&mut baseline, baseline_ids[1]).is_empty(),
+            "later FIFO request ran before position {expected_position} completed"
+        );
+    }
+    assert_eq!(phase(&baseline, baseline_ids[0]), RequestPhase::Terminal);
+    let next = baseline.step().expect("next baseline request starts");
+    assert_eq!(next.promoted_requests, 0);
+    assert_eq!(next.committed_positions, 1);
+    assert_eq!(phase(&baseline, baseline_ids[1]), RequestPhase::Ready);
+
+    let mut candidate =
+        new_engine_with_policy(limits, SchedulingPolicy::DeficitContinuousExpertCoalesce);
+    assert_eq!(
+        candidate.config().scheduling_policy(),
+        SchedulingPolicy::DeficitContinuousExpertCoalesce
+    );
+    let candidate_ids = [0_u32, 1_u32].map(|token| {
+        candidate
+            .try_submit(RequestSpec::new(&[token], 3, SamplingPolicy::Greedy, None))
+            .expect("candidate request")
+    });
+    let first = candidate.step().expect("first candidate wave");
+    assert_eq!(first.promoted_requests, 2);
+    assert_eq!(first.selected_positions, 2);
+    assert_eq!(first.committed_positions, 2);
+    for id in candidate_ids {
+        assert_eq!(phase(&candidate, id), RequestPhase::Ready);
+        assert_eq!(drain_tokens(&mut candidate, id).len(), 1);
+    }
+}
+
+fn completed_tokens_for_policy(
+    policy: SchedulingPolicy,
+    sampling: [SamplingPolicy; 2],
+) -> Vec<Vec<u32>> {
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 2;
+    limits.waves_per_step = 1;
+    limits.max_active_requests = 2;
+    limits.output_capacity_per_request = 4;
+    let mut engine = new_engine_with_policy(limits, policy);
+    let prompts = [[0_u32], [0_u32]];
+    let offers = [
+        BatchRequestSpec::absolute(RequestSpec::new(&prompts[0], 3, sampling[0], None)),
+        BatchRequestSpec::absolute(RequestSpec::new(&prompts[1], 3, sampling[1], None)),
+    ];
+    let admission = engine
+        .prepare_submit_batch(&offers)
+        .expect("policy parity batch prepare")
+        .commit_prepared_batch(17)
+        .expect("policy parity batch commit");
+    assert_eq!(admission.accepted_count(), 2);
+    assert_eq!(admission.rejected_count(), 0);
+    let ids = admission
+        .accepted()
+        .map(|accepted| {
+            assert_eq!(accepted.admitted_ns(), 17);
+            assert_eq!(engine.admitted_ns(accepted.request_id()).unwrap(), 17);
+            accepted.request_id()
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..8 {
+        if ids
+            .iter()
+            .copied()
+            .all(|id| phase(&engine, id) == RequestPhase::Terminal)
+        {
+            break;
+        }
+        engine.step().expect("policy parity step");
+    }
+    let tokens = ids
+        .into_iter()
+        .map(|id| {
+            assert_eq!(phase(&engine, id), RequestPhase::Terminal);
+            let tokens = drain_tokens(&mut engine, id);
+            let terminal = engine
+                .take_terminal(id)
+                .expect("policy parity terminal query")
+                .expect("policy parity terminal result");
+            assert_eq!(terminal.outcome(), TerminalOutcome::Completed);
+            assert_eq!(terminal.emitted_tokens(), tokens.len());
+            tokens
+        })
+        .collect();
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+    let shutdown = engine.shutdown().expect("policy parity shutdown");
+    assert_eq!(shutdown.terminated_requests, 0);
+    assert_eq!(shutdown.remaining_shared_bytes, 0);
+    tokens
+}
+
+#[test]
+fn fifo_and_continuous_policies_preserve_per_request_token_parity() {
+    let greedy_baseline = completed_tokens_for_policy(
+        SchedulingPolicy::FifoRunToCompletion,
+        [SamplingPolicy::Greedy; 2],
+    );
+    let greedy_candidate = completed_tokens_for_policy(
+        SchedulingPolicy::DeficitContinuousExpertCoalesce,
+        [SamplingPolicy::Greedy; 2],
+    );
+    assert_eq!(greedy_baseline, greedy_candidate);
+
+    let sampled = [0x5eed, 0xdecafbad].map(|seed| {
+        SamplingPolicy::Sample(SampleConfig {
+            seed,
+            // Flatten the mock's 10-versus-0 logits so the frozen seeds
+            // exercise non-argmax draws instead of the greedy path.
+            temperature: 1_000_000.0,
+            top_k: 5,
+            top_p: 1.0,
+        })
+    });
+    let sampled_baseline =
+        completed_tokens_for_policy(SchedulingPolicy::FifoRunToCompletion, sampled);
+    let sampled_candidate =
+        completed_tokens_for_policy(SchedulingPolicy::DeficitContinuousExpertCoalesce, sampled);
+    assert_eq!(sampled_baseline, sampled_candidate);
+    assert_ne!(
+        sampled_baseline, greedy_baseline,
+        "seeded parity must exercise a genuinely non-greedy stream"
+    );
+    assert_ne!(
+        sampled_baseline[0], sampled_baseline[1],
+        "distinct request seeds must exercise distinct request-owned streams"
+    );
+}
+
+#[test]
+fn fifo_output_blocking_holds_the_head_while_non_head_cancellation_cleans_up() {
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 3;
+    limits.waves_per_step = 1;
+    limits.max_active_requests = 3;
+    limits.output_capacity_per_request = 1;
+    let mut engine = new_engine_with_policy(limits, SchedulingPolicy::FifoRunToCompletion);
+    let ids = [0_u32, 1_u32, 2_u32].map(|token| {
+        engine
+            .try_submit(RequestSpec::new(&[token], 2, SamplingPolicy::Greedy, None))
+            .expect("FIFO pressure request")
+    });
+
+    let first = engine.step().expect("fill FIFO head output");
+    assert_eq!(first.promoted_requests, 3);
+    assert_eq!(first.committed_positions, 1);
+    assert_eq!(phase(&engine, ids[0]), RequestPhase::OutputBlocked);
+    assert_eq!(phase(&engine, ids[1]), RequestPhase::Ready);
+    assert!(drain_tokens(&mut engine, ids[1]).is_empty());
+    let before_cancellation_reap = engine.ledger_snapshot().request_used();
+
+    assert_eq!(
+        engine.cancel(ids[2]).expect("cancel non-head"),
+        CancelDisposition::Requested
+    );
+    let blocked = engine.step().expect("resolve non-head cancellation");
+    assert_eq!(blocked.committed_positions, 0);
+    assert_eq!(blocked.terminal_decisions, 1);
+    assert_eq!(phase(&engine, ids[2]), RequestPhase::Terminal);
+    assert!(drain_tokens(&mut engine, ids[1]).is_empty());
+    assert!(drain_tokens(&mut engine, ids[2]).is_empty());
+    assert_eq!(
+        engine
+            .take_terminal(ids[2])
+            .expect("cancelled non-head terminal query")
+            .expect("cancelled non-head terminal")
+            .outcome(),
+        TerminalOutcome::Cancelled
+    );
+    assert!(engine.ledger_snapshot().request_used() < before_cancellation_reap);
+
+    assert_eq!(drain_tokens(&mut engine, ids[0]), vec![1]);
+    let completed_head = engine.step().expect("unblocked FIFO head completes");
+    assert_eq!(completed_head.committed_positions, 1);
+    assert_eq!(phase(&engine, ids[0]), RequestPhase::Terminal);
+    assert_eq!(drain_tokens(&mut engine, ids[0]), vec![2]);
+    assert_eq!(
+        engine
+            .take_terminal(ids[0])
+            .expect("FIFO head terminal query")
+            .expect("FIFO head terminal")
+            .outcome(),
+        TerminalOutcome::Completed
+    );
+    assert!(drain_tokens(&mut engine, ids[1]).is_empty());
+
+    let successor = engine.step().expect("FIFO successor starts");
+    assert_eq!(successor.committed_positions, 1);
+    assert_eq!(phase(&engine, ids[1]), RequestPhase::OutputBlocked);
+    assert_eq!(drain_tokens(&mut engine, ids[1]), vec![2]);
+    let terminal_successor = engine.step().expect("FIFO successor completes");
+    assert_eq!(terminal_successor.committed_positions, 1);
+    assert_eq!(phase(&engine, ids[1]), RequestPhase::Terminal);
+    assert_eq!(drain_tokens(&mut engine, ids[1]), vec![3]);
+    assert_eq!(
+        engine
+            .take_terminal(ids[1])
+            .expect("FIFO successor terminal query")
+            .expect("FIFO successor terminal")
+            .outcome(),
+        TerminalOutcome::Completed
+    );
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+    let shutdown = engine.shutdown().expect("FIFO pressure shutdown");
+    assert_eq!(shutdown.terminated_requests, 0);
+    assert_eq!(shutdown.remaining_shared_bytes, 0);
+}
+
+#[test]
+fn fifo_non_head_deadline_terminalizes_without_receiving_service() {
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 3;
+    limits.waves_per_step = 1;
+    limits.max_active_requests = 3;
+    limits.output_capacity_per_request = 4;
+    let mut engine = new_engine_with_policy(limits, SchedulingPolicy::FifoRunToCompletion);
+    let head = engine
+        .try_submit(RequestSpec::new(&[0], 3, SamplingPolicy::Greedy, None))
+        .expect("FIFO deadline head");
+    let expiring = engine
+        .try_submit(RequestSpec::new(&[1], 3, SamplingPolicy::Greedy, Some(1)))
+        .expect("FIFO expiring non-head");
+    let tail = engine
+        .try_submit(RequestSpec::new(&[2], 3, SamplingPolicy::Greedy, None))
+        .expect("FIFO deadline tail");
+
+    assert_eq!(engine.step().unwrap().committed_positions, 1);
+    assert_eq!(drain_tokens(&mut engine, head), vec![1]);
+    assert!(drain_tokens(&mut engine, expiring).is_empty());
+    assert!(drain_tokens(&mut engine, tail).is_empty());
+    engine.advance_clock(1).expect("expire non-head");
+    let report = engine.step().expect("resolve non-head deadline");
+    assert_eq!(report.terminal_decisions, 1);
+    assert_eq!(report.committed_positions, 1);
+    assert_eq!(phase(&engine, expiring), RequestPhase::Terminal);
+    assert_eq!(phase(&engine, head), RequestPhase::Ready);
+    assert_eq!(phase(&engine, tail), RequestPhase::Ready);
+    assert!(drain_tokens(&mut engine, expiring).is_empty());
+    assert!(drain_tokens(&mut engine, tail).is_empty());
+    assert_eq!(
+        engine
+            .take_terminal(expiring)
+            .unwrap()
+            .expect("deadline terminal")
+            .outcome(),
+        TerminalOutcome::DeadlineExceeded
+    );
 }
 
 #[derive(Debug, PartialEq, Eq)]
