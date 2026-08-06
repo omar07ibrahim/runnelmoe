@@ -11,6 +11,7 @@ repository.workspace = true
 default = ["native-avx2"]
 actor-stress-instrumentation = []
 deterministic-checkpoint-instrumentation = []
+m5-run-observer-instrumentation = []
 native-avx2 = ["runnel-runtime/native-avx2"]
 
 [dependencies]

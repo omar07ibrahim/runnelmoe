@@ -2,7 +2,7 @@
 
 - Status: accepted; implementation in progress; measurement pending
 - Date: 2026-08-03
-- Last amended: 2026-08-06 (policy, paired-trace, and stress-evidence clarifications)
+- Last amended: 2026-08-06 (preemption, lifecycle, and run-observer contracts)
 - Milestone: M5
 
 ## Context
@@ -529,6 +529,158 @@ public queued, ready, output-blocked, and preempted manual-clock tests, it also
 closes the lifecycle-state deadline matrix and resident cooperative-preemption
 correctness gate. The run-level timing observer and accepted M5 evidence remain
 explicit gates.
+
+### Sealed bounded run observer
+
+Pre-measurement amendment (2026-08-06): the timing observer contract below was
+closed before an M5 timing run, correctness capture, raw timing row, summary,
+or figure existed. Earlier correctness executions are not timing evidence and
+will not be relabeled as the preregistered capture.
+
+The semantic service trace deliberately contains no clock values, and output
+queues are drained only after the primary timing endpoint. Therefore neither
+endpoint response order nor step return time can reconstruct TTFT, ITL,
+first-work queue delay, phase boundaries, or terminal-decision time. The
+opt-in Cargo feature `m5-run-observer-instrumentation` exports one concrete,
+sealed `RunObserver`; it exports no clock source, callback trait, trait object,
+or arbitrary event sink. Each observer owns an unexported, nonallocating
+`Instant`-origin `RunClock`, and every production observed API samples only
+that source. An external clock cannot be mixed into a run. The ordinary
+feature-off path is monomorphized with a zero-sized null observer and performs
+no observer allocation, clock read, branch, lock, or event write.
+
+The observer is harness-owned rather than scheduler-owned. Its allocations are
+not included in the scheduler logical ledger, are constructed before release,
+are identical for baseline and candidate, and remain included in fresh-child
+`VmHWM`. Evidence reports their requested bytes separately. No observer cost is
+subtracted from elapsed time. This preserves the closed scheduler-owned ledger
+identity while making the instrumentation overhead visible.
+
+An observer is weakly authenticated to one engine control-table domain, owns
+one clock origin captured before its fallible reservations, and accepts one
+atomic evidence admission. Binding before release checks the domain, every
+mutable field is pristine, accepted-count capacity, maximum output count, and
+every checked size product. Runtime callbacks before release poison the
+observer and prevent later publication. Successful binding preallocates all
+storage; a binding or allocation failure precedes publication and leaves the
+observer and engine reusable. The clock is an inline scalar and performs no
+allocation or reference-count operation. The evidence configuration allocates
+exactly:
+
+- 32 accepted-request summary slots, matching the normal total-outstanding
+  limit;
+- 256 optional output-commit timestamps, equal to 32 requests times eight
+  maximum outputs;
+- a fixed nine-bin nonempty-wave occupancy histogram for widths zero through
+  eight, where bin zero must remain zero; and
+- scalar checked totals for steps, waves, selections, expert contributions,
+  expert groups, commits, terminal decisions, resident preemptions, resumes,
+  timestamp-bearing milestone observations, release, final emission, final
+  terminal decision, observer requested bytes, and the three checked
+  state-utilization sampling integers.
+
+Rejected offers never receive an internal request ID and remain harness rows,
+not observer slots. Each accepted summary retains only:
+
+```text
+offered_index, opaque request_id
+prompt_len, max_new_tokens, total_positions, resolved_deadline_ns
+admitted_ns, first_work_start_ns, first_decode_start_ns
+prefill_complete_ns, output_commit_ns[0..emitted_tokens]
+cancel_linearized_ns, terminal_decided_ns, terminal_outcome
+request_owned_zero_ns, worker_quiescent_ns
+committed_positions, emitted_tokens
+```
+
+Prompt tokens, output token values, sampling seeds and state, logits, router
+scores, expert IDs, adapter identities, and deadline contents outside the
+synthetic contract are never retained by this observer. The semantic service
+trace remains the authority for request/position/phase order, and the ledger
+trace remains the authority for ownership and peaks.
+
+The timestamp boundaries are closed:
+
+- `admitted_ns` is the batch `release_ns` installed by the allocation-free
+  publication boundary;
+- `first_work_start_ns` is sampled immediately before the first
+  `prepare_token` call for that request;
+- `first_decode_start_ns` is sampled at the same boundary for position
+  `prompt_len`, if that position exists;
+- `prefill_complete_ns` and each emitted-output timestamp are sampled
+  immediately after the infallible state/service/endpoint publication for the
+  relevant position;
+- `cancel_linearized_ns` is sampled immediately after the successful atomic
+  cancellation transition, including a deterministic checkpoint action;
+- `terminal_decided_ns` is sampled immediately after terminal publication;
+- `worker_quiescent_ns` is sampled when synchronous adapter work carrying that
+  request has returned and the reusable wave no longer carries its work; and
+- `request_owned_zero_ns` is sampled immediately after terminal endpoint,
+  record, slot, prompt, state, and retained-reservation reap completes.
+
+The direct evidence core has one synchronous worker. For a cancellation
+resolved before work, or after all selected adapter calls have returned,
+`worker_quiescent_ns` may equal `terminal_decided_ns`; the two named fields are
+still retained and verified independently. The later actor/serving surface may
+have a distinct asynchronous quiescence boundary and cannot infer it from this
+direct-core result.
+
+Every nonempty wave increments exactly one occupancy bin after its selections
+are fixed. Completed step reports feed the checked aggregate counters. Observer
+request counts, committed positions, emitted indices, terminal values, and
+global totals must reconcile exactly with the accepted batch, terminal
+results, step reports, and complete service trace. Both trace capacities remain
+exactly 8,192 and their sticky overflow states remain independent of observer
+health.
+
+Clock regression or saturation, a pre-release callback, duplicate admission
+or lifecycle milestone, unknown request, noncontiguous
+position or output index, impossible phase or terminal boundary, an
+unobserved cancellation source, counter overflow, observer capacity breach,
+or a callback after finish sets one sticky closed failure code. Runtime
+observer failure retains the longest valid prefix, never returns into or
+changes the scheduler transaction, and makes that run ineligible at final
+verification. Formatting, serialization, hashing, cloning, and JSON writing
+occur only after the observed interval. The observer path performs no dynamic
+allocation, mutex operation, atomic reference-count churn, or user callback.
+Foreign-engine attempts instead fail the observed API preflight without
+mutating either engine or observer, so a pristine observer remains reusable.
+Test-only manual-clock hooks are compiled solely under `cfg(test)` to freeze
+exact boundaries and sticky regression/saturation behavior; they are not part
+of the feature's production surface.
+
+State-page utilization is a time-sampled logical slot diagnostic, not physical
+residency. Immediately after every successful position commit, including a
+completing position before its conceptual state is removed, the observer adds
+the current committed-position count across all active state to one numerator
+and the current admitted full-page slot count across that same state to one
+denominator:
+
+```text
+live_sample              = sum(active committed_positions)
+allocated_sample         = sum(ceil(active total_positions /
+                                   state_page_tokens) * state_page_tokens)
+live_token_sample_sum   += live_sample
+allocated_slot_sum      += allocated_sample
+state_sample_count      += 1
+utilization              = live_token_sample_sum / allocated_slot_sum
+```
+
+Promotion adds one request's rounded slot count to the live observer state;
+terminal cleanup removes its slot and committed-token counts only after any
+same-position sample. Cancellation without a commit adds no sample. The raw
+evidence retains both integer sums and the sample count; it never averages
+per-request ratios. This definition does not imply that pages were faulted in,
+cache-resident, compressed, or backed by storage.
+
+Observer acceptance requires exact manual-clock TTFT/ITL/queue/prefill/decode/
+terminal cases; observer-on/off token, terminal, service-trace, ledger-trace,
+and seeded-RNG parity under both policies and one/four-wave partitioning;
+exact-capacity and sticky-failure neutrality; foreign-domain and clock-failure
+tests; cancellation/deadline/reap lifecycle coverage; a no-growth allocation
+fingerprint across the observed interval; and no-default, observer-only,
+checkpoint-plus-observer, actor-stress-plus-observer, and all-feature builds.
+Only after those gates and the ordered 26-row correctness producer pass may
+the five-cell timing capture begin.
 
 ### Seeded sampling
 
@@ -1094,6 +1246,56 @@ ledger-boundary-overflow       backpressure-control-saturation
 deadline-manual-clock          drr-reference-fairness
 continuous-arrival-1000        actor-concurrency-stress
 ```
+
+`correctness.jsonl` is canonical UTF-8 JSONL with one LF-terminated row in
+exactly that order. Its closed top-level schema is:
+
+```text
+schema                   "runnel.m5-correctness/1"
+check_index              integer 0..25
+check_id                 the identifier at that index above
+kind                     closed proof-kind identifier
+backend                  null | scalar | avx2 | python-pytorch
+status                   ok | failed | unsupported
+failure_code             null or one closed failure identifier
+proof                    one closed kind-specific object
+```
+
+Unknown or duplicate keys, duplicate IDs, a missing or reordered row,
+noncanonical JSON, a nonfinite number, or a value of the wrong exact JSON type
+rejects the file. The interchange schema retains `unsupported`, but every row
+must be `ok` for the accepted capture; the recorded AVX2 host therefore cannot
+accept either AVX2 row as unsupported. A separate Python verifier validates
+the schema and reconstructs hashes, counts, comparisons, and digests rather
+than trusting `status`. The producer invokes reusable typed checks directly;
+human `cargo test` output is not a proof payload.
+
+The proof objects retain raw counts and error maxima, not boolean-only
+attestations. Their closed requirements are:
+
+| Check group | Required proof material |
+| --- | --- |
+| fixture custody | fixture ID/version/representation/context, spec/object/page-table/golden file sizes and SHA-256 values, tensor payload bytes, rounded resident charge |
+| scalar/AVX2 oracle | requested/selected backend, fixture/oracle hashes, positions, token/route/stop digests, logit/router-score/route-weight absolute and relative maxima, tolerances, mismatch counts |
+| streaming/materialized | exact positions and page-boundary suite, input/reference/actual digests, Rust-f64 and independent-PyTorch comparisons, error maxima and tolerance ratios, state-capacity and pointer-stability witnesses |
+| chunk partitions | frozen partition suite, suite digest and count, token-at-a-time reference digest, per-partition state/token/route/stop digests, mismatch count |
+| direct policy parity | all five workload IDs, direct-oracle and scheduler digests, offered/accepted/rejected/terminal and committed-position counts, final request ownership zero |
+| RNG and categorical | committed fixture/oracle hashes, exact case counts and state/word/unit/token/order mismatches, ULP diagnostics, exact invalid classifications |
+| sampling schedule | batch/chunk/completion/preemption permutations, output/RNG/service digests, failed-preview RNG neutrality, preemption/resume counts |
+| contribution/scatter | closed malformed/permutation/lane-reuse cases, rejection stage, canonical reduction digest, zero mutation-before-reject and stale-overwrite counts |
+| cancellation matrix | four boundaries by three actions, fire ordinals, committed prefixes, state/RNG/output/service digests, skipped expert calls, request-zero and worker-quiescent witnesses |
+| ledger boundary | category-map digest, 64-byte quantum, fit/one-short/rollback/batch/full/overflow cases, replayed current/peak snapshots, shutdown zero |
+| backpressure/control | command/output saturation cases, sibling progress, cancel/drop/drain/shutdown dispositions, zero busy-spin, output identity, ownership zero |
+| deadline clock | every lifecycle state, inclusive and cancellation-precedence cases, service-prefix digest, terminal results, ownership zero |
+| DRR fairness | exact service digest, horizon 16, integer lag numerator, maximum gap, Jain numerator/denominator, nonzero service for all 16 requests |
+| continuous arrival | exact overrides, 1,000 healthy service events, expected independent ledger overflow, anchor positions/turn bounds/gap, zero cleanup commits |
+| actor concurrency | action/golden/custody hashes, accepted semantic digest, exactly 32 independently verified fresh race repetitions and overlap witnesses, pump cap, healthy 675-record observer, final ledger zero |
+
+The correctness producer hashes its executable, source closure, fixtures,
+goldens, Python oracle, commit, build command, and controlled environment
+before and after capture. Any failed correctness row prevents measured child
+execution; the harness retains the failure and synthesizes the closed missing
+timing grid without retrying or replacing a variant.
 
 `runs` and `requests` are rectangular. Each `service` row contains the complete
 valid prefix as compact arrays of request index and phase bit, rather than one

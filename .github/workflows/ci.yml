@@ -70,6 +70,24 @@ jobs:
           cargo test -p runnel-scheduler --all-targets \
             --no-default-features --features deterministic-checkpoint-instrumentation \
             --locked
+          cargo clippy -p runnel-scheduler --all-targets \
+            --no-default-features --features m5-run-observer-instrumentation \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets \
+            --no-default-features --features m5-run-observer-instrumentation \
+            --locked
+          cargo clippy -p runnel-scheduler --all-targets --no-default-features \
+            --features deterministic-checkpoint-instrumentation,m5-run-observer-instrumentation \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets --no-default-features \
+            --features deterministic-checkpoint-instrumentation,m5-run-observer-instrumentation \
+            --locked
+          cargo clippy -p runnel-scheduler --all-targets --no-default-features \
+            --features actor-stress-instrumentation,m5-run-observer-instrumentation \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets --no-default-features \
+            --features actor-stress-instrumentation,m5-run-observer-instrumentation \
+            --locked
       - name: Smoke-test the closed M4 evidence protocol
         run: |
           cargo build --locked -p runnel-kernels --bin runnel-kernel-bench \

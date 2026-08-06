@@ -98,6 +98,11 @@ close the implementation, correctness, and custody gates.
 - [x] Continuous batching, expert coalescing, resident deterministic
   preemption, cancellation, backpressure, and seeded sampling pass stress
   tests.
+- [x] The sealed harness-owned run observer is allocation-bounded before
+  release, reconciles exact internal timing milestones with service and ledger
+  evidence, and is behavior-neutral under both policies and feature boundaries.
+- [ ] The ordered closed-schema 26-row correctness producer and hostile-input
+  verifier pass before any timing capture begins.
 - [ ] Evidence reports TTFT, prefill/decode throughput, p50/p95, fairness, and
   observed memory ceilings.
 

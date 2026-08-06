@@ -13,10 +13,11 @@
 
 use crate::{
     RequestId,
-    control::{ControlBinding, ControlDomain},
+    control::{ControlBinding, ControlDomain, ControlRegistry},
     error::{SchedulerError, SchedulerResult},
     id::SlotKey,
     request::CancelDisposition,
+    run_observer::StepObserver,
 };
 use std::{fmt, mem::size_of};
 
@@ -260,8 +261,8 @@ impl CheckpointPlan {
         })
     }
 
-    pub(crate) fn belongs_to(&self, domain: &ControlDomain) -> bool {
-        self.domain.same_table(domain)
+    pub(crate) fn belongs_to_registry(&self, registry: &ControlRegistry) -> bool {
+        registry.matches_domain(&self.domain)
     }
 
     #[must_use]
@@ -310,21 +311,51 @@ pub(crate) struct CheckpointContext<'control> {
     pub(crate) monotonic_ns: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CheckpointFire {
+    monotonic_ns: u64,
+}
+
+impl CheckpointFire {
+    const fn unchanged(monotonic_ns: u64) -> Self {
+        Self { monotonic_ns }
+    }
+
+    pub(crate) const fn monotonic_ns(self) -> u64 {
+        self.monotonic_ns
+    }
+}
+
 pub(crate) trait CheckpointDriver {
-    fn fire(&mut self, context: CheckpointContext<'_>) -> SchedulerResult<u64>;
+    fn fire<O: StepObserver>(
+        &mut self,
+        context: CheckpointContext<'_>,
+        clock: &impl Fn() -> u64,
+        observer: &mut O,
+    ) -> SchedulerResult<CheckpointFire>;
 }
 
 pub(crate) struct NoCheckpoints;
 
 impl CheckpointDriver for NoCheckpoints {
     #[inline(always)]
-    fn fire(&mut self, context: CheckpointContext<'_>) -> SchedulerResult<u64> {
-        Ok(context.monotonic_ns)
+    fn fire<O: StepObserver>(
+        &mut self,
+        context: CheckpointContext<'_>,
+        _: &impl Fn() -> u64,
+        _: &mut O,
+    ) -> SchedulerResult<CheckpointFire> {
+        Ok(CheckpointFire::unchanged(context.monotonic_ns))
     }
 }
 
 impl CheckpointDriver for CheckpointPlan {
-    fn fire(&mut self, context: CheckpointContext<'_>) -> SchedulerResult<u64> {
+    fn fire<O: StepObserver>(
+        &mut self,
+        context: CheckpointContext<'_>,
+        clock: &impl Fn() -> u64,
+        observer: &mut O,
+    ) -> SchedulerResult<CheckpointFire> {
         let CheckpointContext {
             point,
             slot,
@@ -339,7 +370,7 @@ impl CheckpointDriver for CheckpointPlan {
                 && entry.directive.position == position
                 && entry.directive.point == point
         }) else {
-            return Ok(monotonic_ns);
+            return Ok(CheckpointFire::unchanged(monotonic_ns));
         };
         if entry.slot != slot || entry.deadline_ns != deadline_ns {
             return Err(SchedulerError::invalid_request(
@@ -353,11 +384,6 @@ impl CheckpointDriver for CheckpointPlan {
             ));
         }
 
-        let cancellation = if entry.directive.action.cancels() {
-            Some(control.cancel()?)
-        } else {
-            None
-        };
         let (next_ns, deadline) = if entry.directive.action.expires_deadline() {
             let deadline_ns = deadline_ns.ok_or_else(|| {
                 SchedulerError::internal("checkpoint expiry target lost its deadline")
@@ -377,15 +403,29 @@ impl CheckpointDriver for CheckpointPlan {
             (monotonic_ns, None)
         };
         let fire_ordinal = self.fired;
-        self.fired = self
+        let next_fired = self
             .fired
             .checked_add(1)
             .ok_or_else(|| SchedulerError::internal("checkpoint fire count overflows"))?;
+        let cancellation = if entry.directive.action.cancels() {
+            let disposition = control.cancel()?;
+            if observer.enabled() && disposition == CancelDisposition::Requested {
+                // The observer sample is the first operation after the
+                // successful generation-checked cancellation transition.
+                observer.cancellation(request_id, disposition, clock());
+            }
+            Some(disposition)
+        } else {
+            None
+        };
+        self.fired = next_fired;
         entry.effect = Some(CheckpointEffect {
             fire_ordinal,
             cancellation,
             deadline,
         });
-        Ok(next_ns)
+        Ok(CheckpointFire {
+            monotonic_ns: next_ns,
+        })
     }
 }

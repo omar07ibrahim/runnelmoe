@@ -158,10 +158,14 @@ struct ControlTable {
 
 #[derive(Clone)]
 #[cfg_attr(
-    not(any(test, feature = "deterministic-checkpoint-instrumentation")),
+    not(any(
+        test,
+        feature = "deterministic-checkpoint-instrumentation",
+        feature = "m5-run-observer-instrumentation"
+    )),
     allow(
         dead_code,
-        reason = "weak engine-domain binding is used only by checkpoint instrumentation"
+        reason = "weak engine-domain binding is used only by sealed instrumentation"
     )
 )]
 pub(crate) struct ControlDomain {
@@ -170,10 +174,14 @@ pub(crate) struct ControlDomain {
 
 impl ControlDomain {
     #[cfg_attr(
-        not(any(test, feature = "deterministic-checkpoint-instrumentation")),
+        not(any(
+            test,
+            feature = "deterministic-checkpoint-instrumentation",
+            feature = "m5-run-observer-instrumentation"
+        )),
         allow(
             dead_code,
-            reason = "weak engine-domain binding is used only by checkpoint instrumentation"
+            reason = "weak engine-domain binding is used only by sealed instrumentation"
         )
     )]
     pub(crate) fn same_table(&self, other: &Self) -> bool {
@@ -635,11 +643,19 @@ impl fmt::Debug for ControlRegistry {
 }
 
 impl ControlRegistry {
+    pub(crate) fn matches_domain(&self, domain: &ControlDomain) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.table), domain.table.as_ptr())
+    }
+
     #[cfg_attr(
-        not(any(test, feature = "deterministic-checkpoint-instrumentation")),
+        not(any(
+            test,
+            feature = "deterministic-checkpoint-instrumentation",
+            feature = "m5-run-observer-instrumentation"
+        )),
         allow(
             dead_code,
-            reason = "weak engine-domain binding is used only by checkpoint instrumentation"
+            reason = "weak engine-domain binding is used only by sealed instrumentation"
         )
     )]
     pub(crate) fn checkpoint_domain(&self) -> ControlDomain {

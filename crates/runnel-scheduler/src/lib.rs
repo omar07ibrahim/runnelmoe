@@ -22,6 +22,7 @@ mod ledger;
 mod ledger_trace;
 mod request;
 mod ring;
+mod run_observer;
 mod trace;
 mod wave;
 
@@ -69,6 +70,13 @@ pub use request::{
     AcceptedAdmission, BatchAdmission, BatchDeadline, BatchRequestSpec, CancelDisposition,
     EngineSnapshot, OutputEvent, RejectedAdmission, RequestPhase, RequestSpec, ShutdownReport,
     StepReport, TerminalOutcome, TerminalResult,
+};
+#[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+#[doc(hidden)]
+pub use run_observer::{
+    MAX_RUN_OBSERVER_OUTPUT_TIMESTAMPS, MAX_RUN_OBSERVER_REQUESTS, RUN_OCCUPANCY_BIN_COUNT,
+    RunObservationRead, RunObserver, RunObserverAllocationFingerprint, RunObserverFailure,
+    RunObserverStatus, RunObserverTotals, RunRequestObservation,
 };
 pub use trace::{
     ServicePhase, ServiceTraceCursor, ServiceTraceEvent, ServiceTraceRead, ServiceTraceStatus,

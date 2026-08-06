@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     mem::size_of,
     sync::{
         Arc, Condvar, Mutex,
@@ -14,12 +15,13 @@ use runnel_runtime::{
 
 use crate::control::ControlBinding;
 use crate::endpoint::TryPop;
+use crate::run_observer::StepObserver;
 use crate::{
     BatchRequestSpec, CancelDisposition, CheckpointAction, CheckpointDirective, CheckpointPoint,
     DeadlineExpirationDisposition, ErrorCategory, LedgerCategory, LedgerOwnership,
     LedgerTraceCursor, MAX_CHECKPOINT_PLAN_ENTRIES, RequestPhase, RequestSpec, SchedulerConfig,
     SchedulerEngine, SchedulerError, SchedulerLimits, ServiceTraceCursor, StepReport,
-    TerminalOutcome,
+    TerminalOutcome, TerminalResult,
 };
 
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -566,6 +568,551 @@ fn assert_all_request_ownership_reaped(
             );
         }
     }
+}
+
+fn admitted_run_observer(
+    max_new_tokens: usize,
+) -> (
+    SchedulerEngine<GatedAdapter>,
+    crate::RunObserver,
+    crate::RequestId,
+) {
+    let mut engine = new_engine(
+        Arc::new(CommitGate::passthrough()),
+        Arc::new(AtomicUsize::new(0)),
+        1,
+    );
+    let mut observer = engine.prepare_run_observer().expect("callback observer");
+    let prompt = [0_u32];
+    let offers = [BatchRequestSpec::absolute(RequestSpec::new(
+        &prompt,
+        max_new_tokens,
+        SamplingPolicy::Greedy,
+        None,
+    ))];
+    let request = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare callback batch")
+        .commit_prepared_batch_observed_at_for_test(10, &mut observer)
+        .expect("publish callback batch")
+        .accepted()
+        .next()
+        .expect("accepted callback request")
+        .request_id();
+    (engine, observer, request)
+}
+
+fn admitted_deadline_run_observer(
+    deadline_ns: u64,
+) -> (
+    SchedulerEngine<GatedAdapter>,
+    crate::RunObserver,
+    crate::RequestId,
+) {
+    let mut engine = new_engine(
+        Arc::new(CommitGate::passthrough()),
+        Arc::new(AtomicUsize::new(0)),
+        1,
+    );
+    let mut observer = engine
+        .prepare_run_observer()
+        .expect("deadline callback observer");
+    let prompt = [0_u32];
+    let offers = [BatchRequestSpec::absolute(RequestSpec::new(
+        &prompt,
+        2,
+        SamplingPolicy::Greedy,
+        Some(deadline_ns),
+    ))];
+    let request = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare deadline callback batch")
+        .commit_prepared_batch_observed_at_for_test(10, &mut observer)
+        .expect("publish deadline callback batch")
+        .accepted()
+        .next()
+        .expect("accepted deadline callback request")
+        .request_id();
+    (engine, observer, request)
+}
+
+#[test]
+fn run_observer_callback_state_machine_rejects_unpaired_and_impossible_events() {
+    let (_engine, mut observer, request) = admitted_run_observer(2);
+    observer.promotion(request);
+    observer.commit(request, 0, crate::ServicePhase::Prefill, true, 20);
+    assert_eq!(
+        observer.read().status().failure(),
+        Some(crate::RunObserverFailure::InvalidPhaseBoundary)
+    );
+    assert_eq!(observer.read().requests()[0].committed_positions(), 0);
+
+    let (_engine, mut observer, request) = admitted_run_observer(2);
+    observer.promotion(request);
+    observer.work_start(request, 0, 20);
+    observer.commit(request, 0, crate::ServicePhase::Prefill, false, 30);
+    assert_eq!(
+        observer.read().status().failure(),
+        Some(crate::RunObserverFailure::InvalidPhaseBoundary)
+    );
+    assert_eq!(observer.read().requests()[0].emitted_tokens(), 0);
+
+    let (_engine, mut observer, request) = admitted_run_observer(2);
+    observer.terminal(
+        TerminalResult::new(request, TerminalOutcome::Cancelled, 0, 0),
+        20,
+    );
+    assert_eq!(
+        observer.read().status().failure(),
+        Some(crate::RunObserverFailure::MissingCancellationBoundary)
+    );
+
+    let (_engine, mut observer, request) = admitted_run_observer(2);
+    observer.terminal(
+        TerminalResult::new(request, TerminalOutcome::DeadlineExceeded, 0, 0),
+        20,
+    );
+    assert_eq!(
+        observer.read().status().failure(),
+        Some(crate::RunObserverFailure::InvalidTerminal)
+    );
+
+    let (_engine, mut observer, request) = admitted_run_observer(2);
+    observer.terminal(
+        TerminalResult::new(request, TerminalOutcome::Completed, 0, 0),
+        20,
+    );
+    assert_eq!(
+        observer.read().status().failure(),
+        Some(crate::RunObserverFailure::InvalidTerminal)
+    );
+
+    let (_engine, mut observer, request) = admitted_deadline_run_observer(50);
+    observer.terminal(
+        TerminalResult::new(request, TerminalOutcome::DeadlineExceeded, 0, 0),
+        49,
+    );
+    assert_eq!(
+        observer.read().status().failure(),
+        Some(crate::RunObserverFailure::InvalidTerminal)
+    );
+
+    let (_engine, mut observer, request) = admitted_deadline_run_observer(50);
+    observer.cancellation(request, CancelDisposition::Requested, 20);
+    observer.terminal(
+        TerminalResult::new(request, TerminalOutcome::DeadlineExceeded, 0, 0),
+        50,
+    );
+    assert_eq!(
+        observer.read().status().failure(),
+        Some(crate::RunObserverFailure::InvalidTerminal)
+    );
+
+    let (_engine, mut observer, request) = admitted_deadline_run_observer(50);
+    observer.terminal(
+        TerminalResult::new(request, TerminalOutcome::DeadlineExceeded, 0, 0),
+        50,
+    );
+    assert!(observer.read().status().healthy());
+    assert_eq!(
+        observer.read().requests()[0].terminal_outcome(),
+        Some(TerminalOutcome::DeadlineExceeded)
+    );
+}
+
+#[test]
+fn run_observer_allows_a_backpressured_work_attempt_to_retry_once_unowned() {
+    let (_engine, mut observer, request) = admitted_run_observer(2);
+    observer.promotion(request);
+    observer.work_start(request, 0, 20);
+    observer.work_abandoned(request, 0);
+    observer.work_start(request, 0, 30);
+    observer.commit(request, 0, crate::ServicePhase::Prefill, true, 40);
+
+    let read = observer.read();
+    assert!(read.status().healthy());
+    assert_eq!(read.requests()[0].first_work_start_ns(), Some(20));
+    assert_eq!(read.requests()[0].committed_positions(), 1);
+    assert_eq!(
+        read.output_commit_ns(0).expect("retry output timestamps"),
+        &[Some(40)]
+    );
+}
+
+#[test]
+fn run_observer_manual_clock_freezes_exact_phase_and_lifecycle_boundaries() {
+    let mut engine = new_engine(
+        Arc::new(CommitGate::passthrough()),
+        Arc::new(AtomicUsize::new(0)),
+        1,
+    );
+    let mut observer = engine
+        .prepare_run_observer()
+        .expect("manual-clock observer");
+    let prompt = [0_u32, 1];
+    let offers = [BatchRequestSpec::absolute(RequestSpec::new(
+        &prompt,
+        2,
+        SamplingPolicy::Greedy,
+        None,
+    ))];
+    let admission = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare manual-clock batch")
+        .commit_prepared_batch_observed_at_for_test(10, &mut observer)
+        .expect("publish manual-clock batch");
+    let request = admission
+        .accepted()
+        .next()
+        .expect("manual-clock request")
+        .request_id();
+    let now = Cell::new(20_u64);
+    let clock = || now.get();
+
+    let first = engine
+        .step_observed_with_clock_for_test(&clock, &mut observer)
+        .expect("first manual-clock step");
+    assert_eq!(first.committed_positions, 1);
+    now.set(30);
+    let second = engine
+        .step_observed_with_clock_for_test(&clock, &mut observer)
+        .expect("second manual-clock step");
+    assert_eq!(second.committed_positions, 1);
+    now.set(40);
+    let third = engine
+        .step_observed_with_clock_for_test(&clock, &mut observer)
+        .expect("third manual-clock step");
+    assert_eq!(third.committed_positions, 1);
+    assert_eq!(third.terminal_decisions, 1);
+
+    let read = observer.read();
+    let observed = &read.requests()[0];
+    assert_eq!(read.release_ns(), Some(10));
+    assert_eq!(observed.admitted_ns(), 10);
+    assert_eq!(observed.first_work_start_ns(), Some(20));
+    assert_eq!(observed.prefill_complete_ns(), Some(30));
+    assert_eq!(observed.first_decode_start_ns(), Some(40));
+    assert_eq!(
+        read.output_commit_ns(0).expect("manual output timestamps"),
+        &[Some(30), Some(40)]
+    );
+    assert_eq!(observed.terminal_decided_ns(), Some(40));
+    assert_eq!(observed.preemption_count(), 2);
+    assert_eq!(observed.resume_count(), 2);
+    assert_eq!(read.totals().state_live_token_sample_sum, 6);
+    assert_eq!(read.totals().state_allocated_page_slot_sample_sum, 12);
+    assert_eq!(read.totals().state_sample_count, 3);
+    drop(read);
+
+    now.set(50);
+    assert_eq!(
+        engine
+            .drain_events_observed_with_clock_for_test(request, usize::MAX, &clock, &mut observer,)
+            .expect("manual-clock output drain")
+            .len(),
+        2
+    );
+    let terminal = engine
+        .take_terminal_observed_with_clock_for_test(request, &clock, &mut observer)
+        .expect("manual-clock terminal read")
+        .expect("manual-clock terminal");
+    assert_eq!(terminal.outcome(), TerminalOutcome::Completed);
+    assert_eq!(
+        observer.read().requests()[0].request_owned_zero_ns(),
+        Some(50)
+    );
+    let status = observer.finish();
+    assert!(
+        status.healthy(),
+        "manual-clock observer: {:?}",
+        status.failure()
+    );
+}
+
+#[test]
+fn run_observer_manual_clock_records_inclusive_deadline_before_more_work() {
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let mut engine = new_engine(
+        Arc::new(CommitGate::passthrough()),
+        Arc::clone(&apply_count),
+        1,
+    );
+    let mut observer = engine.prepare_run_observer().expect("deadline observer");
+    let prompt = [0_u32, 1];
+    let offers = [BatchRequestSpec::absolute(RequestSpec::new(
+        &prompt,
+        2,
+        SamplingPolicy::Greedy,
+        Some(30),
+    ))];
+    let admission = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare deadline batch")
+        .commit_prepared_batch_observed_at_for_test(10, &mut observer)
+        .expect("publish deadline batch");
+    let request = admission
+        .accepted()
+        .next()
+        .expect("deadline request")
+        .request_id();
+    let now = Cell::new(20_u64);
+    let clock = || now.get();
+
+    let first = engine
+        .step_observed_with_clock_for_test(&clock, &mut observer)
+        .expect("pre-deadline step");
+    assert_eq!(first.committed_positions, 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 1);
+    now.set(30);
+    let expired = engine
+        .step_observed_with_clock_for_test(&clock, &mut observer)
+        .expect("inclusive deadline step");
+    assert_eq!(expired.committed_positions, 0);
+    assert_eq!(expired.terminal_decisions, 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 1);
+    let observed = observer.read().requests()[0];
+    assert_eq!(
+        observed.terminal_outcome(),
+        Some(TerminalOutcome::DeadlineExceeded)
+    );
+    assert_eq!(observed.terminal_decided_ns(), Some(30));
+    assert_eq!(observed.committed_positions(), 1);
+    assert_eq!(observed.cancel_linearized_ns(), None);
+    assert_eq!(observed.worker_quiescent_ns(), None);
+
+    now.set(40);
+    assert!(
+        engine
+            .drain_events_observed_with_clock_for_test(request, usize::MAX, &clock, &mut observer,)
+            .expect("deadline drain")
+            .is_empty()
+    );
+    assert_eq!(
+        engine
+            .take_terminal_observed_with_clock_for_test(request, &clock, &mut observer)
+            .expect("deadline terminal read")
+            .expect("deadline terminal")
+            .outcome(),
+        TerminalOutcome::DeadlineExceeded
+    );
+    assert_eq!(
+        observer.read().requests()[0].request_owned_zero_ns(),
+        Some(40)
+    );
+    assert!(observer.finish().healthy());
+}
+
+#[test]
+fn run_observer_manual_clock_separates_cancel_terminal_quiescent_and_zero() {
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let mut engine = new_engine(
+        Arc::new(CommitGate::passthrough()),
+        Arc::clone(&apply_count),
+        1,
+    );
+    let mut observer = engine
+        .prepare_run_observer()
+        .expect("cancellation observer");
+    let prompt = [0_u32, 1];
+    let offers = [BatchRequestSpec::absolute(RequestSpec::new(
+        &prompt,
+        2,
+        SamplingPolicy::Greedy,
+        None,
+    ))];
+    let admission = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare cancellation batch")
+        .commit_prepared_batch_observed_at_for_test(10, &mut observer)
+        .expect("publish cancellation batch");
+    let request = admission
+        .accepted()
+        .next()
+        .expect("cancellation request")
+        .request_id();
+    let now = Cell::new(20_u64);
+    let clock = || now.get();
+    engine
+        .step_observed_with_clock_for_test(&clock, &mut observer)
+        .expect("pre-cancellation step");
+    assert_eq!(apply_count.load(Ordering::Acquire), 1);
+
+    now.set(25);
+    assert_eq!(
+        engine
+            .cancel_observed_with_clock_for_test(request, &clock, &mut observer)
+            .expect("manual cancellation"),
+        CancelDisposition::Requested
+    );
+    now.set(30);
+    let cancelled = engine
+        .step_observed_with_clock_for_test(&clock, &mut observer)
+        .expect("cancellation terminal step");
+    assert_eq!(cancelled.committed_positions, 0);
+    assert_eq!(cancelled.terminal_decisions, 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 1);
+    let observed = observer.read().requests()[0];
+    assert_eq!(observed.cancel_linearized_ns(), Some(25));
+    assert_eq!(observed.terminal_decided_ns(), Some(30));
+    assert_eq!(observed.worker_quiescent_ns(), Some(30));
+    assert_eq!(
+        observed.terminal_outcome(),
+        Some(TerminalOutcome::Cancelled)
+    );
+
+    now.set(40);
+    assert!(
+        engine
+            .drain_events_observed_with_clock_for_test(request, usize::MAX, &clock, &mut observer,)
+            .expect("cancellation drain")
+            .is_empty()
+    );
+    assert_eq!(
+        engine
+            .take_terminal_observed_with_clock_for_test(request, &clock, &mut observer)
+            .expect("cancellation terminal read")
+            .expect("cancellation terminal")
+            .outcome(),
+        TerminalOutcome::Cancelled
+    );
+    assert_eq!(
+        observer.read().requests()[0].request_owned_zero_ns(),
+        Some(40)
+    );
+    assert!(observer.finish().healthy());
+}
+
+#[test]
+fn run_observer_clock_regression_is_sticky_neutral_and_freezes_valid_prefix() {
+    let mut engine = new_engine(
+        Arc::new(CommitGate::passthrough()),
+        Arc::new(AtomicUsize::new(0)),
+        1,
+    );
+    let mut observer = engine.prepare_run_observer().expect("regression observer");
+    let fingerprint = observer.allocation_fingerprint();
+    let prompt = [0_u32];
+    let offers = [BatchRequestSpec::absolute(RequestSpec::new(
+        &prompt,
+        2,
+        SamplingPolicy::Greedy,
+        None,
+    ))];
+    let request = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare regression batch")
+        .commit_prepared_batch_observed_at_for_test(100, &mut observer)
+        .expect("publish regression batch")
+        .accepted()
+        .next()
+        .expect("accepted regression request")
+        .request_id();
+    let now = Cell::new(50_u64);
+    let clock = || now.get();
+
+    engine
+        .step_observed_with_clock_for_test(&clock, &mut observer)
+        .expect("regressing observer cannot fail scheduler work");
+    assert_eq!(
+        observer.read().status().failure(),
+        Some(crate::RunObserverFailure::ClockRegression)
+    );
+    let frozen_request = observer.read().requests()[0];
+    let frozen_totals = observer.read().totals();
+
+    now.set(101);
+    for _ in 0..4 {
+        if engine.request_phase(request).expect("regression phase") == RequestPhase::Terminal {
+            break;
+        }
+        engine
+            .step_observed_with_clock_for_test(&clock, &mut observer)
+            .expect("poisoned observer remains behavior-neutral");
+    }
+    assert_eq!(
+        engine.request_phase(request).expect("terminal phase"),
+        RequestPhase::Terminal
+    );
+    assert_eq!(observer.read().requests()[0], frozen_request);
+    assert_eq!(observer.read().totals(), frozen_totals);
+
+    now.set(102);
+    assert_eq!(
+        engine
+            .drain_events_observed_with_clock_for_test(request, usize::MAX, &clock, &mut observer)
+            .expect("regression output drain")
+            .len(),
+        2
+    );
+    assert_eq!(
+        engine
+            .take_terminal_observed_with_clock_for_test(request, &clock, &mut observer)
+            .expect("regression terminal read")
+            .expect("regression terminal")
+            .outcome(),
+        TerminalOutcome::Completed
+    );
+    assert_eq!(
+        observer.finish().failure(),
+        Some(crate::RunObserverFailure::ClockRegression)
+    );
+    assert_eq!(observer.allocation_fingerprint(), fingerprint);
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+}
+
+#[test]
+fn run_observer_saturated_clock_is_sticky_and_behavior_neutral() {
+    let mut engine = new_engine(
+        Arc::new(CommitGate::passthrough()),
+        Arc::new(AtomicUsize::new(0)),
+        1,
+    );
+    let mut observer = engine.prepare_run_observer().expect("saturation observer");
+    let prompt = [0_u32];
+    let offers = [BatchRequestSpec::absolute(RequestSpec::new(
+        &prompt,
+        1,
+        SamplingPolicy::Greedy,
+        None,
+    ))];
+    let request = engine
+        .prepare_submit_batch(&offers)
+        .expect("prepare saturation batch")
+        .commit_prepared_batch_observed_at_for_test(10, &mut observer)
+        .expect("publish saturation batch")
+        .accepted()
+        .next()
+        .expect("accepted saturation request")
+        .request_id();
+    let clock = || u64::MAX;
+
+    let report = engine
+        .step_observed_with_clock_for_test(&clock, &mut observer)
+        .expect("saturated observer cannot fail scheduler work");
+    assert_eq!(report.committed_positions, 1);
+    assert_eq!(report.terminal_decisions, 1);
+    assert_eq!(
+        observer.read().status().failure(),
+        Some(crate::RunObserverFailure::ClockSaturated)
+    );
+    let frozen = observer.read().requests()[0];
+    engine
+        .drain_events_observed_with_clock_for_test(request, usize::MAX, &clock, &mut observer)
+        .expect("saturation output drain");
+    assert_eq!(
+        engine
+            .take_terminal_observed_with_clock_for_test(request, &clock, &mut observer)
+            .expect("saturation terminal read")
+            .expect("saturation terminal")
+            .outcome(),
+        TerminalOutcome::Completed
+    );
+    assert_eq!(observer.read().requests()[0], frozen);
+    assert_eq!(
+        observer.finish().failure(),
+        Some(crate::RunObserverFailure::ClockSaturated)
+    );
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
 }
 
 #[test]

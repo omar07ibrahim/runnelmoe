@@ -10,7 +10,9 @@ use crate::{
         ADMISSION_BASE_PLAN_LEN, ChargePlan, active_plan, admission_base_plan,
         aggregate_admission_base_plans, map_ledger_error, shared_static_plan,
     },
-    checkpoint::{CheckpointContext, CheckpointDriver, CheckpointPoint, NoCheckpoints},
+    checkpoint::{
+        CheckpointContext, CheckpointDriver, CheckpointFire, CheckpointPoint, NoCheckpoints,
+    },
     config::{MAX_BATCH_WIDTH, SchedulerConfig},
     control::{
         ControlBatchBindPermit, ControlBinding, ControlRegistry, ControlSnapshot,
@@ -38,11 +40,15 @@ use crate::{
         TerminalResult,
     },
     ring::{DrrRing, RingError},
+    run_observer::{AdmissionObservation, NullObserver, StepObserver},
     trace::{
         ServicePhase, ServiceTraceCursor, ServiceTraceEvent, ServiceTraceRead, ServiceTraceStatus,
     },
     wave::{TaskEnvelope, WaveScratch, WaveScratchError, WaveSelection},
 };
+
+#[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+use crate::run_observer::RunObserver;
 
 #[cfg(any(test, feature = "deterministic-checkpoint-instrumentation"))]
 use crate::checkpoint::{CheckpointDirective, CheckpointPlan};
@@ -141,6 +147,8 @@ pub struct PreparedAdmission<'engine, A: DecoderAdapter> {
     rejection: Option<SchedulerError>,
     offered_deadlines: Vec<BatchDeadline>,
     offered_count: usize,
+    #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+    observation_domain: crate::control::ControlDomain,
     // Keep the provisional charge last: Rust drops fields in declaration
     // order, so every charged payload and endpoint queue is destroyed before
     // rollback can make that capacity available again.
@@ -166,7 +174,40 @@ impl<A: DecoderAdapter> PreparedAdmission<'_, A> {
     /// and deadline failures happen before mutation. After that boundary the
     /// method allocates nothing, executes no model work, and has no error path;
     /// transaction scratch is reclaimed after publication.
-    pub fn commit_prepared_batch(mut self, release_ns: u64) -> SchedulerResult<BatchAdmission> {
+    pub fn commit_prepared_batch(self, release_ns: u64) -> SchedulerResult<BatchAdmission> {
+        let mut observer = NullObserver;
+        self.commit_prepared_batch_with_observer(release_ns, &mut observer)
+    }
+
+    /// Publishes one preregistered batch and binds its accepted identities to
+    /// a preallocated M5 run observer at the same release boundary.
+    #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+    #[doc(hidden)]
+    pub fn commit_prepared_batch_observed(
+        self,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<BatchAdmission> {
+        observer.preflight_admission(&self.observation_domain, self.prepared.len())?;
+        let clock = observer.clock();
+        let release_ns = clock.now_ns();
+        self.commit_prepared_batch_with_observer(release_ns, observer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_prepared_batch_observed_at_for_test(
+        self,
+        release_ns: u64,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<BatchAdmission> {
+        observer.preflight_admission(&self.observation_domain, self.prepared.len())?;
+        self.commit_prepared_batch_with_observer(release_ns, observer)
+    }
+
+    fn commit_prepared_batch_with_observer<O: StepObserver>(
+        mut self,
+        release_ns: u64,
+        observer: &mut O,
+    ) -> SchedulerResult<BatchAdmission> {
         if release_ns < *self.monotonic_ns {
             return Err(SchedulerError::invalid_request(
                 "release_ns",
@@ -220,6 +261,7 @@ impl<A: DecoderAdapter> PreparedAdmission<'_, A> {
 
         // No fallible call is permitted after this publication boundary.
         *self.monotonic_ns = release_ns;
+        observer.release(release_ns);
         let mut aggregate = match self.ledger.take() {
             Some(permit) => permit.commit_for_requests(&self.prospective_ids, &self.partitions),
             None => LedgerReservation::empty(),
@@ -243,6 +285,14 @@ impl<A: DecoderAdapter> PreparedAdmission<'_, A> {
             .zip(endpoints)
             .zip(self.prospective_ids.iter().copied())
         {
+            let observation = AdmissionObservation {
+                offered_index: request.offered_index,
+                request_id,
+                prompt_len: request.prompt.len(),
+                max_new_tokens: request.max_new_tokens,
+                total_positions: request.total_positions,
+                resolved_deadline_ns: request.deadline_ns,
+            };
             let (base_reservation, remainder) = self.partitions.split_next(aggregate);
             aggregate = remainder;
             let (prompt_reservation, retained_reservation) =
@@ -282,6 +332,7 @@ impl<A: DecoderAdapter> PreparedAdmission<'_, A> {
                 Some(&request.slot_index)
             );
             self.free_slots.swap_remove(request.free_position);
+            observer.admission(observation, release_ns);
         }
         debug_assert!(aggregate.is_empty());
         debug_assert!(self.partitions.is_complete());
@@ -340,6 +391,35 @@ impl<A: DecoderAdapter> fmt::Debug for SchedulerEngine<A> {
 }
 
 impl<A: DecoderAdapter> SchedulerEngine<A> {
+    /// Preallocates and engine-binds the sealed M5 timing observer.
+    #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+    #[doc(hidden)]
+    pub fn prepare_run_observer(&self) -> SchedulerResult<RunObserver> {
+        self.ensure_open()?;
+        let domain = self
+            .controls
+            .as_ref()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?
+            .checkpoint_domain();
+        RunObserver::try_bound(&self.config, domain)
+    }
+
+    #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+    fn validate_run_observer_domain(&self, observer: &RunObserver) -> SchedulerResult<()> {
+        let controls = self
+            .controls
+            .as_ref()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
+        if observer.belongs_to_registry(controls) {
+            Ok(())
+        } else {
+            Err(SchedulerError::invalid_request(
+                "run observer",
+                "belongs to another scheduler engine",
+            ))
+        }
+    }
+
     /// Fallibly preallocates every shared synchronous-core capacity.
     pub fn new(adapter: A, config: SchedulerConfig) -> SchedulerResult<Self> {
         if config.worker_count() != 1 {
@@ -870,6 +950,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 slot.free_position,
             )?);
             prepared_requests.push(PreparedBatchRequest {
+                offered_index: ordinal,
                 slot_index: slot.slot_index,
                 free_position: slot.free_position,
                 generation: slot.generation,
@@ -888,6 +969,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let control_registry = control_registry
             .as_mut()
             .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
+        #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+        let observation_domain = control_registry.checkpoint_domain();
         let controls = control_registry.begin_bind_batch(controls.into_prefix(accepted_count))?;
         let endpoint_registry = endpoint_registry
             .as_mut()
@@ -908,6 +991,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             rejection,
             offered_deadlines,
             offered_count: offers.len(),
+            #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+            observation_domain,
             ledger: ledger_permit,
         })
     }
@@ -1259,6 +1344,39 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         self.record_by_id(id)?.control.cancel()
     }
 
+    /// Publishes cancellation and records its successful CAS boundary with
+    /// the sealed M5 observer.
+    #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+    #[doc(hidden)]
+    pub fn cancel_observed(
+        &mut self,
+        id: crate::RequestId,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<CancelDisposition> {
+        self.validate_run_observer_domain(observer)?;
+        let clock = observer.clock();
+        let disposition = self.cancel(id)?;
+        let now_ns = clock.now_ns();
+        observer.cancellation(id, disposition, now_ns);
+        Ok(disposition)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_observed_with_clock_for_test<F>(
+        &mut self,
+        id: crate::RequestId,
+        clock: &F,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<CancelDisposition>
+    where
+        F: Fn() -> u64,
+    {
+        self.validate_run_observer_domain(observer)?;
+        let disposition = self.cancel(id)?;
+        observer.cancellation(id, disposition, clock());
+        Ok(disposition)
+    }
+
     #[allow(dead_code, reason = "used by the staged Tokio actor integration")]
     pub(crate) fn control_binding(&self, id: crate::RequestId) -> SchedulerResult<ControlBinding> {
         Ok(self.record_by_id(id)?.control.clone())
@@ -1279,32 +1397,32 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         observe_clock_value(&mut self.monotonic_ns, clock)
     }
 
-    fn fire_checkpoint<D: CheckpointDriver>(
+    fn fire_checkpoint<D: CheckpointDriver, O: StepObserver>(
         &mut self,
         checkpoints: &mut D,
         key: SlotKey,
         point: CheckpointPoint,
+        clock: &impl Fn() -> u64,
+        observer: &mut O,
     ) -> SchedulerResult<()> {
         let prior_ns = self.monotonic_ns;
-        let next_ns = {
+        let fire = {
             let record = self.record_for_key(key)?;
-            checkpoints.fire(CheckpointContext {
-                point,
-                slot: key,
-                request_id: record.request_id,
-                position: record.committed_positions,
-                control: &record.control,
-                deadline_ns: record.deadline_ns,
-                monotonic_ns: prior_ns,
-            })?
+            checkpoints.fire(
+                CheckpointContext {
+                    point,
+                    slot: key,
+                    request_id: record.request_id,
+                    position: record.committed_positions,
+                    control: &record.control,
+                    deadline_ns: record.deadline_ns,
+                    monotonic_ns: prior_ns,
+                },
+                clock,
+                observer,
+            )?
         };
-        if next_ns < prior_ns {
-            return Err(SchedulerError::internal(
-                "checkpoint instrumentation moved the clock backwards",
-            ));
-        }
-        self.monotonic_ns = next_ns;
-        Ok(())
+        apply_checkpoint_fire(&mut self.monotonic_ns, prior_ns, fire)
     }
 
     pub fn request_phase(&self, id: crate::RequestId) -> SchedulerResult<RequestPhase> {
@@ -1527,14 +1645,49 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .controls
             .as_ref()
             .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
-        if !plan.belongs_to(&controls.checkpoint_domain()) {
+        if !plan.belongs_to_registry(controls) {
             return Err(SchedulerError::invalid_request(
                 "checkpoint plan",
                 "belongs to another scheduler engine",
             ));
         }
         let fixed_ns = self.monotonic_ns;
-        self.step_with_clock_and_checkpoints(&|| fixed_ns, plan)
+        let mut observer = NullObserver;
+        self.step_with_clock_and_checkpoints(&|| fixed_ns, plan, &mut observer)
+    }
+
+    /// Executes one observed step with prevalidated deterministic barriers.
+    ///
+    /// This combined surface exists only for the frozen cancellation evidence
+    /// cell and internal lifecycle tests. Both instruments remain concrete,
+    /// engine-bound, and allocation-stable.
+    #[cfg(any(
+        test,
+        all(
+            feature = "deterministic-checkpoint-instrumentation",
+            feature = "m5-run-observer-instrumentation"
+        )
+    ))]
+    #[doc(hidden)]
+    pub fn step_with_checkpoint_plan_observed(
+        &mut self,
+        plan: &mut CheckpointPlan,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<StepReport> {
+        self.ensure_open()?;
+        let controls = self
+            .controls
+            .as_ref()
+            .ok_or_else(|| SchedulerError::internal("request controls are unavailable"))?;
+        if !plan.belongs_to_registry(controls) {
+            return Err(SchedulerError::invalid_request(
+                "checkpoint plan",
+                "belongs to another scheduler engine",
+            ));
+        }
+        self.validate_run_observer_domain(observer)?;
+        let clock = observer.clock();
+        self.step_with_clock_and_checkpoints(&|| clock.now_ns(), plan, observer)
     }
 
     /// Advances bounded admission and executes up to the configured number of
@@ -1553,17 +1706,44 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         F: Fn() -> u64,
     {
         let mut checkpoints = NoCheckpoints;
-        self.step_with_clock_and_checkpoints(clock, &mut checkpoints)
+        let mut observer = NullObserver;
+        self.step_with_clock_and_checkpoints(clock, &mut checkpoints, &mut observer)
     }
 
-    fn step_with_clock_and_checkpoints<F, D>(
+    /// Executes one timed direct-engine step with the sealed M5 observer.
+    #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+    #[doc(hidden)]
+    pub fn step_observed(&mut self, observer: &mut RunObserver) -> SchedulerResult<StepReport> {
+        self.validate_run_observer_domain(observer)?;
+        let clock = observer.clock();
+        let mut checkpoints = NoCheckpoints;
+        self.step_with_clock_and_checkpoints(&|| clock.now_ns(), &mut checkpoints, observer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_observed_with_clock_for_test<F>(
+        &mut self,
+        clock: &F,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<StepReport>
+    where
+        F: Fn() -> u64,
+    {
+        self.validate_run_observer_domain(observer)?;
+        let mut checkpoints = NoCheckpoints;
+        self.step_with_clock_and_checkpoints(clock, &mut checkpoints, observer)
+    }
+
+    fn step_with_clock_and_checkpoints<F, D, O>(
         &mut self,
         clock: &F,
         checkpoints: &mut D,
+        observer: &mut O,
     ) -> SchedulerResult<StepReport>
     where
         F: Fn() -> u64,
         D: CheckpointDriver,
+        O: StepObserver,
     {
         self.ensure_open()?;
         if self.adapter.is_none()
@@ -1611,11 +1791,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             &mut trace,
             clock,
             checkpoints,
+            observer,
         );
-        if result.is_err()
-            && let Err(cleanup) = self.recover_wave(&mut ring, &mut wave)
-        {
-            result = Err(cleanup);
+        let mut recovered_after_error = false;
+        if result.is_err() {
+            match self.recover_wave(&mut ring, &mut wave) {
+                Ok(()) => recovered_after_error = true,
+                Err(cleanup) => result = Err(cleanup),
+            }
         }
 
         self.adapter = Some(adapter);
@@ -1624,11 +1807,19 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         self.sampling = Some(sampling);
         self.wave = Some(wave);
         self.service_trace = Some(trace);
+        if recovered_after_error && observer.has_pending_worker_quiescence() {
+            // Error recovery cleared the reusable wave before this sample.
+            let quiescent_ns = clock();
+            observer.flush_worker_quiescence(quiescent_ns);
+        }
+        if let Ok(report) = &result {
+            observer.step(*report);
+        }
         result
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn step_with_resources<D: CheckpointDriver>(
+    fn step_with_resources<D: CheckpointDriver, O: StepObserver>(
         &mut self,
         adapter: &A,
         ring: &mut DrrRing,
@@ -1638,13 +1829,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         trace: &mut Vec<ServiceTraceEvent>,
         clock: &impl Fn() -> u64,
         checkpoints: &mut D,
+        observer: &mut O,
     ) -> SchedulerResult<StepReport> {
         let mut report = StepReport::default();
-        self.resolve_visible_controls(ring, &mut report, clock)?;
-        report.resumed_requests = self.resume_preempted(ring)?;
+        self.resolve_visible_controls(ring, &mut report, clock, observer)?;
+        report.resumed_requests = self.resume_preempted(ring, observer)?;
 
         for wave_index in 0..self.config.waves_per_step() {
-            self.promote_fifo(adapter, ring, &mut report, clock)?;
+            self.promote_fifo(adapter, ring, &mut report, clock, observer)?;
             if ring.is_empty() {
                 break;
             }
@@ -1660,19 +1852,22 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 clock,
                 checkpoints,
                 final_wave,
+                observer,
             )?;
             if selected == 0 {
                 break;
             }
             report.waves += 1;
-            self.resolve_visible_controls(ring, &mut report, clock)?;
+            self.resolve_visible_controls(ring, &mut report, clock, observer)?;
             if final_wave {
-                report.preempted_requests = self
-                    .slots
-                    .iter()
-                    .filter_map(|slot| slot.record.as_ref())
-                    .filter(|record| record.phase == RequestPhase::Preempted)
-                    .count();
+                let mut survivors = 0_usize;
+                for record in self.slots.iter().filter_map(|slot| slot.record.as_ref()) {
+                    if record.phase == RequestPhase::Preempted {
+                        survivors += 1;
+                        observer.preempted(record.request_id);
+                    }
+                }
+                report.preempted_requests = survivors;
             }
         }
         Ok(report)
@@ -1681,7 +1876,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     /// Resumes resident state only after the step's opening control scan.
     /// Ring membership, credit, adapter state, RNG, and ledger ownership never
     /// move across this allocation-free phase transition.
-    fn resume_preempted(&mut self, ring: &DrrRing) -> SchedulerResult<usize> {
+    fn resume_preempted<O: StepObserver>(
+        &mut self,
+        ring: &DrrRing,
+        observer: &mut O,
+    ) -> SchedulerResult<usize> {
         let mut preempted_slots = 0_usize;
         for slot in &self.slots {
             let Some(record) = slot.record.as_ref() else {
@@ -1737,16 +1936,18 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 && record.phase == RequestPhase::Preempted
             {
                 record.phase = RequestPhase::Ready;
+                observer.resumed(record.request_id);
             }
         }
         Ok(preempted_slots)
     }
 
-    fn resolve_visible_controls(
+    fn resolve_visible_controls<O: StepObserver>(
         &mut self,
         ring: &mut DrrRing,
         report: &mut StepReport,
         clock: &impl Fn() -> u64,
+        observer: &mut O,
     ) -> SchedulerResult<()> {
         for index in 0..self.slots.len() {
             let now = self.observe_clock(clock);
@@ -1763,7 +1964,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             };
             if let Some((key, outcome, disconnected)) = action {
                 if let Some(outcome) = outcome {
-                    self.terminalize_key(ring, key, outcome)?;
+                    self.terminalize_key_observed(ring, key, outcome, clock, observer)?;
                     report.terminal_decisions += 1;
                 } else {
                     let endpoint = self.record_for_key(key)?.endpoint.clone();
@@ -1778,7 +1979,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                         )?;
                     }
                     if endpoint.snapshot()?.reap_ready {
-                        self.reap_key(key)?;
+                        let request_id = self.reap_key(key)?;
+                        if observer.enabled() {
+                            let zero_ns = clock();
+                            observer.request_zero(request_id, zero_ns);
+                        }
                     }
                 }
             }
@@ -1786,12 +1991,13 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         Ok(())
     }
 
-    fn promote_fifo(
+    fn promote_fifo<O: StepObserver>(
         &mut self,
         adapter: &A,
         ring: &mut DrrRing,
         report: &mut StepReport,
         clock: &impl Fn() -> u64,
+        observer: &mut O,
     ) -> SchedulerResult<()> {
         while ring.len() < self.config.max_active_requests() {
             let Some(key) = self.queued.front().copied() else {
@@ -1800,7 +2006,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             let now = self.observe_clock(clock);
             let outcome = visible_control_outcome(self.record_for_key(key)?, now)?;
             if let Some(outcome) = outcome {
-                self.terminalize_key(ring, key, outcome)?;
+                self.terminalize_key_observed(ring, key, outcome, clock, observer)?;
                 report.terminal_decisions += 1;
                 continue;
             }
@@ -1823,7 +2029,13 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                     drop(ledger_permit);
                     let category =
                         SchedulerError::adapter("allocating request state", source).category();
-                    self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
+                    self.terminalize_key_observed(
+                        ring,
+                        key,
+                        TerminalOutcome::Failed { category },
+                        clock,
+                        observer,
+                    )?;
                     report.terminal_decisions += 1;
                     continue;
                 }
@@ -1861,12 +2073,13 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 ));
             }
             report.promoted_requests += 1;
+            observer.promotion(request_id);
         }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_wave<D: CheckpointDriver>(
+    fn execute_wave<D: CheckpointDriver, O: StepObserver>(
         &mut self,
         adapter: &A,
         ring: &mut DrrRing,
@@ -1878,6 +2091,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         clock: &impl Fn() -> u64,
         checkpoints: &mut D,
         preempt_after_commit: bool,
+        observer: &mut O,
     ) -> SchedulerResult<usize> {
         wave.reset().map_err(map_wave_error)?;
         if ring.current_epoch().is_none() && ring.open_round().map_err(map_ring_error)?.is_none() {
@@ -1922,7 +2136,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             if !runnable {
                 let progress = ring.mark_blocked(visit).map_err(map_ring_error)?;
                 if let Some(outcome) = control {
-                    self.terminalize_key(ring, key, outcome)?;
+                    self.terminalize_key_observed(ring, key, outcome, clock, observer)?;
                     report.terminal_decisions += 1;
                 }
                 if progress.is_closed() {
@@ -1940,12 +2154,24 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             };
             let (reservation, progress) = ring.mark_selected(visit).map_err(map_ring_error)?;
             let input_token = input_token(self.record_for_key(key)?)?;
+            let request_id = self.record_for_key(key)?.request_id;
+            let position = self.record_for_key(key)?.committed_positions;
+            if self.record_for_key(key)?.state.is_none() {
+                ring.recover_credit(reservation).map_err(map_ring_error)?;
+                return Err(SchedulerError::internal(
+                    "ready request has no adapter state",
+                ));
+            }
             self.record_mut_for_key(key)?.phase = RequestPhase::Preparing;
             let prepared = {
                 let record = self.record_for_key(key)?;
                 let state = record.state.as_ref().ok_or_else(|| {
                     SchedulerError::internal("ready request has no adapter state")
                 })?;
+                if observer.enabled() {
+                    let work_started_ns = clock();
+                    observer.work_start(request_id, position, work_started_ns);
+                }
                 adapter.prepare_token(state, input_token, workspace)
             };
             let prepared = match prepared {
@@ -1953,7 +2179,13 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 Err(source) => {
                     ring.recover_credit(reservation).map_err(map_ring_error)?;
                     let category = SchedulerError::adapter("preparing token", source).category();
-                    self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
+                    self.terminalize_key_observed(
+                        ring,
+                        key,
+                        TerminalOutcome::Failed { category },
+                        clock,
+                        observer,
+                    )?;
                     report.terminal_decisions += 1;
                     if progress.is_closed() {
                         break;
@@ -1973,12 +2205,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 || !bind_prepared_identity(self.record_mut_for_key(key)?, adapter_identity)
             {
                 ring.recover_credit(reservation).map_err(map_ring_error)?;
-                self.terminalize_key(
+                self.terminalize_key_observed(
                     ring,
                     key,
                     TerminalOutcome::Failed {
                         category: ErrorCategory::Internal,
                     },
+                    clock,
+                    observer,
                 )?;
                 report.terminal_decisions += 1;
                 if progress.is_closed() {
@@ -1991,12 +2225,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             let task_count = tasks.len();
             if task_count == 0 || task_count > self.config.max_tasks_per_token() {
                 ring.recover_credit(reservation).map_err(map_ring_error)?;
-                self.terminalize_key(
+                self.terminalize_key_observed(
                     ring,
                     key,
                     TerminalOutcome::Failed {
                         category: ErrorCategory::Internal,
                     },
+                    clock,
+                    observer,
                 )?;
                 report.terminal_decisions += 1;
                 if progress.is_closed() {
@@ -2022,12 +2258,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                     {
                         ring.recover_credit(reservation).map_err(map_ring_error)?;
                     }
-                    self.terminalize_key(
+                    self.terminalize_key_observed(
                         ring,
                         key,
                         TerminalOutcome::Failed {
                             category: ErrorCategory::Internal,
                         },
+                        clock,
+                        observer,
                     )?;
                     report.terminal_decisions += 1;
                     if progress.is_closed() {
@@ -2072,12 +2310,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 if let Some(reservation) = selection.reservation.take() {
                     ring.recover_credit(reservation).map_err(map_ring_error)?;
                 }
-                self.terminalize_key(
+                self.terminalize_key_observed(
                     ring,
                     key,
                     TerminalOutcome::Failed {
                         category: ErrorCategory::Internal,
                     },
+                    clock,
+                    observer,
                 )?;
                 report.terminal_decisions += 1;
             } else {
@@ -2094,6 +2334,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             return Ok(0);
         }
         report.selected_positions += selected_count;
+        observer.wave(selected_count);
         wave.sort_tasks().map_err(map_wave_error)?;
         #[cfg(test)]
         if take_wave_task_transaction_corruption_for_test() {
@@ -2106,7 +2347,13 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let mut suppressed_before_expert = [false; MAX_BATCH_WIDTH as usize];
         for (selection_index, selection) in wave.selections().iter().enumerate() {
             let key = selection.slot;
-            self.fire_checkpoint(checkpoints, key, CheckpointPoint::PostRouterPreExpert)?;
+            self.fire_checkpoint(
+                checkpoints,
+                key,
+                CheckpointPoint::PostRouterPreExpert,
+                clock,
+                observer,
+            )?;
             let now = self.observe_clock(clock);
             suppressed_before_expert[selection_index] =
                 visible_control_outcome(self.record_for_key(key)?, now)?.is_some();
@@ -2193,13 +2440,19 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             let control = visible_control_outcome(self.record_for_key(key)?, now)?;
             if let Some(category) = failure {
                 self.release_wave_selection(ring, wave, selection_index)?;
-                self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
+                self.terminalize_key_observed(
+                    ring,
+                    key,
+                    TerminalOutcome::Failed { category },
+                    clock,
+                    observer,
+                )?;
                 report.terminal_decisions += 1;
                 continue;
             }
             if let Some(outcome) = control {
                 self.release_wave_selection(ring, wave, selection_index)?;
-                self.terminalize_key(ring, key, outcome)?;
+                self.terminalize_wave_key_observed(ring, key, outcome, clock, observer)?;
                 report.terminal_decisions += 1;
                 continue;
             }
@@ -2216,7 +2469,13 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 Err(source) => {
                     self.release_wave_selection(ring, wave, selection_index)?;
                     let category = SchedulerError::adapter("finishing token", source).category();
-                    self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
+                    self.terminalize_key_observed(
+                        ring,
+                        key,
+                        TerminalOutcome::Failed { category },
+                        clock,
+                        observer,
+                    )?;
                     report.terminal_decisions += 1;
                     continue;
                 }
@@ -2228,22 +2487,30 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 || logits.iter().any(|value| !value.is_finite())
             {
                 self.release_wave_selection(ring, wave, selection_index)?;
-                self.terminalize_key(
+                self.terminalize_key_observed(
                     ring,
                     key,
                     TerminalOutcome::Failed {
                         category: ErrorCategory::Internal,
                     },
+                    clock,
+                    observer,
                 )?;
                 report.terminal_decisions += 1;
                 continue;
             }
             self.record_mut_for_key(key)?.phase = RequestPhase::ReadyToCommit;
-            self.fire_checkpoint(checkpoints, key, CheckpointPoint::ReadyToCommitPrePlan)?;
+            self.fire_checkpoint(
+                checkpoints,
+                key,
+                CheckpointPoint::ReadyToCommitPrePlan,
+                clock,
+                observer,
+            )?;
             let now = self.observe_clock(clock);
             if let Some(outcome) = visible_control_outcome(self.record_for_key(key)?, now)? {
                 self.release_wave_selection(ring, wave, selection_index)?;
-                self.terminalize_key(ring, key, outcome)?;
+                self.terminalize_wave_key_observed(ring, key, outcome, clock, observer)?;
                 report.terminal_decisions += 1;
                 continue;
             }
@@ -2263,18 +2530,34 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 Ok(PublicationPlan::OutputBlocked) => {
                     self.release_wave_selection(ring, wave, selection_index)?;
                     self.record_mut_for_key(key)?.phase = RequestPhase::OutputBlocked;
+                    if observer.enabled() {
+                        let record = self.record_for_key(key)?;
+                        observer.work_abandoned(record.request_id, record.committed_positions);
+                    }
                     continue;
                 }
                 Ok(PublicationPlan::Cancelled) => {
                     self.release_wave_selection(ring, wave, selection_index)?;
-                    self.terminalize_key(ring, key, TerminalOutcome::Cancelled)?;
+                    self.terminalize_wave_key_observed(
+                        ring,
+                        key,
+                        TerminalOutcome::Cancelled,
+                        clock,
+                        observer,
+                    )?;
                     report.terminal_decisions += 1;
                     continue;
                 }
                 Err(error) => {
                     self.release_wave_selection(ring, wave, selection_index)?;
                     let category = error.category();
-                    self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
+                    self.terminalize_key_observed(
+                        ring,
+                        key,
+                        TerminalOutcome::Failed { category },
+                        clock,
+                        observer,
+                    )?;
                     report.terminal_decisions += 1;
                     continue;
                 }
@@ -2283,7 +2566,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             if let Some(outcome) = visible_control_outcome(self.record_for_key(key)?, now)? {
                 drop(publication);
                 self.release_wave_selection(ring, wave, selection_index)?;
-                self.terminalize_key(ring, key, outcome)?;
+                self.terminalize_wave_key_observed(ring, key, outcome, clock, observer)?;
                 report.terminal_decisions += 1;
                 continue;
             }
@@ -2301,6 +2584,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 publication,
                 clock,
                 checkpoints,
+                observer,
             );
             match committed {
                 Ok(CommitDisposition::Applied {
@@ -2313,17 +2597,26 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                     }
                 }
                 Ok(CommitDisposition::Suppressed(outcome)) => {
-                    self.terminalize_key(ring, key, outcome)?;
+                    self.terminalize_wave_key_observed(ring, key, outcome, clock, observer)?;
                     report.terminal_decisions += 1;
                 }
                 Err(error) => {
                     let category = error.category();
-                    self.terminalize_key(ring, key, TerminalOutcome::Failed { category })?;
+                    self.terminalize_key_observed(
+                        ring,
+                        key,
+                        TerminalOutcome::Failed { category },
+                        clock,
+                        observer,
+                    )?;
                     report.terminal_decisions += 1;
                 }
             }
         }
         wave.reset().map_err(map_wave_error)?;
+        if observer.has_pending_worker_quiescence() {
+            observer.flush_worker_quiescence(clock());
+        }
         Ok(selected_count)
     }
 
@@ -2450,7 +2743,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn commit_publication<D: CheckpointDriver>(
+    fn commit_publication<D: CheckpointDriver, O: StepObserver>(
         &mut self,
         adapter: &A,
         ring: &mut DrrRing,
@@ -2461,6 +2754,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         publication: TokenPublication<'_>,
         clock: &impl Fn() -> u64,
         checkpoints: &mut D,
+        observer: &mut O,
     ) -> SchedulerResult<CommitDisposition> {
         let TokenPublication {
             position,
@@ -2530,6 +2824,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         let service_event = ServiceTraceEvent::new(request_id, position, service_phase);
         let deadline_ns = record.deadline_ns;
         let control = &record.control;
+        let emitted = endpoint_guard.expects_output();
         let mut release = Some(release);
         let mut endpoint_guard = Some(endpoint_guard);
         let (callback, adapter_result, terminal_outcome, checkpoint_error) = ring
@@ -2538,16 +2833,29 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 let mut checkpoint_error = None;
                 let adapter_result =
                     adapter.with_validated_state_commit(&mut state, pending, |adapter_permit| {
-                        match checkpoints.fire(CheckpointContext {
-                            point: CheckpointPoint::CompositePermitPreFinalSnapshot,
-                            slot: key,
-                            request_id,
-                            position,
-                            control,
-                            deadline_ns,
-                            monotonic_ns: *monotonic_ns,
-                        }) {
-                            Ok(next_ns) => *monotonic_ns = next_ns,
+                        let checkpoint_prior_ns = *monotonic_ns;
+                        match checkpoints.fire(
+                            CheckpointContext {
+                                point: CheckpointPoint::CompositePermitPreFinalSnapshot,
+                                slot: key,
+                                request_id,
+                                position,
+                                control,
+                                deadline_ns,
+                                monotonic_ns: *monotonic_ns,
+                            },
+                            clock,
+                            observer,
+                        ) {
+                            Ok(fire) => {
+                                if let Err(error) =
+                                    apply_checkpoint_fire(monotonic_ns, checkpoint_prior_ns, fire)
+                                {
+                                    checkpoint_error = Some(error);
+                                    drop(adapter_permit);
+                                    return;
+                                }
+                            }
                             Err(error) => {
                                 checkpoint_error = Some(error);
                                 drop(adapter_permit);
@@ -2556,16 +2864,29 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                         }
                         let now = observe_clock_value(monotonic_ns, clock);
                         let snapshot = control.fresh_snapshot_prevalidated();
-                        match checkpoints.fire(CheckpointContext {
-                            point: CheckpointPoint::PostFinalSnapshot,
-                            slot: key,
-                            request_id,
-                            position,
-                            control,
-                            deadline_ns,
-                            monotonic_ns: *monotonic_ns,
-                        }) {
-                            Ok(next_ns) => *monotonic_ns = next_ns,
+                        let checkpoint_prior_ns = *monotonic_ns;
+                        match checkpoints.fire(
+                            CheckpointContext {
+                                point: CheckpointPoint::PostFinalSnapshot,
+                                slot: key,
+                                request_id,
+                                position,
+                                control,
+                                deadline_ns,
+                                monotonic_ns: *monotonic_ns,
+                            },
+                            clock,
+                            observer,
+                        ) {
+                            Ok(fire) => {
+                                if let Err(error) =
+                                    apply_checkpoint_fire(monotonic_ns, checkpoint_prior_ns, fire)
+                                {
+                                    checkpoint_error = Some(error);
+                                    drop(adapter_permit);
+                                    return;
+                                }
+                            }
                             Err(error) => {
                                 checkpoint_error = Some(error);
                                 drop(adapter_permit);
@@ -2634,6 +2955,13 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                     && let Some(guard) = endpoint_guard.take()
                 {
                     guard.publish(terminal);
+                    if observer.enabled() {
+                        let committed_ns = clock();
+                        observer.commit(request_id, position, service_phase, emitted, committed_ns);
+                        if let Some(terminal) = terminal {
+                            observer.terminal(terminal, committed_ns);
+                        }
+                    }
                 }
                 (callback, adapter_result, terminal_outcome, checkpoint_error)
             })
@@ -2694,11 +3022,15 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         wave.reset().map_err(map_wave_error)
     }
 
-    fn terminalize_key(
+    #[allow(clippy::too_many_arguments)]
+    fn terminalize_key<O: StepObserver>(
         &mut self,
         ring: &mut DrrRing,
         key: SlotKey,
         outcome: TerminalOutcome,
+        clock: &impl Fn() -> u64,
+        observer: &mut O,
+        defer_worker_quiescence: bool,
     ) -> SchedulerResult<()> {
         if self.record_for_key(key)?.phase == RequestPhase::Terminal {
             return Ok(());
@@ -2758,6 +3090,13 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         );
         release.apply();
         endpoint_guard.publish_terminal(terminal);
+        if observer.enabled() {
+            let decided_ns = clock();
+            observer.terminal(terminal, decided_ns);
+            if outcome == TerminalOutcome::Cancelled && !defer_worker_quiescence {
+                observer.worker_quiescent(record.request_id, decided_ns);
+            }
+        }
         if control_snapshot.disconnected() {
             let report = endpoint.settle_disconnected()?;
             validate_endpoint_discard(
@@ -2770,11 +3109,57 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         Ok(())
     }
 
+    fn terminalize_key_observed<O: StepObserver>(
+        &mut self,
+        ring: &mut DrrRing,
+        key: SlotKey,
+        outcome: TerminalOutcome,
+        clock: &impl Fn() -> u64,
+        observer: &mut O,
+    ) -> SchedulerResult<()> {
+        self.terminalize_key_with_observer(ring, key, outcome, clock, observer, false)
+    }
+
+    fn terminalize_wave_key_observed<O: StepObserver>(
+        &mut self,
+        ring: &mut DrrRing,
+        key: SlotKey,
+        outcome: TerminalOutcome,
+        clock: &impl Fn() -> u64,
+        observer: &mut O,
+    ) -> SchedulerResult<()> {
+        self.terminalize_key_with_observer(ring, key, outcome, clock, observer, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn terminalize_key_with_observer<O: StepObserver>(
+        &mut self,
+        ring: &mut DrrRing,
+        key: SlotKey,
+        outcome: TerminalOutcome,
+        clock: &impl Fn() -> u64,
+        observer: &mut O,
+        defer_worker_quiescence: bool,
+    ) -> SchedulerResult<()> {
+        self.terminalize_key(ring, key, outcome, clock, observer, defer_worker_quiescence)
+    }
+
     /// Drains at most `limit` already committed output events.
     pub fn drain_events(
         &mut self,
         id: crate::RequestId,
         limit: usize,
+    ) -> SchedulerResult<Vec<OutputEvent>> {
+        let mut observer = NullObserver;
+        self.drain_events_with_observer(id, limit, &|| 0, &mut observer)
+    }
+
+    fn drain_events_with_observer<O: StepObserver>(
+        &mut self,
+        id: crate::RequestId,
+        limit: usize,
+        clock: &impl Fn() -> u64,
+        observer: &mut O,
     ) -> SchedulerResult<Vec<OutputEvent>> {
         let key = self.record_by_id(id)?.key;
         let count = self
@@ -2826,15 +3211,58 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             self.record_mut_for_key(key)?.phase = RequestPhase::Ready;
         }
         if endpoint.reap_ready {
-            self.reap_key(key)?;
+            let request_id = self.reap_key(key)?;
+            if observer.enabled() {
+                observer.request_zero(request_id, clock());
+            }
         }
         Ok(drained)
+    }
+
+    /// Drains committed events while timestamping a resulting ownership-zero
+    /// reap for the sealed M5 observer.
+    #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+    #[doc(hidden)]
+    pub fn drain_events_observed(
+        &mut self,
+        id: crate::RequestId,
+        limit: usize,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<Vec<OutputEvent>> {
+        self.validate_run_observer_domain(observer)?;
+        let clock = observer.clock();
+        self.drain_events_with_observer(id, limit, &|| clock.now_ns(), observer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_events_observed_with_clock_for_test<F>(
+        &mut self,
+        id: crate::RequestId,
+        limit: usize,
+        clock: &F,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<Vec<OutputEvent>>
+    where
+        F: Fn() -> u64,
+    {
+        self.validate_run_observer_domain(observer)?;
+        self.drain_events_with_observer(id, limit, clock, observer)
     }
 
     /// Takes a terminal result once, independently of buffered output.
     pub fn take_terminal(
         &mut self,
         id: crate::RequestId,
+    ) -> SchedulerResult<Option<TerminalResult>> {
+        let mut observer = NullObserver;
+        self.take_terminal_with_observer(id, &|| 0, &mut observer)
+    }
+
+    fn take_terminal_with_observer<O: StepObserver>(
+        &mut self,
+        id: crate::RequestId,
+        clock: &impl Fn() -> u64,
+        observer: &mut O,
     ) -> SchedulerResult<Option<TerminalResult>> {
         let key = self.record_by_id(id)?.key;
         let result = {
@@ -2862,12 +3290,43 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             result
         };
         if self.record_for_key(key)?.endpoint.snapshot()?.reap_ready {
-            self.reap_key(key)?;
+            let request_id = self.reap_key(key)?;
+            if observer.enabled() {
+                observer.request_zero(request_id, clock());
+            }
         }
         Ok(result)
     }
 
-    fn reap_key(&mut self, key: SlotKey) -> SchedulerResult<()> {
+    /// Takes a terminal value while timestamping a resulting ownership-zero
+    /// reap for the sealed M5 observer.
+    #[cfg(any(test, feature = "m5-run-observer-instrumentation"))]
+    #[doc(hidden)]
+    pub fn take_terminal_observed(
+        &mut self,
+        id: crate::RequestId,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<Option<TerminalResult>> {
+        self.validate_run_observer_domain(observer)?;
+        let clock = observer.clock();
+        self.take_terminal_with_observer(id, &|| clock.now_ns(), observer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_terminal_observed_with_clock_for_test<F>(
+        &mut self,
+        id: crate::RequestId,
+        clock: &F,
+        observer: &mut RunObserver,
+    ) -> SchedulerResult<Option<TerminalResult>>
+    where
+        F: Fn() -> u64,
+    {
+        self.validate_run_observer_domain(observer)?;
+        self.take_terminal_with_observer(id, clock, observer)
+    }
+
+    fn reap_key(&mut self, key: SlotKey) -> SchedulerResult<crate::RequestId> {
         let index = key.index();
         let slot = self
             .slots
@@ -2923,11 +3382,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         self.free_slots.push(index);
         drop(record);
         release.apply();
-        Ok(())
+        Ok(request_id)
     }
 
     fn discard_and_reap_key(&mut self, key: SlotKey) -> SchedulerResult<()> {
-        self.reap_key(key)
+        self.reap_key(key).map(|_| ())
     }
 
     /// Closes the engine, resolves all requests, and releases all declared
@@ -2959,6 +3418,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             .ring
             .take()
             .ok_or_else(|| SchedulerError::internal("scheduler ring is unavailable"))?;
+        let fixed_ns = self.monotonic_ns;
+        let mut observer = NullObserver;
         let cleanup = (|| -> SchedulerResult<()> {
             for index in 0..self.slots.len() {
                 let decision = self.slots[index]
@@ -2967,7 +3428,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                     .filter(|record| record.phase != RequestPhase::Terminal)
                     .map(|record| record.key);
                 if let Some(key) = decision {
-                    self.terminalize_key(&mut ring, key, TerminalOutcome::Cancelled)?;
+                    self.terminalize_key(
+                        &mut ring,
+                        key,
+                        TerminalOutcome::Cancelled,
+                        &|| fixed_ns,
+                        &mut observer,
+                        false,
+                    )?;
                     terminated_requests += 1;
                 }
             }
@@ -3209,6 +3677,7 @@ struct PreparedSlot {
 }
 
 struct PreparedBatchRequest<A: DecoderAdapter> {
+    offered_index: usize,
     slot_index: usize,
     free_position: usize,
     generation: SlotGeneration,
@@ -3459,6 +3928,21 @@ fn validate_endpoint_reap(
 fn observe_clock_value(last_seen_ns: &mut u64, clock: &impl Fn() -> u64) -> u64 {
     *last_seen_ns = (*last_seen_ns).max(clock());
     *last_seen_ns
+}
+
+fn apply_checkpoint_fire(
+    monotonic_ns: &mut u64,
+    prior_ns: u64,
+    fire: CheckpointFire,
+) -> SchedulerResult<()> {
+    let next_ns = fire.monotonic_ns();
+    if next_ns < prior_ns {
+        return Err(SchedulerError::internal(
+            "checkpoint instrumentation moved the clock backwards",
+        ));
+    }
+    *monotonic_ns = next_ns;
+    Ok(())
 }
 
 fn ensure_request_lifecycle_feasible<const BASE: usize, const ACTIVE: usize>(
