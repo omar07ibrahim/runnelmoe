@@ -338,6 +338,9 @@ pub enum RequestPhase {
     Preparing,
     ExpertOwned,
     ReadyToCommit,
+    /// A complete position committed at the deterministic engine-step budget;
+    /// active state remains resident until the next control-first resume.
+    Preempted,
     OutputBlocked,
     Terminal,
 }
@@ -453,25 +456,46 @@ impl TerminalResult {
 /// Aggregate result of one deterministic engine step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StepReport {
+    /// Admission-FIFO records made resident during this step.
     pub promoted_requests: usize,
+    /// Non-empty model waves executed during this step.
     pub waves: usize,
+    /// Model positions selected into authenticated wave ownership.
     pub selected_positions: usize,
+    /// Expert tasks that reached the adapter.
     pub expert_tasks: usize,
+    /// Contiguous expert-ID groups presented to the adapter.
     pub expert_groups: usize,
+    /// Positions atomically committed to canonical request state.
     pub committed_positions: usize,
+    /// Requests still resident-preempted after the final control scan.
+    pub preempted_requests: usize,
+    /// Resident-preempted requests resumed after the opening control scan.
+    pub resumed_requests: usize,
+    /// Requests given an irrevocable terminal outcome during this step.
     pub terminal_decisions: usize,
 }
 
 /// Allocation-free control-plane snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EngineSnapshot {
+    /// Greatest monotonic nanosecond value observed by the engine.
     pub monotonic_ns: u64,
+    /// Whether shutdown has closed this engine to new work.
     pub closed: bool,
+    /// Accepted requests still waiting in the admission FIFO.
     pub queued_requests: usize,
+    /// Resident nonterminal requests, including blocked and preempted records.
     pub active_requests: usize,
+    /// Resident requests awaiting a control-first next-step resume.
+    pub preempted_requests: usize,
+    /// Resident requests whose bounded output endpoint is full.
     pub output_blocked_requests: usize,
+    /// Terminal results not yet acknowledged by their consumer.
     pub retained_terminal_results: usize,
+    /// Current total logical bytes across shared and request owners.
     pub ledger_used_bytes: usize,
+    /// Historical peak total logical bytes.
     pub ledger_peak_bytes: usize,
 }
 

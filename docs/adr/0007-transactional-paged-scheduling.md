@@ -331,7 +331,9 @@ The request lifecycle is:
 
 ```text
 validated -> queued -> admitted -> preparing -> expert_owned
-          -> ready_to_commit -> ready | output_blocked | terminal
+          -> ready_to_commit -> ready | preempted | output_blocked | terminal
+preempted -> control scan -> ready | terminal
+output_blocked -> receiver progress/control scan -> ready | terminal
 ```
 
 Before the linearization point, the actor must hold:
@@ -377,6 +379,53 @@ run and shutdown cannot report complete reclamation then. Evidence reports
 both `request_owned_zero - cancel_linearized` and
 `worker_quiescent - cancel_linearized`.
 
+### Deterministic cooperative preemption
+
+`waves_per_step` is the closed scheduler-pump budget. A successful,
+non-terminal position committed in the final configured wave enters
+`preempted` atomically with its adapter-state, RNG, output, service-credit, and
+service-trace commit. The engine then returns to its owner, allowing the actor
+to service already bounded command/control work before the next pump. A
+reported survivor selects an explicit Tokio cooperative yield before that
+next blocking pump. A completion, full output queue, cancellation, deadline,
+or contained adapter failure takes precedence over `preempted`.
+
+This is resident cooperative preemption, not state eviction. The request keeps
+its exact ring member, cursor/epoch relationship, zero post-commit deficit,
+adapter state and binding, prompt and active reservations, output endpoint,
+sampling state, and ledger ownership. It is never removed and reinserted and
+does not pass through the admission FIFO. At the next pump the engine first
+resolves cancellation and inclusive deadlines while the request is still
+`preempted`; only surviving requests make one allocation-free transition to
+`ready` before a ring visit. The two-pass resume audit validates all resident
+owners and the complete ring/queue relationship before changing any phase, so
+an invariant failure cannot partially resume a batch.
+
+The stable mechanism identifier is
+`resident-step-budget-preemption-v1`. `batch_width <= 8` and
+`waves_per_step <= 4` bound one pump to 32 selected positions, four positions
+per request, and at most eight preempted survivors.
+
+`StepReport.preempted_requests` counts requests that remain `preempted` after
+the final wave's post-commit control scan, not transient planned transitions;
+these are precisely the survivors that force an actor cooperative yield.
+`StepReport.resumed_requests` counts the control-cleared transitions at the
+next opening boundary.
+`EngineSnapshot.preempted_requests` is the current resident count and those
+requests also contribute to `active_requests`, preserving actor liveness. A
+post-final-snapshot cancellation can therefore commit one position and report
+zero preemptions when the same step immediately terminalizes it. Preemption
+and resume add no service event, ledger mutation, RNG transition, output, or
+allocation. Step-partition tests require identical service traces, terminals,
+and greedy and seeded tokens for one versus four waves under both policies.
+
+The FIFO comparison policy deliberately retains its run-to-completion ring
+order across a pump yield; the continuous policy retains its DRR cursor and can
+serve the next due member after the yield. Reclaiming opaque adapter state or
+swapping it to another tier would require a separately authenticated
+snapshot/restore ABI and explicit storage accounting. That is not claimed by
+this M5 mechanism.
+
 ### Backpressure and bounded Tokio owner
 
 The production owner is a thin Tokio actor around the deterministic engine.
@@ -413,6 +462,21 @@ current value; `u64::MAX` is a valid terminal clock value after which no larger
 advance exists. `now >= deadline` is expired. Duration and absolute-time
 arithmetic is checked. Tests use a manual clock and deterministic gates rather
 than sleeps.
+
+The deadline lifecycle matrix is explicit and prefix-preserving:
+
+| observed state | deterministic gate |
+| --- | --- |
+| queued | inclusive expiry before promotion in `cancellation_and_deadlines_are_inclusive_with_cancellation_precedence` |
+| active/ready | non-head expiry without service in `fifo_non_head_deadline_terminalizes_without_receiving_service` |
+| expert-owned | `PostRouterPreExpert` expiry in `cancellation_and_deadline_actions_suppress_each_preapply_checkpoint_exactly` |
+| ready-to-commit | `ReadyToCommitPrePlan` and `CompositePermitPreFinalSnapshot` expiry in the same checkpoint matrix |
+| output-blocked | committed-prefix expiry in `output_blocked_cancellation_and_deadline_preserve_the_committed_prefix` |
+| preempted | control-first expiry and cancellation precedence in `preempted_controls_win_before_resume_and_preserve_the_committed_prefix` |
+
+The manual clock is inclusive in every row. No suppressed position changes
+state, RNG, output, service credit, or trace; any earlier committed prefix
+remains drainable and is reported by the terminal result.
 
 ### Sealed deterministic checkpoint instrumentation
 
@@ -460,9 +524,11 @@ slot generations; duplicate/limit/deadline validation; and balanced request
 ownership. A separate scalar tiny-v3 integration workload freezes 12 `P(896)`
 requests with queued cancellation plus post-final/pre-apply position 0,
 post-router/pre-expert position 8, and composite-permit position 895 actions.
-This closes the transaction-boundary injection mechanism only. Deterministic
-preemption, the remaining lifecycle-state deadline matrix, and accepted M5
-timing evidence remain explicit gates.
+This closes the transaction-boundary injection mechanism. Together with the
+public queued, ready, output-blocked, and preempted manual-clock tests, it also
+closes the lifecycle-state deadline matrix and resident cooperative-preemption
+correctness gate. The run-level timing observer and accepted M5 evidence remain
+explicit gates.
 
 ### Seeded sampling
 

@@ -642,6 +642,7 @@ fn cancellation_during_adapter_validation_suppresses_commit_and_recovers_ring_cr
 
     assert_eq!(report.selected_positions, 2);
     assert_eq!(report.committed_positions, 1);
+    assert_eq!(report.preempted_requests, 1);
     assert_eq!(report.terminal_decisions, 1);
     assert_eq!(apply_count.load(Ordering::Acquire), 1);
     assert_eq!(
@@ -650,12 +651,13 @@ fn cancellation_during_adapter_validation_suppresses_commit_and_recovers_ring_cr
     );
     assert_eq!(
         engine.request_phase(sibling).expect("sibling phase"),
-        RequestPhase::Ready
+        RequestPhase::Preempted
     );
 
     let recovery = engine.step().expect("ring service after suppression");
     assert_eq!(recovery.selected_positions, 1);
     assert_eq!(recovery.committed_positions, 1);
+    assert_eq!(recovery.resumed_requests, 1);
     assert_eq!(recovery.terminal_decisions, 1);
     assert_eq!(apply_count.load(Ordering::Acquire), 2);
     assert_no_active_request_ownership(&engine);
@@ -693,6 +695,64 @@ fn cancellation_during_adapter_validation_suppresses_commit_and_recovers_ring_cr
     assert_eq!(sibling_terminal.committed_positions(), 2);
     assert_eq!(sibling_terminal.emitted_tokens(), 2);
     assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn preempted_resume_audit_is_atomic_when_a_later_member_is_missing() {
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let expert_count = Arc::new(AtomicUsize::new(0));
+    let mut engine =
+        new_checkpoint_engine(2, 1, Arc::clone(&apply_count), Arc::clone(&expert_count));
+    let requests = [0_u32, 1_u32].map(|token| {
+        engine
+            .try_submit(RequestSpec::new(&[token], 2, SamplingPolicy::Greedy, None))
+            .expect("accepted resume-audit request")
+    });
+
+    let first = engine.step().expect("preempt both audit requests");
+    assert_eq!(first.committed_positions, 2);
+    assert_eq!(first.preempted_requests, 2);
+    assert_eq!(first.terminal_decisions, 0);
+    assert_eq!(apply_count.load(Ordering::Acquire), 2);
+    assert_eq!(expert_count.load(Ordering::Acquire), 2);
+    assert!(requests.iter().copied().all(|request| {
+        engine.request_phase(request).expect("preempted phase") == RequestPhase::Preempted
+    }));
+    let before_snapshot = engine.snapshot();
+    let before_ledger = engine.ledger_snapshot();
+    let before_trace = engine
+        .service_trace_since(ServiceTraceCursor::origin())
+        .expect("pre-corruption service trace")
+        .events()
+        .to_vec();
+
+    engine
+        .remove_preempted_membership_for_test(requests[1])
+        .expect("remove later resident membership");
+    let error = engine
+        .step()
+        .expect_err("resume audit must reject incomplete membership");
+    assert_eq!(error.category(), ErrorCategory::Internal);
+    assert_eq!(engine.snapshot(), before_snapshot);
+    assert_eq!(engine.ledger_snapshot(), before_ledger);
+    assert_eq!(
+        engine
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect("post-corruption service trace")
+            .events(),
+        before_trace
+    );
+    assert!(requests.iter().copied().all(|request| {
+        engine.request_phase(request).expect("atomic audit phase") == RequestPhase::Preempted
+    }));
+    assert_eq!(apply_count.load(Ordering::Acquire), 2);
+    assert_eq!(expert_count.load(Ordering::Acquire), 2);
+
+    let shutdown = engine.shutdown().expect("corrupted audit shutdown");
+    assert_eq!(shutdown.terminated_requests, 2);
+    assert_eq!(shutdown.discarded_output_events, 2);
+    assert_eq!(shutdown.remaining_shared_bytes, 0);
+    assert_eq!(engine.ledger_snapshot().total_used(), 0);
 }
 
 #[test]
@@ -824,6 +884,8 @@ fn cancellation_after_the_final_snapshot_loses_to_the_committed_position() {
             expert_tasks: 1,
             expert_groups: 1,
             committed_positions: 1,
+            preempted_requests: 0,
+            resumed_requests: 0,
             terminal_decisions: 1,
         }
     );
@@ -916,6 +978,8 @@ fn concrete_checkpoint_plan_is_ordered_redacted_and_allocation_stable() {
             expert_tasks: 1,
             expert_groups: 1,
             committed_positions: 1,
+            preempted_requests: 0,
+            resumed_requests: 0,
             terminal_decisions: 1,
         }
     );
@@ -1272,6 +1336,8 @@ fn post_final_checkpoint_actions_lose_exactly_one_emitting_position() {
                 expert_tasks: 1,
                 expert_groups: 1,
                 committed_positions: 1,
+                preempted_requests: 0,
+                resumed_requests: 0,
                 terminal_decisions: 1,
             }
         );
@@ -1445,6 +1511,8 @@ fn output_blocked_cancellation_and_deadline_preserve_the_committed_prefix() {
                 expert_tasks: 0,
                 expert_groups: 0,
                 committed_positions: 0,
+                preempted_requests: 0,
+                resumed_requests: 0,
                 terminal_decisions: 1,
             }
         );
@@ -1599,6 +1667,8 @@ fn stale_task_transaction_is_rejected_before_expert_execution_and_sibling_progre
             expert_tasks: 1,
             expert_groups: 1,
             committed_positions: 1,
+            preempted_requests: 0,
+            resumed_requests: 0,
             terminal_decisions: 2,
         }
     );

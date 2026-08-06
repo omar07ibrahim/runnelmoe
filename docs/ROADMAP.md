@@ -95,8 +95,9 @@ close the implementation, correctness, and custody gates.
   conservative claim rules are preregistered in
   [ADR-0007](adr/0007-transactional-paged-scheduling.md).
 - [ ] Chunked prefill and bounded paged state preserve single-request parity.
-- [ ] Continuous batching, expert coalescing, deterministic preemption,
-  cancellation, backpressure, and seeded sampling pass stress tests.
+- [x] Continuous batching, expert coalescing, resident deterministic
+  preemption, cancellation, backpressure, and seeded sampling pass stress
+  tests.
 - [ ] Evidence reports TTFT, prefill/decode throughput, p50/p95, fairness, and
   observed memory ceilings.
 

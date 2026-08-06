@@ -277,13 +277,18 @@ generation-bound, allocates only during bounded preparation, redacts targets,
 and adds no callback or dynamic-dispatch path to ordinary execution. The
 concurrent actor uses a preallocated generation-tagged submission table,
 ready-commit FIFO, direct request controls/endpoints, origin-relative Tokio
-deadlines, and one awaited blocking engine pump at a time. Responded commands retain their
-slots until consumed or abandoned, and cooperative shutdown waits for command
-claims and live endpoint ownership before destructive teardown. The
-deterministic-preemption gate, remaining lifecycle-state deadline matrix,
-run-level timing observer, and accepted evidence remain incomplete until the
-rest of M5 lands. Weights remain eagerly resident in M5, so live cache-leased
-expert execution remains an explicit system gap.
+deadlines, and one awaited blocking engine pump at a time. Responded commands
+retain their slots until consumed or abandoned, and cooperative shutdown waits
+for command claims and live endpoint ownership before destructive teardown. The
+resident deterministic-preemption gate yields at the exact configured pump
+budget, resolves controls before resume, preserves ring and ledger ownership,
+and is trace/token neutral across step partitions. Manual-clock tests cover
+queued, ready, expert-owned, ready-to-commit, output-blocked, and preempted
+states. This mechanism does not evict opaque adapter state; authenticated
+state snapshot/restore remains a future ABI boundary. The run-level timing
+observer and accepted evidence remain incomplete until the rest of M5 lands.
+Weights remain eagerly resident in M5, so live cache-leased expert execution
+remains an explicit system gap.
 
 The service trace is a bounded semantic commit log, not a timer. Its public
 direct-engine surface borrows an immutable suffix from an opaque ordinal cursor;

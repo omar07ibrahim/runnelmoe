@@ -1316,6 +1316,26 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         Ok(self.record_by_id(id)?.rng_state)
     }
 
+    #[cfg(test)]
+    pub(crate) fn remove_preempted_membership_for_test(
+        &mut self,
+        id: crate::RequestId,
+    ) -> SchedulerResult<()> {
+        let record = self.record_by_id(id)?;
+        if record.phase != RequestPhase::Preempted {
+            return Err(SchedulerError::internal(
+                "test corruption target is not preempted",
+            ));
+        }
+        let key = record.key;
+        self.ring
+            .as_mut()
+            .ok_or_else(|| SchedulerError::internal("scheduler ring is unavailable"))?
+            .remove(key)
+            .map_err(map_ring_error)?;
+        Ok(())
+    }
+
     /// Returns the exact engine admission boundary recorded for this request.
     pub fn admitted_ns(&self, id: crate::RequestId) -> SchedulerResult<u64> {
         Ok(self.record_by_id(id)?.admitted_ns)
@@ -1329,6 +1349,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     pub fn snapshot(&self) -> EngineSnapshot {
         let ledger = self.ledger.snapshot();
         let mut active = 0_usize;
+        let mut preempted = 0_usize;
         let mut output_blocked = 0_usize;
         let terminals = self
             .endpoints
@@ -1341,6 +1362,10 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                     | RequestPhase::Preparing
                     | RequestPhase::ExpertOwned
                     | RequestPhase::ReadyToCommit => active += 1,
+                    RequestPhase::Preempted => {
+                        active += 1;
+                        preempted += 1;
+                    }
                     RequestPhase::OutputBlocked => {
                         active += 1;
                         output_blocked += 1;
@@ -1355,6 +1380,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             closed: self.closed,
             queued_requests: self.queued.len(),
             active_requests: active,
+            preempted_requests: preempted,
             output_blocked_requests: output_blocked,
             retained_terminal_results: terminals,
             ledger_used_bytes: usize::try_from(ledger.total_used()).unwrap_or(usize::MAX),
@@ -1615,12 +1641,14 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     ) -> SchedulerResult<StepReport> {
         let mut report = StepReport::default();
         self.resolve_visible_controls(ring, &mut report, clock)?;
+        report.resumed_requests = self.resume_preempted(ring)?;
 
-        for _ in 0..self.config.waves_per_step() {
+        for wave_index in 0..self.config.waves_per_step() {
             self.promote_fifo(adapter, ring, &mut report, clock)?;
             if ring.is_empty() {
                 break;
             }
+            let final_wave = wave_index + 1 == self.config.waves_per_step();
             let selected = self.execute_wave(
                 adapter,
                 ring,
@@ -1631,14 +1659,87 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
                 &mut report,
                 clock,
                 checkpoints,
+                final_wave,
             )?;
             if selected == 0 {
                 break;
             }
             report.waves += 1;
             self.resolve_visible_controls(ring, &mut report, clock)?;
+            if final_wave {
+                report.preempted_requests = self
+                    .slots
+                    .iter()
+                    .filter_map(|slot| slot.record.as_ref())
+                    .filter(|record| record.phase == RequestPhase::Preempted)
+                    .count();
+            }
         }
         Ok(report)
+    }
+
+    /// Resumes resident state only after the step's opening control scan.
+    /// Ring membership, credit, adapter state, RNG, and ledger ownership never
+    /// move across this allocation-free phase transition.
+    fn resume_preempted(&mut self, ring: &DrrRing) -> SchedulerResult<usize> {
+        let mut preempted_slots = 0_usize;
+        for slot in &self.slots {
+            let Some(record) = slot.record.as_ref() else {
+                continue;
+            };
+            if record.phase != RequestPhase::Preempted {
+                continue;
+            }
+            if record.state.is_none()
+                || record.active_reservation.is_none()
+                || record.adapter_binding.is_none()
+                || record.prompt.is_none()
+                || record.prompt_reservation.is_none()
+                || record.retained_reservation.is_none()
+            {
+                return Err(SchedulerError::internal(
+                    "preempted request lost active ownership",
+                ));
+            }
+            preempted_slots += 1;
+        }
+        for key in &self.queued {
+            if self.record_for_key(*key)?.phase == RequestPhase::Preempted {
+                return Err(SchedulerError::internal(
+                    "preempted request re-entered the admission queue",
+                ));
+            }
+        }
+        let mut preempted_members = 0_usize;
+        for (key, request_id, has_reservation, deficit) in ring.member_states() {
+            let record = self.record_for_key(key)?;
+            if record.request_id != request_id {
+                return Err(SchedulerError::internal(
+                    "resident ring identity does not match request slot",
+                ));
+            }
+            if record.phase == RequestPhase::Preempted {
+                if has_reservation || deficit != 0 {
+                    return Err(SchedulerError::internal(
+                        "preempted request retains unapplied service credit",
+                    ));
+                }
+                preempted_members += 1;
+            }
+        }
+        if preempted_members != preempted_slots {
+            return Err(SchedulerError::internal(
+                "preempted request lost resident ring membership",
+            ));
+        }
+        for slot in &mut self.slots {
+            if let Some(record) = slot.record.as_mut()
+                && record.phase == RequestPhase::Preempted
+            {
+                record.phase = RequestPhase::Ready;
+            }
+        }
+        Ok(preempted_slots)
     }
 
     fn resolve_visible_controls(
@@ -1776,6 +1877,7 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         report: &mut StepReport,
         clock: &impl Fn() -> u64,
         checkpoints: &mut D,
+        preempt_after_commit: bool,
     ) -> SchedulerResult<usize> {
         wave.reset().map_err(map_wave_error)?;
         if ring.current_epoch().is_none() && ring.open_round().map_err(map_ring_error)?.is_none() {
@@ -2148,8 +2250,11 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             let endpoint = self.record_for_key(key)?.endpoint.clone();
             let publication = match self.plan_publication(
                 adapter,
-                key,
-                pending_identity,
+                PublicationContext {
+                    key,
+                    identity: pending_identity,
+                    preempt_after_commit,
+                },
                 logits,
                 sampling,
                 &endpoint,
@@ -2225,12 +2330,16 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
     fn plan_publication<'endpoint>(
         &self,
         adapter: &A,
-        key: SlotKey,
-        identity: AdapterWorkIdentity,
+        context: PublicationContext,
         logits: &[f32],
         sampling: &mut SamplingWorkspace,
         endpoint: &'endpoint EndpointProducer,
     ) -> SchedulerResult<PublicationPlan<'endpoint>> {
+        let PublicationContext {
+            key,
+            identity,
+            preempt_after_commit,
+        } = context;
         let record = self.record_for_key(key)?;
         let next_position = record
             .committed_positions
@@ -2309,6 +2418,8 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
             RequestPhase::Terminal
         } else if output_full_after_publish {
             RequestPhase::OutputBlocked
+        } else if preempt_after_commit {
+            RequestPhase::Preempted
         } else {
             RequestPhase::Ready
         };
@@ -3152,6 +3263,12 @@ struct RequestRecord<A: DecoderAdapter> {
     adapter_binding: Option<AdapterBinding>,
     endpoint: EndpointProducer,
     direct_receiver: Option<EndpointReceiver>,
+}
+
+struct PublicationContext {
+    key: SlotKey,
+    identity: AdapterWorkIdentity,
+    preempt_after_commit: bool,
 }
 
 struct TokenPublication<'endpoint> {

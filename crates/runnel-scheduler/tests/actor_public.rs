@@ -18,14 +18,15 @@ async fn feature_off_public_actor_completes_and_releases_one_request() {
     let model = TinyModel::from_artifact_with_backend(&artifact, BackendRequest::Scalar)
         .expect("scalar tiny-v3 model");
     let mut limits = SchedulerLimits::tiny();
-    limits.max_new_tokens = 2;
-    limits.output_capacity_per_request = 2;
+    limits.max_new_tokens = 3;
+    limits.output_capacity_per_request = 3;
+    limits.waves_per_step = 1;
     let config = SchedulerConfig::new(&model, limits).expect("scheduler configuration");
     let actor = SchedulerActor::spawn(model, config).expect("scheduler actor");
     let client = actor.client();
 
     let submission = client
-        .try_submit(RequestSpec::new(&[1], 2, SamplingPolicy::Greedy, None))
+        .try_submit(RequestSpec::new(&[1], 3, SamplingPolicy::Greedy, None))
         .expect("bounded submission");
     let mut handle = timeout(Duration::from_secs(5), submission.wait())
         .await
@@ -54,7 +55,7 @@ async fn feature_off_public_actor_completes_and_releases_one_request() {
             TryRecvOutput::Empty => panic!("awaited receive returned empty"),
         }
     }
-    assert_eq!(output_indices, [0, 1]);
+    assert_eq!(output_indices, [0, 1, 2]);
     drop(handle);
 
     let report = timeout(Duration::from_secs(5), actor.shutdown())

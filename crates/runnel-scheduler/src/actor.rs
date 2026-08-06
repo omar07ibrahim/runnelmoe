@@ -2311,6 +2311,7 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
             };
             match state {
                 PumpState::Continue => {}
+                PumpState::Yield => tokio::task::yield_now().await,
                 PumpState::Wait(deadline) => {
                     #[cfg(any(test, feature = "actor-stress-instrumentation"))]
                     if let Err(error) = self.shared.activity.wait_until(deadline).await {
@@ -2388,7 +2389,11 @@ impl<A: DecoderAdapter> BlockingOwner<A> {
         }
 
         if self.should_continue(report)? {
-            return Ok(PumpState::Continue);
+            return Ok(if report.preempted_requests == 0 {
+                PumpState::Continue
+            } else {
+                PumpState::Yield
+            });
         }
         let deadline = if closing { None } else { self.next_deadline()? };
         Ok(PumpState::Wait(deadline))
@@ -2641,6 +2646,7 @@ impl<A: DecoderAdapter> Drop for BlockingOwner<A> {
 
 enum PumpState {
     Continue,
+    Yield,
     Wait(Option<Instant>),
     Complete(ActorShutdownReport),
 }
@@ -2791,7 +2797,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::{ErrorCategory, SchedulerLimits, TerminalOutcome};
+    use crate::{
+        ErrorCategory, RequestPhase, SchedulerLimits, ServiceTraceCursor, TerminalOutcome,
+    };
 
     fn model_and_config(mut limits: SchedulerLimits) -> (TinyModel, SchedulerConfig) {
         limits.worker_count = 1;
@@ -2999,6 +3007,112 @@ mod tests {
         let (model, config) = model_and_config(SchedulerLimits::tiny());
         let error = SchedulerActor::spawn(model, config).unwrap_err();
         assert_eq!(error.category(), ErrorCategory::Unsupported);
+    }
+
+    #[test]
+    fn resident_preemption_yields_between_physical_pumps_before_control_and_command_work() {
+        let mut limits = SchedulerLimits::tiny();
+        limits.batch_width = 1;
+        limits.waves_per_step = 1;
+        limits.max_active_requests = 2;
+        limits.output_capacity_per_request = 4;
+        let (model, config) = model_and_config(limits);
+        let engine = SchedulerEngine::new(model, config).expect("preemption actor engine");
+        let shared = Arc::new(Shared::try_new(config).expect("preemption actor shared state"));
+        let client = SchedulerClient {
+            shared: Arc::clone(&shared),
+        };
+        let mut owner =
+            BlockingOwner::try_new(engine, Arc::clone(&shared)).expect("preemption actor owner");
+
+        let mut first_submission = client
+            .try_submit(request(&[1], 3, None))
+            .expect("first preemption command");
+        assert!(matches!(
+            owner.pump().expect("first physical pump"),
+            PumpState::Yield
+        ));
+        let mut first = shared
+            .take_response(first_submission.slot, first_submission.ticket)
+            .expect("first response query")
+            .expect("first response ready")
+            .expect("first request admitted");
+        first_submission.pending = false;
+        assert_eq!(
+            owner
+                .engine
+                .request_phase(first.request_id())
+                .expect("first preempted phase"),
+            RequestPhase::Preempted
+        );
+
+        assert_eq!(
+            first.cancel().expect("cancel between physical pumps"),
+            CancelDisposition::Requested
+        );
+        let mut second_submission = client
+            .try_submit(request(&[14], 1, None))
+            .expect("inter-pump command");
+        assert!(matches!(
+            owner.pump().expect("second physical pump"),
+            PumpState::Continue
+        ));
+        let mut second = shared
+            .take_response(second_submission.slot, second_submission.ticket)
+            .expect("second response query")
+            .expect("second response ready")
+            .expect("second request admitted");
+        second_submission.pending = false;
+
+        assert_eq!(
+            owner
+                .engine
+                .request_phase(first.request_id())
+                .expect("first terminal phase"),
+            RequestPhase::Terminal
+        );
+        assert_eq!(
+            owner
+                .engine
+                .request_phase(second.request_id())
+                .expect("second terminal phase"),
+            RequestPhase::Terminal
+        );
+        let trace = owner
+            .engine
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect("inter-pump service trace");
+        assert_eq!(trace.events().len(), 2);
+        assert_eq!(trace.events()[0].request_id(), first.request_id());
+        assert_eq!(trace.events()[0].position(), 0);
+        assert_eq!(trace.events()[1].request_id(), second.request_id());
+        assert_eq!(trace.events()[1].position(), 0);
+        drop(trace);
+
+        assert!(matches!(
+            first.try_recv_output().expect("first committed prefix"),
+            TryRecvOutput::Output(_)
+        ));
+        assert_eq!(
+            first
+                .try_terminal()
+                .expect("first cancellation terminal")
+                .expect("first terminal retained")
+                .outcome(),
+            TerminalOutcome::Cancelled
+        );
+        assert!(matches!(
+            second.try_recv_output().expect("second committed output"),
+            TryRecvOutput::Output(_)
+        ));
+        assert_eq!(
+            second
+                .try_terminal()
+                .expect("second completion terminal")
+                .expect("second terminal retained")
+                .outcome(),
+            TerminalOutcome::Completed
+        );
     }
 
     #[test]

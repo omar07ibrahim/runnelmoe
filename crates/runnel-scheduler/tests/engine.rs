@@ -793,7 +793,7 @@ fn explicit_policies_have_frozen_names_and_distinct_service_order() {
     assert_eq!(first.promoted_requests, 2);
     assert_eq!(first.selected_positions, 1);
     assert_eq!(first.committed_positions, 1);
-    assert_eq!(phase(&baseline, baseline_ids[0]), RequestPhase::Ready);
+    assert_eq!(phase(&baseline, baseline_ids[0]), RequestPhase::Preempted);
     assert_eq!(phase(&baseline, baseline_ids[1]), RequestPhase::Ready);
     assert_eq!(drain_tokens(&mut baseline, baseline_ids[0]), vec![1]);
     assert!(drain_tokens(&mut baseline, baseline_ids[1]).is_empty());
@@ -812,7 +812,7 @@ fn explicit_policies_have_frozen_names_and_distinct_service_order() {
     let next = baseline.step().expect("next baseline request starts");
     assert_eq!(next.promoted_requests, 0);
     assert_eq!(next.committed_positions, 1);
-    assert_eq!(phase(&baseline, baseline_ids[1]), RequestPhase::Ready);
+    assert_eq!(phase(&baseline, baseline_ids[1]), RequestPhase::Preempted);
 
     let mut candidate =
         new_engine_with_policy(limits, SchedulingPolicy::DeficitContinuousExpertCoalesce);
@@ -830,8 +830,251 @@ fn explicit_policies_have_frozen_names_and_distinct_service_order() {
     assert_eq!(first.selected_positions, 2);
     assert_eq!(first.committed_positions, 2);
     for id in candidate_ids {
-        assert_eq!(phase(&candidate, id), RequestPhase::Ready);
+        assert_eq!(phase(&candidate, id), RequestPhase::Preempted);
         assert_eq!(drain_tokens(&mut candidate, id).len(), 1);
+    }
+}
+
+#[test]
+fn cooperative_preemption_preserves_resident_ownership_and_resumes_exactly() {
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 1;
+    limits.waves_per_step = 1;
+    limits.max_active_requests = 1;
+    limits.output_capacity_per_request = 4;
+    let mut engine = new_engine_with_limits(limits);
+    engine.advance_clock(9).expect("pre-deadline clock");
+    let request = engine
+        .try_submit(RequestSpec::new(&[0], 3, SamplingPolicy::Greedy, Some(10)))
+        .expect("accepted preemption request");
+
+    let first = engine.step().expect("first bounded service step");
+    assert_eq!(
+        first,
+        StepReport {
+            promoted_requests: 1,
+            waves: 1,
+            selected_positions: 1,
+            expert_tasks: 1,
+            expert_groups: 1,
+            committed_positions: 1,
+            preempted_requests: 1,
+            resumed_requests: 0,
+            terminal_decisions: 0,
+        }
+    );
+    assert_eq!(phase(&engine, request), RequestPhase::Preempted);
+    let preempted = engine.snapshot();
+    assert_eq!(preempted.active_requests, 1);
+    assert_eq!(preempted.preempted_requests, 1);
+    assert_eq!(preempted.output_blocked_requests, 0);
+    assert_eq!(drain_tokens(&mut engine, request), [1]);
+    assert_eq!(phase(&engine, request), RequestPhase::Preempted);
+
+    let resident_ledger = engine.ledger_snapshot();
+    let second = engine.step().expect("control-first resident resume");
+    assert_eq!(second.promoted_requests, 0);
+    assert_eq!(second.selected_positions, 1);
+    assert_eq!(second.committed_positions, 1);
+    assert_eq!(second.preempted_requests, 1);
+    assert_eq!(second.resumed_requests, 1);
+    assert_eq!(second.terminal_decisions, 0);
+    assert_eq!(phase(&engine, request), RequestPhase::Preempted);
+    assert_eq!(engine.ledger_snapshot(), resident_ledger);
+
+    let final_step = engine.step().expect("terminal position is not preempted");
+    assert_eq!(final_step.selected_positions, 1);
+    assert_eq!(final_step.committed_positions, 1);
+    assert_eq!(final_step.preempted_requests, 0);
+    assert_eq!(final_step.resumed_requests, 1);
+    assert_eq!(final_step.terminal_decisions, 1);
+    assert_eq!(phase(&engine, request), RequestPhase::Terminal);
+    assert_eq!(drain_tokens(&mut engine, request), [2, 3]);
+    let terminal = engine
+        .take_terminal(request)
+        .expect("preemption terminal query")
+        .expect("preemption terminal retained");
+    assert_eq!(terminal.outcome(), TerminalOutcome::Completed);
+    assert_eq!(terminal.committed_positions(), 3);
+    assert_eq!(terminal.emitted_tokens(), 3);
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+    assert_eq!(engine.shutdown().unwrap().remaining_shared_bytes, 0);
+}
+
+#[test]
+fn preempted_controls_win_before_resume_and_preserve_the_committed_prefix() {
+    for (cancel, expire, expected_outcome) in [
+        (false, true, TerminalOutcome::DeadlineExceeded),
+        (true, false, TerminalOutcome::Cancelled),
+        (true, true, TerminalOutcome::Cancelled),
+    ] {
+        let mut limits = SchedulerLimits::tiny();
+        limits.batch_width = 1;
+        limits.waves_per_step = 1;
+        limits.max_active_requests = 1;
+        limits.output_capacity_per_request = 4;
+        let mut engine = new_engine_with_limits(limits);
+        engine.advance_clock(9).expect("pre-deadline clock");
+        let request = engine
+            .try_submit(RequestSpec::new(&[0], 3, SamplingPolicy::Greedy, Some(10)))
+            .expect("accepted preempted control request");
+
+        let first = engine.step().expect("commit preempted prefix");
+        assert_eq!(first.committed_positions, 1);
+        assert_eq!(first.preempted_requests, 1);
+        assert_eq!(phase(&engine, request), RequestPhase::Preempted);
+        let trace_before = engine
+            .service_trace_since(ServiceTraceCursor::origin())
+            .expect("preempted prefix trace")
+            .events()
+            .to_vec();
+        assert_eq!(trace_before.len(), 1);
+
+        if expire {
+            engine
+                .advance_clock(10)
+                .expect("reach inclusive preempted deadline");
+        }
+        if cancel {
+            assert_eq!(
+                engine.cancel(request).expect("cancel preempted request"),
+                CancelDisposition::Requested
+            );
+        }
+        let resolved = engine.step().expect("resolve control before resume");
+        assert_eq!(
+            resolved,
+            StepReport {
+                promoted_requests: 0,
+                waves: 0,
+                selected_positions: 0,
+                expert_tasks: 0,
+                expert_groups: 0,
+                committed_positions: 0,
+                preempted_requests: 0,
+                resumed_requests: 0,
+                terminal_decisions: 1,
+            }
+        );
+        assert_eq!(phase(&engine, request), RequestPhase::Terminal);
+        assert_eq!(
+            engine
+                .service_trace_since(ServiceTraceCursor::origin())
+                .expect("terminal preempted trace")
+                .events(),
+            trace_before
+        );
+        assert_eq!(drain_tokens(&mut engine, request), [1]);
+        let terminal = engine
+            .take_terminal(request)
+            .expect("preempted control terminal query")
+            .expect("preempted control terminal retained");
+        assert_eq!(terminal.outcome(), expected_outcome);
+        assert_eq!(terminal.committed_positions(), 1);
+        assert_eq!(terminal.emitted_tokens(), 1);
+        assert_eq!(engine.ledger_snapshot().request_used(), 0);
+        assert_eq!(engine.shutdown().unwrap().remaining_shared_bytes, 0);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StepPartitionOutcome {
+    trace: Vec<(runnel_scheduler::RequestId, usize, ServicePhase)>,
+    tokens: Vec<Vec<u32>>,
+    terminals: Vec<(TerminalOutcome, usize, usize)>,
+}
+
+fn complete_step_partition_scenario(
+    policy: SchedulingPolicy,
+    waves_per_step: u64,
+    sampling: [SamplingPolicy; 2],
+) -> StepPartitionOutcome {
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 2;
+    limits.waves_per_step = waves_per_step;
+    limits.max_active_requests = 2;
+    limits.output_capacity_per_request = 4;
+    limits.trace_capacity = 32;
+    let mut engine = new_engine_with_policy(limits, policy);
+    let ids = [0_u32, 1_u32].map(|token| {
+        engine
+            .try_submit(RequestSpec::new(
+                &[token],
+                3,
+                sampling[usize::try_from(token).expect("sampling index")],
+                None,
+            ))
+            .expect("accepted step-partition request")
+    });
+
+    for _ in 0..8 {
+        let snapshot = engine.snapshot();
+        if snapshot.queued_requests == 0 && snapshot.active_requests == 0 {
+            break;
+        }
+        engine.step().expect("step-partition service");
+    }
+    let complete = engine.snapshot();
+    assert_eq!(complete.queued_requests, 0);
+    assert_eq!(complete.active_requests, 0);
+    assert_eq!(complete.preempted_requests, 0);
+
+    let trace = engine
+        .service_trace_since(ServiceTraceCursor::origin())
+        .expect("complete step-partition trace")
+        .events()
+        .iter()
+        .map(|event| (event.request_id(), event.position(), event.phase()))
+        .collect();
+    let tokens = ids.map(|id| drain_tokens(&mut engine, id)).to_vec();
+    let terminals = ids
+        .map(|id| {
+            let terminal = engine
+                .take_terminal(id)
+                .expect("step-partition terminal query")
+                .expect("step-partition terminal retained");
+            (
+                terminal.outcome(),
+                terminal.committed_positions(),
+                terminal.emitted_tokens(),
+            )
+        })
+        .to_vec();
+    assert_eq!(engine.ledger_snapshot().request_used(), 0);
+    assert_eq!(engine.shutdown().unwrap().remaining_shared_bytes, 0);
+    StepPartitionOutcome {
+        trace,
+        tokens,
+        terminals,
+    }
+}
+
+#[test]
+fn preemption_is_service_trace_and_token_neutral_for_both_policies() {
+    let seeded = [17_u64, 29_u64].map(|seed| {
+        SamplingPolicy::Sample(SampleConfig {
+            seed,
+            temperature: 1.0,
+            top_k: 4,
+            top_p: 1.0,
+        })
+    });
+    for sampling in [[SamplingPolicy::Greedy; 2], seeded] {
+        for policy in [
+            SchedulingPolicy::FifoRunToCompletion,
+            SchedulingPolicy::DeficitContinuousExpertCoalesce,
+        ] {
+            let preempted = complete_step_partition_scenario(policy, 1, sampling);
+            let uninterrupted = complete_step_partition_scenario(policy, 4, sampling);
+            assert_eq!(preempted, uninterrupted, "policy {policy:?}");
+            assert_eq!(preempted.trace.len(), 6);
+            assert!(
+                preempted
+                    .terminals
+                    .iter()
+                    .all(|terminal| *terminal == (TerminalOutcome::Completed, 3, 3))
+            );
+        }
     }
 }
 
@@ -1039,7 +1282,7 @@ fn fifo_non_head_deadline_terminalizes_without_receiving_service() {
     assert_eq!(report.terminal_decisions, 1);
     assert_eq!(report.committed_positions, 1);
     assert_eq!(phase(&engine, expiring), RequestPhase::Terminal);
-    assert_eq!(phase(&engine, head), RequestPhase::Ready);
+    assert_eq!(phase(&engine, head), RequestPhase::Preempted);
     assert_eq!(phase(&engine, tail), RequestPhase::Ready);
     assert!(drain_tokens(&mut engine, expiring).is_empty());
     assert!(drain_tokens(&mut engine, tail).is_empty());
@@ -1688,8 +1931,9 @@ fn intrinsically_unserviceable_fifo_head_is_rejected_before_admission() {
 fn adapter_error_after_commit_terminalizes_without_stranding_ownership() {
     for max_new_tokens in [1, 2] {
         let adapter = MockAdapter::failing_after_commit();
-        let config =
-            SchedulerConfig::new(&adapter, SchedulerLimits::tiny()).expect("scheduler config");
+        let mut limits = SchedulerLimits::tiny();
+        limits.waves_per_step = 1;
+        let config = SchedulerConfig::new(&adapter, limits).expect("scheduler config");
         let mut engine = SchedulerEngine::new(adapter, config).expect("scheduler engine");
         let baseline = engine.snapshot();
         let id = engine
@@ -1703,6 +1947,7 @@ fn adapter_error_after_commit_terminalizes_without_stranding_ownership() {
 
         let report = engine.step().expect("post-commit failure is contained");
         assert_eq!(report.committed_positions, 1);
+        assert_eq!(report.preempted_requests, 0);
         assert_eq!(report.terminal_decisions, 1);
         assert_eq!(phase(&engine, id), RequestPhase::Terminal);
         let trace = engine
@@ -1868,13 +2113,9 @@ fn bounded_output_backpressure_blocks_only_full_requests_and_resumes_after_drain
         })
         .collect();
 
-    assert_eq!(
-        engine
-            .step()
-            .expect("first service round")
-            .committed_positions,
-        2
-    );
+    let first = engine.step().expect("first service round");
+    assert_eq!(first.committed_positions, 2);
+    assert_eq!(first.preempted_requests, 0);
     assert_eq!(phase(&engine, ids[0]), RequestPhase::OutputBlocked);
     assert_eq!(phase(&engine, ids[1]), RequestPhase::OutputBlocked);
     assert_eq!(phase(&engine, ids[2]), RequestPhase::Ready);
@@ -1893,6 +2134,7 @@ fn bounded_output_backpressure_blocks_only_full_requests_and_resumes_after_drain
     );
     let blocked = engine.snapshot();
     assert_eq!(blocked.output_blocked_requests, 3);
+    assert_eq!(blocked.preempted_requests, 0);
 
     assert!(
         engine
@@ -2171,4 +2413,32 @@ fn terminal_reaping_restores_accounting_and_shutdown_releases_mixed_state() {
             .terminated_requests,
         0
     );
+
+    let mut preempt_limits = SchedulerLimits::tiny();
+    preempt_limits.batch_width = 1;
+    preempt_limits.waves_per_step = 1;
+    preempt_limits.max_active_requests = 1;
+    preempt_limits.output_capacity_per_request = 4;
+    let mut preempted_engine = new_engine_with_limits(preempt_limits);
+    let preempted_request = preempted_engine
+        .try_submit(RequestSpec::new(&[0], 3, SamplingPolicy::Greedy, None))
+        .expect("accepted shutdown-preempted request");
+    let preempted_step = preempted_engine.step().expect("preempt before shutdown");
+    assert_eq!(preempted_step.preempted_requests, 1);
+    assert_eq!(
+        phase(&preempted_engine, preempted_request),
+        RequestPhase::Preempted
+    );
+    let preempted_shutdown = preempted_engine
+        .shutdown()
+        .expect("shutdown preempted engine");
+    assert_eq!(preempted_shutdown.terminated_requests, 1);
+    assert_eq!(preempted_shutdown.discarded_output_events, 1);
+    assert!(preempted_shutdown.released_request_bytes > 0);
+    assert_eq!(preempted_shutdown.remaining_shared_bytes, 0);
+    let preempted_closed = preempted_engine.snapshot();
+    assert!(preempted_closed.closed);
+    assert_eq!(preempted_closed.active_requests, 0);
+    assert_eq!(preempted_closed.preempted_requests, 0);
+    assert_eq!(preempted_closed.ledger_used_bytes, 0);
 }

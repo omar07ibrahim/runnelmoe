@@ -578,6 +578,20 @@ impl DrrRing {
             .any(|member| member.slot_key == slot_key && member.request_id == request_id)
     }
 
+    /// Iterates authenticated resident membership without allocating.
+    pub(crate) fn member_states(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (SlotKey, RequestId, bool, u8)> + '_ {
+        self.members.iter().map(|member| {
+            (
+                member.slot_key,
+                member.request_id,
+                member.reservation_epoch.is_some(),
+                member.deficit,
+            )
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn deficit(&self, slot_key: SlotKey) -> Option<u8> {
         self.members

@@ -310,8 +310,7 @@ cargo test -p runnel-scheduler --test checkpoint_instrumented_public \
 
 Checkpoint-plan allocation and the integration harness are correctness
 instrumentation and are excluded from M5 timing regions. This gate does not
-claim that deterministic scheduler preemption or the full M5 evidence capture
-has landed.
+claim that the full M5 evidence capture has landed.
 
 ## M5 scheduling-policy verification
 
@@ -352,6 +351,56 @@ final origin read, and proves cancellation cleanup adds no service before both
 request and shared ownership reach zero. These are policy/correctness gates,
 not performance evidence. The timed M5 capture harness, measured service rows,
 measured ledger rows, and run-level observer remain outstanding.
+
+## M5 deterministic cooperative-preemption verification
+
+The `resident-step-budget-preemption-v1` mechanism yields resident request
+work at the exact final `waves_per_step` commit. An unfinished request enters
+`Preempted` as part of that commit; the actor gets a command/control
+opportunity, and the next pump
+resolves cancellation and inclusive deadlines before an allocation-free
+resume. Ring membership, service order and credit, adapter state, prompt and
+active reservations, RNG, output endpoints, and ledger ownership remain
+resident. Output blocking, completion, terminal control, and contained adapter
+failures take precedence.
+
+The resume audit is two-pass and linear in slots plus queued and ring members.
+It authenticates slot/request identity, complete ownership, zero applied
+service deficit, absence from the admission queue, and exact resident-member
+cardinality before mutating any phase. Fault injection removes a later member
+and proves that no earlier request partially resumes. Focused gates are:
+
+```console
+cargo test -p runnel-scheduler --test engine \
+  cooperative_preemption_preserves_resident_ownership_and_resumes_exactly \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  preempted_controls_win_before_resume_and_preserve_the_committed_prefix \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  preemption_is_service_trace_and_token_neutral_for_both_policies \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --lib preempted_resume_audit \
+  --locked --offline
+cargo test -p runnel-scheduler --lib \
+  resident_preemption_yields_between_physical_pumps \
+  --locked --offline
+cargo test -p runnel-scheduler --test actor_public --locked --offline
+```
+
+The partition test compares one-wave and four-wave pumps for FIFO and
+continuous scheduling with greedy and independently seeded sampling. It
+requires identical complete service traces, tokens, terminal counts, and
+outcomes. The actor test uses a one-wave pump and completes across multiple
+preemption boundaries without an external wake. The checkpoint and public
+manual-clock suites together cover queued, ready, expert-owned,
+ready-to-commit, output-blocked, and preempted expiry with cancellation
+precedence.
+
+This is control-plane cooperative preemption, not adapter-state swapping or
+memory reclamation. No opaque state serialization/restore ABI exists, and no
+such claim is made. Timed preemption counts remain part of the outstanding M5
+capture.
 
 ## M5 bounded service-trace verification
 
