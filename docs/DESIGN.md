@@ -255,7 +255,11 @@ generation-bound atomic request controls, and prevalidated release permits for
 terminal/reap/shutdown cleanup. Durable request acquisition and release permits
 also publish one owner-attributed ledger-evidence mutation at those lifecycle
 boundaries; provisional rollback restores historical peaks and remains absent
-from the evidence stream. A live monotonic-clock and control snapshot is taken
+from the evidence stream. Reusable contribution lanes are prearmed with the
+complete slot-generation, request, scheduler transaction, adapter identity,
+rank, and expert authorization; the same identity is rechecked before expert
+execution and scatter, so a stale completion cannot fill a later wave's lane.
+A live monotonic-clock and control snapshot is taken
 inside the adapter's validated commit callback; suppression drops both
 unapplied permits before terminal cleanup, so that position publishes no state,
 RNG, output, trace, or service-credit debit. A generation-tagged endpoint lock

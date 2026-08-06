@@ -49,6 +49,7 @@ const ACTIVE_PLAN_LEN: usize = 2;
 thread_local! {
     static BATCH_ALLOCATION_FAILURE_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
     static SHUTDOWN_RELEASE_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static CORRUPT_NEXT_WAVE_TASK_TRANSACTION: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -82,6 +83,16 @@ fn batch_allocation_checkpoint() -> SchedulerResult<()> {
 #[cfg(test)]
 pub(crate) fn fail_next_shutdown_release_for_test() {
     SHUTDOWN_RELEASE_FAILURE.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn corrupt_next_wave_task_transaction_for_test() {
+    CORRUPT_NEXT_WAVE_TASK_TRANSACTION.with(|corrupt| corrupt.set(true));
+}
+
+#[cfg(test)]
+fn take_wave_task_transaction_corruption_for_test() -> bool {
+    CORRUPT_NEXT_WAVE_TASK_TRANSACTION.with(|corrupt| corrupt.replace(false))
 }
 
 #[cfg(test)]
@@ -1862,20 +1873,41 @@ impl<A: DecoderAdapter> SchedulerEngine<A> {
         }
         report.selected_positions += selected_count;
         wave.sort_tasks().map_err(map_wave_error)?;
+        #[cfg(test)]
+        if take_wave_task_transaction_corruption_for_test() {
+            let foreign = self.transaction_ids.issue().map_err(map_identity_error)?;
+            wave.corrupt_first_task_transaction_for_test(foreign)
+                .map_err(map_wave_error)?;
+        }
 
         let mut failures = [None; MAX_BATCH_WIDTH as usize];
         let mut previous_expert = None;
         {
-            let (tasks, scatter) = wave.drain_tasks_and_scatter().map_err(map_wave_error)?;
+            let (tasks, selections, scatter) =
+                wave.drain_tasks_and_scatter().map_err(map_wave_error)?;
             for envelope in tasks {
                 let (completion, task) = envelope.into_parts();
                 let selection_index = completion.selection_index();
                 if failures.get(selection_index).copied().flatten().is_some() {
                     continue;
                 }
-                let current = self
-                    .record_for_key(completion.slot())
-                    .is_ok_and(|record| record.request_id == completion.request_id());
+                let authorized = WaveScratch::<
+                    A::PreparedToken,
+                    A::ExpertTask,
+                    A::ExpertContribution,
+                >::completion_is_authorized(
+                    selections, scatter, &completion
+                );
+                let current = authorized
+                    && self.record_for_key(completion.slot()).is_ok_and(|record| {
+                        record.request_id == completion.request_id()
+                            && record.phase == RequestPhase::ExpertOwned
+                            && record.committed_positions
+                                == completion.adapter_identity().position()
+                            && record.adapter_binding.is_some_and(|binding| {
+                                binding.matches(completion.adapter_identity())
+                            })
+                    });
                 if !current {
                     if let Some(failure) = failures.get_mut(selection_index) {
                         *failure = Some(ErrorCategory::Internal);
@@ -3040,6 +3072,14 @@ struct AdapterBinding {
     model_instance_id: u64,
     state_id: u64,
     expected_revision: u64,
+}
+
+impl AdapterBinding {
+    fn matches(self, identity: AdapterWorkIdentity) -> bool {
+        self.model_instance_id == identity.model_instance_id()
+            && self.state_id == identity.state_id().get()
+            && self.expected_revision == identity.state_revision()
+    }
 }
 
 fn visible_control_outcome<A: DecoderAdapter>(

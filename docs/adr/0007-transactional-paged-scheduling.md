@@ -118,18 +118,28 @@ ID. The scheduler wraps them in an engine-owned envelope containing:
 ```
 
 Runtime adapter types never depend on scheduler request slots. Both layers
-validate their complete identity before scatter. Request IDs, request slots,
-slot generations, engine/adapter transaction IDs, model/state IDs, revisions,
-and positions use checked increments; exhaustion fails before work selection
-and never wraps or reuses an identity. Adapter transaction identities are
-observed against one engine-lifetime high-water mark and must increase
-strictly across requests as well as within one request.
+validate their complete identity before expert execution and again before
+scatter. Every reusable numeric scatter lane is prearmed with the complete
+scheduler envelope above; the eventual single-use completion must match that
+authorization field-for-field before it can occupy the lane. A mismatch leaves
+the expected authorization and contribution payload unchanged. Rollback and
+wave reset clear both fields only after proving that no service reservation is
+discarded. Request IDs, request slots, slot generations, engine/adapter
+transaction IDs, model/state IDs, revisions, and positions use checked
+increments; exhaustion fails before work selection and never wraps or reuses
+an identity. Adapter transaction identities are observed against one
+engine-lifetime high-water mark and must increase strictly across requests as
+well as within one request.
 
 `finish_token` rejects a missing, duplicate, foreign, stale, wrong-rank,
 wrong-expert, nonfinite, or dimension-mismatched contribution before it
 creates a pending commit. Contributions may execute in expert-ID order, but
 the mixture is always reduced in router-rank order. A completion permutation
-cannot alter the numerical accumulation order.
+cannot alter the numerical accumulation order. Unit tests mutate each slot,
+request, engine transaction, adapter transaction/model/state/revision/position,
+selection, router-rank, expert, and scatter component independently, and
+reuse one physical lane in a later wave; every stale write is rejected without
+damaging the current lane.
 
 Model state carries a nonzero identity and monotonically increasing revision.
 A pending state commit can apply only to the state/revision from which it was
@@ -551,16 +561,17 @@ The owner/lifetime transitions are closed:
 | output queue capacity and terminal slot | request, reserved before admission; committed events occupy bounded slots until drain/discard, and capacity releases at result reap/drop |
 | worker scratch | shared static partition through scheduler shutdown; worker ownership changes do not remove its charge |
 | sampling scratch | shared static partition through scheduler shutdown; logits and sampling workspace occupancy change without changing its reserved capacity |
-| coalesced batch capacity | shared static partition through shutdown; includes 64 bytes per task identity plus adapter contribution buffers and is charged once, never per participating request |
+| coalesced batch capacity | shared static partition through shutdown; includes 64 bytes per task envelope, a separate fixed 128-byte full scatter-authorization slot, and adapter task/contribution buffers; charged once, never per participating request |
 | trace capacity | shared static partition through shutdown at 128 bytes per configured paired index: one independent 64-byte service-event slot and one independent 64-byte ledger-event slot; borrowed cursor reads leave both append-only occupancies and the combined capacity charge unchanged, and successful shutdown discards both arrays |
 | model resident partition | validated static partition present when the scheduler is constructed |
 | page-pool partition | exact configured M2 cache payload capacity when a cache is attached, otherwise zero |
 | admission reserve | shared semantic headroom through scheduler lifetime; typed construction requires the maximum requested Vec-payload peak across direct batch preparation phases, while allocator overhead and RSS remain separate observations |
 
 Fixed logical metadata charges are 64 bytes per command, actor-control,
-request, output-event, terminal, expert-task, state-page, service-event, and
-ledger-event slot; each paired trace index therefore remains 128 bytes; and
-each retained request record is 512 bytes. Each actor command also
+request, output-event, terminal, expert-task envelope, state-page,
+service-event, and ledger-event slot; each full task scatter authorization is
+128 bytes, each paired trace index remains 128 bytes, and each retained request
+record is 512 bytes. Each actor command also
 includes the configured maximum offered-prompt payload before its per-slot
 charge is rounded. Actor control adds one 64-byte accepted-control/deadline slot
 per maximum outstanding request to a separate 64-byte global wake/lifecycle

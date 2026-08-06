@@ -10,6 +10,7 @@ use runnel_runtime::{
 use crate::{
     error::{ErrorCategory, SchedulerError, SchedulerResult},
     trace::TRACE_SLOT_CHARGE_BYTES,
+    wave::TASK_AUTHORIZATION_SLOT_BYTES,
 };
 
 pub const LEDGER_ALIGNMENT_BYTES: u64 = 64;
@@ -1007,6 +1008,7 @@ fn shared_static_charges(
     let task_and_contribution_bytes = checked_sum(
         &[
             EXPERT_TASK_ENVELOPE_BYTES,
+            TASK_AUTHORIZATION_SLOT_BYTES,
             to_u64(
                 geometry.execution_layout.task_payload_bytes(),
                 "adapter task payload",
@@ -1274,12 +1276,13 @@ mod tests {
         assert_eq!(shared.total_bytes(), config.shared_static_charge_bytes());
         assert_eq!(shared.actor_command_bytes(), 116_736);
         assert_eq!(shared.actor_control_bytes(), 2_112);
-        assert_eq!(config.shared_static_charge_bytes(), 2_224_896);
+        assert_eq!(shared.coalesced_batch_bytes(), 4_096);
+        assert_eq!(config.shared_static_charge_bytes(), 2_226_944);
         assert_eq!(config.pending_transaction_charge_bytes(), 384);
         assert_eq!(config.output_queue_charge_bytes(), 4_096);
         assert_eq!(config.minimum_request_charge_bytes(), 6_272);
         assert_eq!(config.worst_case_request_charge_bytes(), 78_336);
-        assert_eq!(config.minimum_total_charge_bytes(), 2_231_168);
+        assert_eq!(config.minimum_total_charge_bytes(), 2_233_216);
         assert!(config.minimum_total_charge_bytes() <= config.logical_memory_limit_bytes());
     }
 

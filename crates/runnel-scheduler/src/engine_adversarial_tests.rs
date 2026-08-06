@@ -176,6 +176,7 @@ struct GatedAdapter {
     next_transaction_id: AtomicU64,
     gate: Arc<CommitGate>,
     apply_count: Arc<AtomicUsize>,
+    expert_count: Arc<AtomicUsize>,
     apply_cancel: Option<Arc<ApplyCancelHook>>,
 }
 
@@ -188,7 +189,19 @@ impl GatedAdapter {
             next_transaction_id: AtomicU64::new(1),
             gate,
             apply_count,
+            expert_count: Arc::new(AtomicUsize::new(0)),
             apply_cancel: None,
+        }
+    }
+
+    fn with_expert_count(
+        gate: Arc<CommitGate>,
+        apply_count: Arc<AtomicUsize>,
+        expert_count: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            expert_count,
+            ..Self::new(gate, apply_count)
         }
     }
 
@@ -352,6 +365,7 @@ impl DecoderAdapter for GatedAdapter {
         task: ExpertTask,
         _workspace: &mut (),
     ) -> RuntimeResult<ExpertContribution> {
+        self.expert_count.fetch_add(1, Ordering::AcqRel);
         Ok(ExpertContribution {
             identity: task.identity,
             input_token: task.input_token,
@@ -892,6 +906,104 @@ fn recycled_engine_slot_rejects_stale_control_without_affecting_its_new_request(
     assert_eq!(terminal.outcome(), TerminalOutcome::Completed);
     assert_eq!(terminal.committed_positions(), 1);
     assert_eq!(terminal.emitted_tokens(), 1);
+    assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
+}
+
+#[test]
+fn stale_task_transaction_is_rejected_before_expert_execution_and_sibling_progresses() {
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let expert_count = Arc::new(AtomicUsize::new(0));
+    let adapter = GatedAdapter::with_expert_count(
+        Arc::new(CommitGate::passthrough()),
+        Arc::clone(&apply_count),
+        Arc::clone(&expert_count),
+    );
+    let mut limits = SchedulerLimits::tiny();
+    limits.batch_width = 2;
+    limits.waves_per_step = 1;
+    let config = SchedulerConfig::new(&adapter, limits).expect("stale-task scheduler config");
+    let mut engine = SchedulerEngine::new(adapter, config).expect("stale-task scheduler engine");
+    let pristine = engine.ledger_snapshot();
+    let stale = engine
+        .try_submit(RequestSpec::new(&[0], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted stale-task target");
+    let sibling = engine
+        .try_submit(RequestSpec::new(&[1], 1, SamplingPolicy::Greedy, None))
+        .expect("accepted stale-task sibling");
+
+    crate::engine::corrupt_next_wave_task_transaction_for_test();
+    let report = engine
+        .step()
+        .expect("stale task fails one selection closed");
+    assert_eq!(
+        report,
+        StepReport {
+            promoted_requests: 2,
+            waves: 1,
+            selected_positions: 2,
+            expert_tasks: 1,
+            expert_groups: 1,
+            committed_positions: 1,
+            terminal_decisions: 2,
+        }
+    );
+    assert_eq!(expert_count.load(Ordering::Acquire), 1);
+    assert_eq!(apply_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        engine.request_phase(stale).expect("stale-task phase"),
+        RequestPhase::Terminal
+    );
+    assert_eq!(
+        engine.request_phase(sibling).expect("sibling phase"),
+        RequestPhase::Terminal
+    );
+    let service = engine
+        .service_trace_since(ServiceTraceCursor::origin())
+        .expect("service trace after stale task");
+    assert!(service.status().healthy());
+    assert_eq!(service.events().len(), 1);
+    assert_eq!(service.events()[0].request_id(), sibling);
+    assert_eq!(service.events()[0].position(), 0);
+    drop(service);
+    assert_no_active_request_ownership(&engine);
+
+    assert!(
+        engine
+            .drain_events(stale, usize::MAX)
+            .expect("stale-task output")
+            .is_empty()
+    );
+    let stale_terminal = engine
+        .take_terminal(stale)
+        .expect("stale-task terminal query")
+        .expect("stale-task terminal");
+    assert_eq!(
+        stale_terminal.outcome(),
+        TerminalOutcome::Failed {
+            category: ErrorCategory::Internal,
+        }
+    );
+    assert_eq!(stale_terminal.committed_positions(), 0);
+    assert_eq!(stale_terminal.emitted_tokens(), 0);
+
+    let sibling_events = engine
+        .drain_events(sibling, usize::MAX)
+        .expect("sibling output");
+    assert_eq!(sibling_events.len(), 1);
+    assert_eq!(sibling_events[0].request_id(), sibling);
+    assert_eq!(sibling_events[0].output_index(), 0);
+    let sibling_terminal = engine
+        .take_terminal(sibling)
+        .expect("sibling terminal query")
+        .expect("sibling terminal");
+    assert_eq!(sibling_terminal.outcome(), TerminalOutcome::Completed);
+    assert_eq!(sibling_terminal.committed_positions(), 1);
+    assert_eq!(sibling_terminal.emitted_tokens(), 1);
+    let ledger_trace = engine
+        .ledger_trace_since(LedgerTraceCursor::origin())
+        .expect("ledger trace after stale task cleanup");
+    assert!(ledger_trace.status().healthy());
+    drop(ledger_trace);
     assert_all_request_ownership_reaped(&engine, pristine.total_used(), pristine.shared_used());
 }
 
