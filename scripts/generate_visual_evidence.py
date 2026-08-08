@@ -43,6 +43,9 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 SAFE_PATH = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
 SAFE_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+EMAIL_LIKE = re.compile(
+    rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+)
 
 COLORS = {
     "bg": "#07131f",
@@ -146,6 +149,7 @@ def scan(data: bytes, label: str) -> str:
     for marker, description in FORBIDDEN.items():
         need(marker not in data, f"{label} contains {description}")
     need(b"\0" not in data, f"{label} contains NUL")
+    need(EMAIL_LIKE.search(data) is None, f"{label} contains email-like PII")
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -226,7 +230,13 @@ def parse(command: Command, data: bytes) -> Any:
     return value
 
 
-def bounded_run(argv: Sequence[str], root: pathlib.Path, environment: dict[str, str]) -> tuple[bytes, bytes]:
+def bounded_run(
+    argv: Sequence[str],
+    root: pathlib.Path,
+    environment: dict[str, str],
+    command_id: str,
+) -> tuple[bytes, bytes]:
+    need(re.fullmatch(r"[a-z0-9-]+", command_id) is not None, "command ID is unsafe")
     process = subprocess.Popen(
         list(argv),
         cwd=root,
@@ -247,7 +257,7 @@ def bounded_run(argv: Sequence[str], root: pathlib.Path, environment: dict[str, 
     while selector.get_map() and failure is None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            failure = "command exceeded 120 seconds"
+            failure = f"{command_id} exceeded 120 seconds"
             break
         events = selector.select(min(remaining, 0.5))
         if not events and process.poll() is not None:
@@ -263,7 +273,7 @@ def bounded_run(argv: Sequence[str], root: pathlib.Path, environment: dict[str, 
                 continue
             buffers[item.data].extend(chunk)
             if len(buffers[item.data]) > MAX_STREAM:
-                failure = f"{item.data} exceeded {MAX_STREAM} bytes"
+                failure = f"{command_id} {item.data} exceeded {MAX_STREAM} bytes"
                 break
     selector.close()
     if failure is not None:
@@ -276,8 +286,7 @@ def bounded_run(argv: Sequence[str], root: pathlib.Path, environment: dict[str, 
     code = process.wait(timeout=5)
     stdout, stderr = bytes(buffers["stdout"]), bytes(buffers["stderr"])
     if code:
-        excerpt = stderr.decode("utf-8", "replace").replace("\n", " ")[:300]
-        raise ContractError(f"command exited {code}: {excerpt}")
+        raise ContractError(f"{command_id} exited {code}")
     return stdout, stderr
 
 
@@ -658,7 +667,9 @@ def build(root: pathlib.Path, output: pathlib.Path, repository: str, revision: s
     recorded_env = {key: environment[key] for key in ("CARGO_NET_OFFLINE", "CARGO_TERM_COLOR", "LANG", "LC_ALL", "RUST_BACKTRACE")}
     parsed, command_records, sources = {}, [], {}
     for command in COMMANDS:
-        stdout, stderr = bounded_run(command.argv, root, environment)
+        stdout, stderr = bounded_run(
+            command.argv, root, environment, command.capture_id
+        )
         scan(stdout, command.capture_id + ".stdout")
         scan(stderr, command.capture_id + ".stderr")
         parsed[command.capture_id] = parse(command, stdout)
@@ -816,22 +827,42 @@ def border_clear(image: Any) -> bool:
 
 def verify(root: pathlib.Path, expected_revision: str | None = None) -> dict[str, Any]:
     pillow()
+    need(not root.is_symlink(), "artifact root must not be a symlink")
     root = root.resolve()
-    need(root.is_dir() and not root.is_symlink(), "artifact root is unsafe")
+    need(root.is_dir(), "artifact root is unsafe")
+    entries = list(root.rglob("*"))
+    for entry in entries:
+        need(
+            not entry.is_symlink() and (entry.is_file() or entry.is_dir()),
+            f"artifact contains unsafe entry {entry.relative_to(root)}",
+        )
+    directories = {
+        entry.relative_to(root).as_posix() for entry in entries if entry.is_dir()
+    }
+    need(directories == {"raw", "visuals"}, "artifact directory topology changed")
     manifest = strict_json((root / "manifest.json").read_bytes(), "manifest.json")
     need(manifest["schema"] == SCHEMA and manifest["candidate_only"] is True, "manifest schema changed")
     revision = manifest["source"]["revision"]
     need(REVISION.fullmatch(revision) is not None and (expected_revision is None or revision == expected_revision), "revision changed")
     need([row["argv"] for row in manifest["commands"]] == [list(item.argv) for item in COMMANDS], "command vectors changed")
     declared = {row["path"]: row for row in manifest["files"]}
-    actual = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and path.name not in {"manifest.json", "SHA256SUMS"}}
+    regular_files = [entry for entry in entries if entry.is_file()]
+    actual = {
+        path.relative_to(root).as_posix()
+        for path in regular_files
+        if path.name not in {"manifest.json", "SHA256SUMS"}
+    }
     need(set(declared) == actual, "manifest inventory is not closed")
     for relative, row in declared.items():
         need(SAFE_PATH.fullmatch(relative) is not None, "unsafe artifact path")
         path = root / relative
         need(path.is_file() and not path.is_symlink() and path.stat().st_size == row["bytes"] <= MAX_FILE and file_digest(path) == row["sha256"], f"file custody failed for {relative}")
     checksums = sums((root / "SHA256SUMS").read_bytes())
-    expected_sums = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and path.name != "SHA256SUMS"}
+    expected_sums = {
+        path.relative_to(root).as_posix()
+        for path in regular_files
+        if path.name != "SHA256SUMS"
+    }
     need(set(checksums) == expected_sums, "checksum inventory is not closed")
     for relative, value in checksums.items():
         need(file_digest(root / relative) == value, f"checksum failed for {relative}")
@@ -879,12 +910,30 @@ def verify(root: pathlib.Path, expected_revision: str | None = None) -> dict[str
                 need("not an OS screenshot" in image.info["RenderContract"] and json.loads(image.info["ContentBounds"]) == bounds and border_clear(image), "PNG bounds/render contract changed")
         else:
             with Image.open(path) as image:
-                need(image.format == "GIF" and image.n_frames == 4 and list(image.size) == asset["canvas"], "GIF frame contract changed")
+                need(
+                    image.format == "GIF"
+                    and image.n_frames == 4
+                    and list(image.size) == asset["canvas"]
+                    and image.info.get("loop") == 0
+                    and "transparency" not in image.info,
+                    "GIF frame contract changed",
+                )
                 comment = json.loads(image.info["comment"].decode())
                 need(comment["schema"] == ASSET_SCHEMA and comment["revision"] == revision and "not a screen recording" in comment["rendering"], "GIF provenance changed")
-                for index in range(image.n_frames):
+                durations = (1400, 1400, 1400, 1600)
+                for index, duration in enumerate(durations):
                     image.seek(index)
-                    need(image.size == tuple(asset["canvas"]) and border_clear(image), f"GIF frame {index} is clipped")
+                    tiles = list(image.tile)
+                    need(
+                        image.size == tuple(asset["canvas"])
+                        and len(tiles) == 1
+                        and tiles[0][1] == (0, 0, *asset["canvas"])
+                        and image.info.get("duration") == duration
+                        and getattr(image, "disposal_method", None) == 2
+                        and "transparency" not in image.info
+                        and border_clear(image),
+                        f"GIF frame {index} is not a full opaque frame",
+                    )
     for path in [root / "README.md", root / "manifest.json", root / "SHA256SUMS", *sorted((root / "raw").glob("*")), *sorted((root / "visuals").glob("*.svg"))]:
         scan(path.read_bytes(), path.relative_to(root).as_posix())
     return {"revision": revision, "manifest_sha256": file_digest(root / "manifest.json"), "capture_count": len(COMMANDS), "asset_count": len(manifest["assets"]), "file_count": len(checksums) + 1}
