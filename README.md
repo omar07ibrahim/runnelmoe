@@ -72,6 +72,105 @@ measure token throughput, serving latency, storage I/O, or other hardware.
 See the [raw summary](benchmarks/raw/m4-bf16-gemv-20260803/summary.json) and
 [M4 review](docs/reviews/M4_REVIEW.md).
 
+## Setup and executable proof
+
+Requirements are Git and the pinned Rust toolchain. Python is needed only for
+the independent oracle and evidence checks. From a fresh checkout:
+
+```console
+git clone https://github.com/omar07ibrahim/runnelmoe.git
+cd runnelmoe
+cargo build --locked \
+  -p runnel --bin runnel --bin runnel-m4-model-check \
+  -p runnel-sim --bin runnel-cache-sim
+cargo run --locked -p runnel -- \
+  demo --prompt moe --max-new-tokens 4 --json
+```
+
+![Deterministic rendering of the actual M1 artifact-to-token stdout](docs/visual-evidence/m1-m4-0aca4a7/visuals/m1-demo-transcript.png)
+
+*This is a deterministic rendering of the [captured M1
+stdout](docs/visual-evidence/m1-m4-0aca4a7/raw/m1-demo.stdout), not an
+operating-system screenshot. The fixture output is systems-test evidence, not
+language-quality or performance evidence.*
+
+## M1-M4 workflow
+
+![Four deterministic frames derived from the actual M1, M2, M3, and M4 command outputs](docs/visual-evidence/m1-m4-0aca4a7/visuals/m1-m4-workflow.gif)
+
+*The animation presents the four actual stdout streams in order. It is not a
+screen recording, benchmark timeline, or latency visualization. See the
+[closed manifest](docs/visual-evidence/m1-m4-0aca4a7/manifest.json) and
+[SHA-256 inventory](docs/visual-evidence/m1-m4-0aca4a7/SHA256SUMS).*
+
+## Source-backed M1-M4 results
+
+Every card below was derived from captured output at source revision
+`0aca4a7dac07b437afa56f4e3a527232bfaf6123`. The linked raw streams are
+authoritative; the cards are navigational summaries.
+
+### M1: artifact to deterministic tokens
+
+![M1 actual CLI result showing the authenticated tiny adapter and deterministic generated tokens](docs/visual-evidence/m1-m4-0aca4a7/visuals/m1-demo.svg)
+
+The generated fixture authenticates as the tiny causal-MoE adapter and produces
+IDs `[15, 11, 20, 9]`, decoded as `"njsh"`. This is a deterministic
+systems vector, not model-quality evidence. [Raw
+stdout](docs/visual-evidence/m1-m4-0aca4a7/raw/m1-demo.stdout) /
+[reproduce](#reproduce-and-check)
+
+### M2: verified bounded data plane
+
+![M2 actual CLI result showing parity and stable cache accounting](docs/visual-evidence/m1-m4-0aca4a7/visuals/m2-data-plane.svg)
+
+The captured demand trace preserves sync/cache and forced-eviction generation
+parity, with one hit, four misses, four admissions, three evictions, and no
+dropped trace events. Volatile wait, I/O, and RSS fields remain only in [raw
+stdout](docs/visual-evidence/m1-m4-0aca4a7/raw/m2-data-plane.stdout); they are
+not performance claims. [Reproduce](#reproduce-and-check)
+
+### M3: one-seed functional smoke
+
+![M3 one-replicate 64-step offline cache-policy matrix](docs/visual-evidence/m1-m4-0aca4a7/visuals/m3-cache-matrix.svg)
+
+This is one deterministic replicate/seed with 64 measured steps and 18 cells.
+It checks policy plumbing and modeled byte accounting. It is not a benchmark,
+not the accepted 30-seed experiment, and not evidence for a general policy
+winner. [Raw
+stdout](docs/visual-evidence/m1-m4-0aca4a7/raw/m3-cache-matrix.stdout) /
+[reproduce](#reproduce-and-check)
+
+### M4: complete-model correctness ledger
+
+![M4 actual three-row correctness ledger for tiny-v1 and tiny-v2 scalar and AVX2 paths](docs/visual-evidence/m1-m4-0aca4a7/visuals/m4-model-check.svg)
+
+All three rows completed on the capture host with exact selected experts and
+tokens; the maximum declared tolerance ratio was `0.014519`. This command
+emits no timing, and AVX2 is explicitly `unsupported` on a host without that
+ISA. [Raw
+stdout](docs/visual-evidence/m1-m4-0aca4a7/raw/m4-model-check.stdout) /
+[reproduce](#reproduce-and-check)
+
+## Implemented architecture and limits
+
+![Cargo-manifest-derived topology of the accepted M1-M4 workspace crates](docs/visual-evidence/m1-m4-0aca4a7/visuals/m1-m4-architecture.svg)
+
+*The graph is parsed from the workspace and seven crate manifests at the
+captured source revision. It deliberately excludes the unaccepted scheduler;
+it is not a picture of planned M5 behavior.*
+
+The current boundary is intentionally narrow:
+
+- M1 uses generated fixtures and proves deterministic execution, not language
+  quality.
+- M2 reconstructs authenticated tensors before scalar execution; it does not
+  stream expert pages during each token's compute.
+- M3's card is a one-seed functional smoke with modeled bytes, not host timing.
+- M4's correctness card has no timing; the separate accepted M4 figures below
+  cover only fixed synthetic GEMV batches on one recorded host.
+- No M5 scheduler result, multi-request serving result, production endpoint, or
+  end-to-end inference-speed claim is represented.
+
 ## Accepted M3–M4 visual evidence
 
 These five committed SVGs are regenerated byte-for-byte from the accepted raw
@@ -114,6 +213,24 @@ not token throughput, serving latency, or storage-I/O measurements.*
 percentile-bootstrap intervals. The preregistered rule is satisfied only for
 the two named primary cells on the recorded host; the figure supports no
 general CPU, compiler, model, or inference-speed ranking.*
+
+## Reproduce and check
+
+Verify the adopted payload against its raw streams, provenance metadata, and
+asset bounds with Python 3.12.11 and the locked Pillow wheel:
+
+```console
+python3 -m pip install --disable-pip-version-check --no-deps \
+  --only-binary=:all: --require-hashes -r scripts/visual-requirements.txt
+python3 scripts/generate_visual_evidence.py verify \
+  --input docs/visual-evidence/m1-m4-0aca4a7 \
+  --expected-revision 0aca4a7dac07b437afa56f4e3a527232bfaf6123
+python3 scripts/verify_repository.py
+```
+
+The [capture and rendering
+contract](docs/VISUAL_EVIDENCE.md#source-captures) records the exact command
+vectors and nonclaims. To rerun each executable surface:
 
 Run the complete artifact-to-token demo after fetching the locked Rust
 dependencies once:

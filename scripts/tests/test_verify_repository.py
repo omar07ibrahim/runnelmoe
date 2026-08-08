@@ -67,5 +67,14 @@ class SourceTextTests(unittest.TestCase):
         self.assertEqual(failures, [f"{path}: missing final newline"])
 
 
+class MarkdownLinkTests(unittest.TestCase):
+    def test_image_and_text_destinations_are_parsed(self) -> None:
+        text = "![result](visual.svg) and [evidence](raw.json)"
+        self.assertEqual(
+            contract.MARKDOWN_LINK.findall(text),
+            ["visual.svg", "raw.json"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

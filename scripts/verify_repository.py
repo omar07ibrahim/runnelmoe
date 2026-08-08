@@ -249,7 +249,7 @@ FORBIDDEN_BASENAMES = {
     "id_rsa",
 }
 
-MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
+MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 ACTION_USE = re.compile(
     r"^\s*(?:-\s*)?uses:\s*['\"]?([^'\"#\s]+)['\"]?\s*(?:#.*)?$",
     re.MULTILINE,
