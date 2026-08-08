@@ -100,3 +100,30 @@ The artifact-level SHA-256 reported by `actions/upload-artifact` is the final
 hosted custody value. No candidate visual is linked from project documentation
 or committed as an adopted asset before independent review and explicit
 approval.
+
+## Adopted M1-M4 snapshot
+
+The exact 18-file payload from the independently reviewed hosted candidate is
+preserved at [`m1-m4-0aca4a7`](visual-evidence/m1-m4-0aca4a7/). No payload
+byte was regenerated or normalized. Its internal `README.md` and
+`candidate_only` field retain the candidate-time state.
+
+- Source revision / tree: `0aca4a7dac07b437afa56f4e3a527232bfaf6123` /
+  `2e324f78a8fdefff3c017561a7bef2dc893bc4c4`
+- Workflow run / attempt: `31275522585` / `1`
+- Artifact ID / bytes: `9026883207` / `207857`
+- Artifact SHA-256:
+  `34539c05e97c674e73f665f05b4938cbfa6faeaa943a909169d2d5c434028b3f`
+- Manifest SHA-256:
+  `31d31acf000064404fce23361aced0eab501a10c81a733b75f1f87d9668c448f`
+
+Recheck the adopted snapshot with the same fail-closed verifier:
+
+```console
+python3 scripts/generate_visual_evidence.py verify \
+  --input docs/visual-evidence/m1-m4-0aca4a7 \
+  --expected-revision 0aca4a7dac07b437afa56f4e3a527232bfaf6123
+```
+
+Raw streams remain authoritative. The scope is accepted M1-M4 only: no
+scheduler, end-to-end inference, serving, or storage-performance claim.

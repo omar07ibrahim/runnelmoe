@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1034" viewBox="0 0 1440 1034" role="img" aria-labelledby="title desc">
+  <title id="title">Small offline cache matrix</title>
+  <desc id="desc">markov_clusters replicate 0 / 64 measured steps / modeled physical bytes</desc>
+  <metadata>{&quot;content_bounds&quot;:[48,48,1392,1004],&quot;revision&quot;:&quot;0aca4a7dac07b437afa56f4e3a527232bfaf6123&quot;,&quot;schema&quot;:&quot;runnel.visual-evidence-asset/1&quot;,&quot;source_stdout_sha256&quot;:&quot;3a5778318d3ed50db61102af51e95b7eb4bcf7cca9d74a856e84feb12da9f239&quot;}</metadata>
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#10273a"/><stop offset="1" stop-color="#091725"/></linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#a3bac0"/></marker>
+  </defs>
+  <rect width="1440" height="1034" rx="24" fill="#07131f"/>
+  <rect x="20" y="20" width="1400" height="994" rx="20" fill="url(#surface)" stroke="#2a4a60"/>
+  <text x="58" y="66" fill="#5de0c2" font-family="sans-serif" font-size="15" font-weight="700">M3 / FUNCTIONAL SMOKE</text>
+  <text x="58" y="110" fill="#eff8f6" font-family="sans-serif" font-size="32" font-weight="700">Small offline cache matrix</text>
+  <text x="58" y="141" fill="#a3bac0" font-family="sans-serif" font-size="15">markov_clusters replicate 0 / 64 measured steps / modeled physical bytes</text>
+  <rect x="48" y="177" width="1344" height="201" rx="14" fill="#102538" stroke="#2a4a60"/>
+  <text x="72" y="206" fill="#77aaff" font-family="sans-serif" font-size="16" font-weight="700">2 MiB</text>
+  <text x="72" y="233" fill="#eff8f6" font-family="monospace" font-size="15">lru: 9.562 MiB / 1.000 x LRU</text>
+  <text x="72" y="257" fill="#eff8f6" font-family="monospace" font-size="15">slru: 13.125 MiB / 1.373 x LRU</text>
+  <text x="72" y="281" fill="#eff8f6" font-family="monospace" font-size="15">tiny-lfu: 16.375 MiB / 1.712 x LRU</text>
+  <text x="72" y="305" fill="#eff8f6" font-family="monospace" font-size="15">router-admit: 11.750 MiB / 1.229 x LRU</text>
+  <text x="72" y="329" fill="#eff8f6" font-family="monospace" font-size="15">router-prefetch: 15.562 MiB / 1.627 x LRU</text>
+  <text x="72" y="353" fill="#eff8f6" font-family="monospace" font-size="15">belady: 9.188 MiB / 0.961 x LRU</text>
+  <rect x="48" y="395" width="1344" height="201" rx="14" fill="#102538" stroke="#2a4a60"/>
+  <text x="72" y="424" fill="#77aaff" font-family="sans-serif" font-size="16" font-weight="700">4 MiB</text>
+  <text x="72" y="451" fill="#eff8f6" font-family="monospace" font-size="15">lru: 9.188 MiB / 1.000 x LRU</text>
+  <text x="72" y="475" fill="#eff8f6" font-family="monospace" font-size="15">slru: 9.375 MiB / 1.020 x LRU</text>
+  <text x="72" y="499" fill="#eff8f6" font-family="monospace" font-size="15">tiny-lfu: 16.062 MiB / 1.748 x LRU</text>
+  <text x="72" y="523" fill="#eff8f6" font-family="monospace" font-size="15">router-admit: 9.375 MiB / 1.020 x LRU</text>
+  <text x="72" y="547" fill="#eff8f6" font-family="monospace" font-size="15">router-prefetch: 12.125 MiB / 1.320 x LRU</text>
+  <text x="72" y="571" fill="#eff8f6" font-family="monospace" font-size="15">belady: 9.188 MiB / 1.000 x LRU</text>
+  <rect x="48" y="613" width="1344" height="201" rx="14" fill="#102538" stroke="#2a4a60"/>
+  <text x="72" y="642" fill="#77aaff" font-family="sans-serif" font-size="16" font-weight="700">8 MiB</text>
+  <text x="72" y="669" fill="#eff8f6" font-family="monospace" font-size="15">lru: 9.188 MiB / 1.000 x LRU</text>
+  <text x="72" y="693" fill="#eff8f6" font-family="monospace" font-size="15">slru: 9.188 MiB / 1.000 x LRU</text>
+  <text x="72" y="717" fill="#eff8f6" font-family="monospace" font-size="15">tiny-lfu: 10.250 MiB / 1.116 x LRU</text>
+  <text x="72" y="741" fill="#eff8f6" font-family="monospace" font-size="15">router-admit: 9.188 MiB / 1.000 x LRU</text>
+  <text x="72" y="765" fill="#eff8f6" font-family="monospace" font-size="15">router-prefetch: 10.688 MiB / 1.163 x LRU</text>
+  <text x="72" y="789" fill="#eff8f6" font-family="monospace" font-size="15">belady: 9.188 MiB / 1.000 x LRU</text>
+  <text x="58" y="839" fill="#ffc66d" font-family="sans-serif" font-size="14">Actual 18-cell CLI smoke. Not the accepted 30-seed experiment, host timing, or a general policy ranking.</text>
+  <text x="1382" y="999" text-anchor="end" fill="#a3bac0" font-family="monospace" font-size="12">source 0aca4a7dac07 / stdout 3a5778318d3ed50d...</text>
+</svg>
