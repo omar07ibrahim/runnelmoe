@@ -1,6 +1,7 @@
 [package]
 name = "runnel"
 description = "Local CLI for the RunnelMoE reference runtime"
+default-run = "runnel"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

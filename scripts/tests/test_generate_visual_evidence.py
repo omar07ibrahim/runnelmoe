@@ -8,6 +8,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import tomllib
 import unittest
 import xml.etree.ElementTree as ET
 
@@ -48,6 +49,16 @@ class CommandContractTests(unittest.TestCase):
         for command in evidence.COMMANDS:
             self.assertNotIn("sh", command.argv)
             self.assertNotIn("bash", command.argv)
+
+    def test_cli_package_selects_the_documented_default_binary(self) -> None:
+        manifest = tomllib.loads(
+            (ROOT / "crates" / "runnel-cli" / "Cargo.toml").read_text()
+        )
+        self.assertEqual(manifest["package"]["default-run"], "runnel")
+        self.assertEqual(
+            {target["name"] for target in manifest["bin"]},
+            {"runnel", "runnel-m4-model-check"},
+        )
 
     def test_strict_json_rejects_duplicate_and_nonfinite_values(self) -> None:
         with self.assertRaises(evidence.ContractError):
