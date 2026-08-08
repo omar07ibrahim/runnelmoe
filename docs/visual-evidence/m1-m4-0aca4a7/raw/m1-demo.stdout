@@ -1,1 +1,0 @@
-{"schema_version":1,"artifact_id":"sha256:e49321cefc980ab59cd449341edfc624ccfc4b0b703cd175184e056d296d9ed3","adapter":{"id":"runnel.tiny-causal-moe","version":1},"input_token_count":4,"generated_ids":[15,11,20,9],"text":"njsh","stop_reason":"max_new_tokens"}

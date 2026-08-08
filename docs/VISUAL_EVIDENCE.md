@@ -100,38 +100,3 @@ The artifact-level SHA-256 reported by `actions/upload-artifact` is the final
 hosted custody value. No candidate visual is linked from project documentation
 or committed as an adopted asset before independent review and explicit
 approval.
-
-## Adopted M1-M4 snapshot
-
-The seven visual assets in
-[`m1-m4-0aca4a7`](visual-evidence/m1-m4-0aca4a7/) were adopted only after
-independent review of the complete hosted candidate. The committed directory
-is the byte-for-byte 18-file artifact payload; its internal `README.md` and
-`candidate_only` manifest field intentionally retain the candidate-time state
-instead of rewriting provenance after approval.
-
-- Source revision: `0aca4a7dac07b437afa56f4e3a527232bfaf6123`
-- Source tree: `2e324f78a8fdefff3c017561a7bef2dc893bc4c4`
-- Workflow run / attempt: `31275522585` / `1`
-- Hosted artifact ID: `9026883207`
-- Hosted artifact name:
-  `visual-evidence-candidate-0aca4a7dac07b437afa56f4e3a527232bfaf6123-1`
-- Hosted ZIP bytes / SHA-256: `207857` /
-  `34539c05e97c674e73f665f05b4938cbfa6faeaa943a909169d2d5c434028b3f`
-- Manifest SHA-256:
-  `31d31acf000064404fce23361aced0eab501a10c81a733b75f1f87d9668c448f`
-
-Verify the adopted snapshot with the same fail-closed contract used before
-approval (Python 3.12.11 on Linux x86-64):
-
-```console
-python3 -m pip install --disable-pip-version-check --no-deps \
-  --only-binary=:all: --require-hashes -r scripts/visual-requirements.txt
-python3 scripts/generate_visual_evidence.py verify \
-  --input docs/visual-evidence/m1-m4-0aca4a7 \
-  --expected-revision 0aca4a7dac07b437afa56f4e3a527232bfaf6123
-```
-
-The raw streams remain authoritative. Adoption does not widen the claim scope:
-the snapshot covers accepted M1-M4 only, excludes the unaccepted scheduler, and
-contains no end-to-end inference, serving, or storage-performance claim.

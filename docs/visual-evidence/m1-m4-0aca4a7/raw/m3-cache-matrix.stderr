@@ -1,2 +1,0 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
-     Running `target/debug/runnel-cache-sim matrix --family markov_clusters --replicate 0 --measured-steps 64`
