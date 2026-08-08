@@ -177,6 +177,7 @@ REQUIRED = {
     "scripts/run_m2_experiment.py",
     "scripts/run_m3_experiment.py",
     "scripts/run_m4_experiment.py",
+    "scripts/tests/test_generate_visual_evidence.py",
     "scripts/tests/test_run_m2_experiment.py",
     "scripts/tests/test_run_m3_experiment.py",
     "scripts/tests/test_run_m4_experiment.py",
