@@ -171,6 +171,7 @@ REQUIRED = {
     "oracle/tests/test_cache_policy.py",
     "oracle/tests/test_oracle.py",
     "rust-toolchain.toml",
+    "scripts/generate_visual_evidence.py",
     "scripts/visual-requirements.txt",
     "scripts/verify_repository.py",
     "scripts/run_m2_experiment.py",
