@@ -22,6 +22,19 @@ SKIP_PARTS = {
     "tmp",
 }
 MAX_FILE_BYTES = 5 * 1024 * 1024
+APPROVED_BINARY_FILES = {
+    Path(
+        "docs/visual-evidence/m1-m4-0aca4a7/visuals/"
+        "m1-demo-transcript.png"
+    ): (".png", (b"\x89PNG\r\n\x1a\n",)),
+    Path(
+        "docs/visual-evidence/m1-m4-0aca4a7/visuals/"
+        "m1-m4-workflow.gif"
+    ): (".gif", (b"GIF87a", b"GIF89a")),
+}
+BINARY_SUFFIXES = frozenset(
+    suffix for suffix, _signatures in APPROVED_BINARY_FILES.values()
+)
 
 REQUIRED = {
     ".editorconfig",
@@ -178,6 +191,7 @@ REQUIRED = {
     "scripts/run_m3_experiment.py",
     "scripts/run_m4_experiment.py",
     "scripts/tests/test_generate_visual_evidence.py",
+    "scripts/tests/test_verify_repository.py",
     "scripts/tests/test_run_m2_experiment.py",
     "scripts/tests/test_run_m3_experiment.py",
     "scripts/tests/test_run_m4_experiment.py",
@@ -270,6 +284,32 @@ def repository_files() -> list[Path]:
             continue
         files.append(relative)
     return sorted(files)
+
+
+def source_text(relative: Path, data: bytes, failures: list[str]) -> str | None:
+    approved = APPROVED_BINARY_FILES.get(relative)
+    if approved is not None:
+        suffix, signatures = approved
+        if relative.suffix.lower() != suffix or not any(
+            data.startswith(signature) for signature in signatures
+        ):
+            failures.append(
+                f"{relative}: approved binary suffix or magic does not match"
+            )
+        return None
+    if relative.suffix.lower() in BINARY_SUFFIXES:
+        failures.append(f"{relative}: binary asset path is not allowlisted")
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        failures.append(
+            f"{relative}: malformed UTF-8 is not an allowlisted binary"
+        )
+        return None
+    if data and not data.endswith(b"\n"):
+        failures.append(f"{relative}: missing final newline")
+    return text
 
 
 def check_local_links(path: Path, text: str, failures: list[str]) -> None:
@@ -407,13 +447,8 @@ def main() -> int:
         for marker, label in FORBIDDEN_BYTES.items():
             if marker in data:
                 failures.append(f"{relative}: contains {label}")
-        if data and not data.endswith(b"\n"):
-            failures.append(f"{relative}: missing final newline")
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        if relative.suffix == ".md":
+        text = source_text(relative, data, failures)
+        if text is not None and relative.suffix == ".md":
             check_local_links(relative, text, failures)
 
     action_files = list((ROOT / ".github/workflows").glob("*.yml"))
