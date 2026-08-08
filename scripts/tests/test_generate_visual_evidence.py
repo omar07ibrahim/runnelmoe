@@ -38,7 +38,7 @@ class CommandContractTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            evidence.COMMANDS[2].argv[-9:],
+            evidence.COMMANDS[2].argv[-7:],
             (
                 "matrix", "--family", "markov_clusters", "--replicate", "0",
                 "--measured-steps", "64",
