@@ -407,12 +407,12 @@ def main() -> int:
         for marker, label in FORBIDDEN_BYTES.items():
             if marker in data:
                 failures.append(f"{relative}: contains {label}")
-        if data and not data.endswith(b"\n"):
-            failures.append(f"{relative}: missing final newline")
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             continue
+        if data and not data.endswith(b"\n"):
+            failures.append(f"{relative}: missing final newline")
         if relative.suffix == ".md":
             check_local_links(relative, text, failures)
 
