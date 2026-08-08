@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -66,6 +67,27 @@ class CommandContractTests(unittest.TestCase):
                 with self.assertRaises(evidence.ContractError):
                     evidence.scan(sample, f"sample-{index}")
 
+    def test_email_like_pii_is_rejected_without_a_published_literal(self) -> None:
+        sample = b"portfolio.owner" + b"@" + b"example" + b".invalid"
+        with self.assertRaises(evidence.ContractError):
+            evidence.scan(sample, "email-like")
+
+    def test_failed_command_does_not_echo_captured_stderr(self) -> None:
+        environment = {"PATH": os.environ["PATH"], "LANG": "C.UTF-8"}
+        with self.assertRaises(evidence.ContractError) as caught:
+            evidence.bounded_run(
+                (
+                    sys.executable,
+                    "-c",
+                    "import sys;sys.stderr.write('sensitive details');raise SystemExit(7)",
+                ),
+                ROOT,
+                environment,
+                "failing-test",
+            )
+        self.assertEqual(str(caught.exception), "failing-test exited 7")
+        self.assertNotIn("sensitive", str(caught.exception))
+
     def test_capture_size_is_bounded(self) -> None:
         oversized = b"x" * (evidence.MAX_STREAM + 1)
         with self.assertRaises(evidence.ContractError):
@@ -89,6 +111,44 @@ class CommandContractTests(unittest.TestCase):
                 evidence.COMMANDS[0],
                 (json.dumps(valid, separators=(",", ":")) + "\n").encode(),
             )
+
+    def test_derived_workflow_text_ignores_unallowlisted_extra_fields(self) -> None:
+        sentinel = "UNALLOWLISTED_SENTINEL"
+        parsed = {
+            "m1-demo": {
+                "generated_ids": [15, 11, 20, 9],
+                "text": "njsh",
+                "stop_reason": "max_new_tokens",
+                "extra": sentinel,
+            },
+            "m2-data-plane": {
+                "parity": True,
+                "forced_eviction_generation": {
+                    "full_generation_parity": True
+                },
+                "metrics": {"physical_read_bytes": 64},
+                "extra": sentinel,
+            },
+            "m3-cache-matrix": {
+                "results": [
+                    {
+                        "capacity_bytes": 2 * 1024 * 1024,
+                        "metrics": {"total_physical_load_bytes": 128},
+                        "extra": sentinel,
+                    }
+                ]
+            },
+            "m4-model-check": [
+                {
+                    "check_id": "tiny-v1-preservation",
+                    "status": "ok",
+                    "backend": "v1-f32",
+                    "extra": sentinel,
+                }
+            ],
+        }
+        rendered = json.dumps(evidence.summaries(parsed), sort_keys=True)
+        self.assertNotIn(sentinel, rendered)
 
     def test_small_matrix_parser_checks_closed_grid_and_accounting(self) -> None:
         policies = (
@@ -237,6 +297,22 @@ class HostedCandidateTests(unittest.TestCase):
         self.assertEqual(result["asset_count"], 7)
         self.assertTrue(evidence.SHA256.fullmatch(result["manifest_sha256"]))
 
+    def test_gif_has_four_exact_full_opaque_frames(self) -> None:
+        gif = pathlib.Path(CANDIDATE) / "visuals" / "m1-m4-workflow.gif"
+        with evidence.Image.open(gif) as image:
+            self.assertEqual(image.info.get("loop"), 0)
+            self.assertNotIn("transparency", image.info)
+            self.assertEqual(image.n_frames, 4)
+            for index, duration in enumerate((1400, 1400, 1400, 1600)):
+                image.seek(index)
+                tiles = list(image.tile)
+                self.assertEqual(len(tiles), 1)
+                self.assertEqual(tiles[0][1], (0, 0, *image.size))
+                self.assertEqual(image.info.get("duration"), duration)
+                self.assertEqual(image.disposal_method, 2)
+                self.assertNotIn("transparency", image.info)
+                self.assertTrue(evidence.border_clear(image))
+
     def test_raw_tamper_is_rejected(self) -> None:
         temp_root = os.environ.get("RUNNER_TEMP")
         with tempfile.TemporaryDirectory(dir=temp_root) as temporary:
@@ -244,6 +320,36 @@ class HostedCandidateTests(unittest.TestCase):
             shutil.copytree(CANDIDATE, clone)
             with (clone / "raw" / "m1-demo.stdout").open("ab") as output:
                 output.write(b" ")
+            with self.assertRaises(evidence.ContractError):
+                evidence.verify(clone)
+
+    def test_supplied_root_symlink_is_rejected(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        temp_root = os.environ.get("RUNNER_TEMP")
+        with tempfile.TemporaryDirectory(dir=temp_root) as temporary:
+            link = pathlib.Path(temporary) / "candidate-link"
+            os.symlink(pathlib.Path(CANDIDATE).resolve(), link, target_is_directory=True)
+            with self.assertRaises(evidence.ContractError):
+                evidence.verify(link)
+
+    def test_unexpected_directory_is_rejected(self) -> None:
+        temp_root = os.environ.get("RUNNER_TEMP")
+        with tempfile.TemporaryDirectory(dir=temp_root) as temporary:
+            clone = pathlib.Path(temporary) / "candidate"
+            shutil.copytree(CANDIDATE, clone)
+            (clone / "unexpected-directory").mkdir()
+            with self.assertRaises(evidence.ContractError):
+                evidence.verify(clone)
+
+    def test_nonregular_entry_is_rejected(self) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFOs unavailable")
+        temp_root = os.environ.get("RUNNER_TEMP")
+        with tempfile.TemporaryDirectory(dir=temp_root) as temporary:
+            clone = pathlib.Path(temporary) / "candidate"
+            shutil.copytree(CANDIDATE, clone)
+            os.mkfifo(clone / "unexpected-pipe")
             with self.assertRaises(evidence.ContractError):
                 evidence.verify(clone)
 
