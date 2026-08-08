@@ -154,8 +154,6 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    env:
-      CANDIDATE_PATH: ${{ runner.temp }}/runnel-visual-evidence-${{ github.sha }}
     steps:
       - name: Check out exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -184,6 +182,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          CANDIDATE_PATH="$RUNNER_TEMP/runnel-visual-evidence-$GITHUB_SHA"
           test ! -e "$CANDIDATE_PATH"
           python3 scripts/generate_visual_evidence.py capture \
             --repo-root "$GITHUB_WORKSPACE" \
@@ -195,9 +194,10 @@ jobs:
       - name: Verify complete candidate artifact
         env:
           RUNNEL_REQUIRE_VISUAL_DEPS: "1"
-          RUNNEL_VISUAL_EVIDENCE_CANDIDATE: ${{ env.CANDIDATE_PATH }}
+          RUNNEL_VISUAL_EVIDENCE_CANDIDATE: ${{ runner.temp }}/runnel-visual-evidence-${{ github.sha }}
         run: |
           set -euo pipefail
+          CANDIDATE_PATH="$RUNNER_TEMP/runnel-visual-evidence-$GITHUB_SHA"
           python3 scripts/generate_visual_evidence.py verify \
             --input "$CANDIDATE_PATH" \
             --expected-revision "$GITHUB_SHA"
@@ -207,7 +207,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: visual-evidence-candidate-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ env.CANDIDATE_PATH }}
+          path: ${{ runner.temp }}/runnel-visual-evidence-${{ github.sha }}
           if-no-files-found: error
           include-hidden-files: false
           compression-level: 0
