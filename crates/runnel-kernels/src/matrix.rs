@@ -1,12 +1,24 @@
 use crate::{Bf16, BufferRole, KernelError};
 
 /// A finite, dense, row-major BF16 matrix in compact host-endian storage.
-#[derive(Clone, Debug)]
 pub struct Bf16Matrix {
     rows: usize,
     columns: usize,
-    storage: Box<[u16]>,
+    storage: Vec<u16>,
     word_offset: usize,
+}
+
+impl core::fmt::Debug for Bf16Matrix {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Bf16Matrix")
+            .field("rows", &self.rows)
+            .field("columns", &self.columns)
+            .field("storage_words", &self.storage.len())
+            .field("word_offset", &self.word_offset)
+            .field("payload", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PartialEq for Bf16Matrix {
@@ -22,11 +34,7 @@ impl Bf16Matrix {
     ///
     /// Returns an error for invalid dimensions, size/length mismatch, or any
     /// infinity or NaN word.
-    pub fn from_words(
-        rows: usize,
-        columns: usize,
-        words: impl Into<Box<[u16]>>,
-    ) -> Result<Self, KernelError> {
+    pub fn from_words(rows: usize, columns: usize, words: Vec<u16>) -> Result<Self, KernelError> {
         Self::from_storage(rows, columns, words, 0)
     }
 
@@ -46,7 +54,7 @@ impl Bf16Matrix {
     pub fn from_storage(
         rows: usize,
         columns: usize,
-        storage: impl Into<Box<[u16]>>,
+        storage: Vec<u16>,
         word_offset: usize,
     ) -> Result<Self, KernelError> {
         validate_dimensions(rows, columns)?;
@@ -57,7 +65,6 @@ impl Bf16Matrix {
                 .ok_or(KernelError::SizeOverflow {
                     buffer: BufferRole::Weights,
                 })?;
-        let storage = storage.into();
         if storage.len() != expected_storage_words {
             return Err(KernelError::MatrixLengthMismatch {
                 expected_words: expected_storage_words,
@@ -96,10 +103,16 @@ impl Bf16Matrix {
             });
         }
 
-        let words = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect::<Vec<_>>();
+        let mut words = try_reserve_words(elements)?;
+        for pair in bytes.chunks_exact(size_of::<u16>()) {
+            let [least_significant, most_significant] = pair else {
+                return Err(KernelError::ByteLengthMismatch {
+                    expected_bytes,
+                    actual_bytes: bytes.len(),
+                });
+            };
+            words.push(u16::from_le_bytes([*least_significant, *most_significant]));
+        }
         Self::from_words(rows, columns, words)
     }
 
@@ -119,7 +132,7 @@ impl Bf16Matrix {
             });
         }
 
-        let mut words = Vec::with_capacity(expected);
+        let mut words = try_reserve_words(expected)?;
         for &value in values {
             words.push(Bf16::try_from_f32_rne(value)?.to_bits());
         }
@@ -180,4 +193,41 @@ fn validate_finite_words(words: &[u16]) -> Result<(), KernelError> {
         }
     }
     Ok(())
+}
+
+fn try_reserve_words(word_count: usize) -> Result<Vec<u16>, KernelError> {
+    let requested_bytes =
+        word_count
+            .checked_mul(size_of::<u16>())
+            .ok_or(KernelError::SizeOverflow {
+                buffer: BufferRole::Weights,
+            })?;
+    let mut words = Vec::new();
+    words
+        .try_reserve_exact(word_count)
+        .map_err(|_| KernelError::AllocationFailure {
+            buffer: BufferRole::Weights,
+            requested_bytes,
+        })?;
+    Ok(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_reserve_words;
+    use crate::{BufferRole, KernelError};
+
+    #[test]
+    fn impossible_word_reservation_reports_exact_requested_bytes() {
+        let word_count = usize::MAX / size_of::<u16>();
+        let requested_bytes = word_count * size_of::<u16>();
+
+        assert_eq!(
+            try_reserve_words(word_count),
+            Err(KernelError::AllocationFailure {
+                buffer: BufferRole::Weights,
+                requested_bytes,
+            })
+        );
+    }
 }

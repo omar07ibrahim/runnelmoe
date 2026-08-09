@@ -50,6 +50,44 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test all targets
         run: cargo test --workspace --all-targets --locked
+      - name: Exercise scheduler feature boundaries
+        run: |
+          cargo clippy -p runnel-scheduler --all-targets --all-features \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets --all-features --locked
+          cargo clippy -p runnel-scheduler --all-targets --no-default-features \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets \
+            --no-default-features --locked
+          cargo clippy -p runnel-scheduler --all-targets \
+            --no-default-features --features actor-stress-instrumentation \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets \
+            --no-default-features --features actor-stress-instrumentation --locked
+          cargo clippy -p runnel-scheduler --all-targets \
+            --no-default-features --features deterministic-checkpoint-instrumentation \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets \
+            --no-default-features --features deterministic-checkpoint-instrumentation \
+            --locked
+          cargo clippy -p runnel-scheduler --all-targets \
+            --no-default-features --features m5-run-observer-instrumentation \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets \
+            --no-default-features --features m5-run-observer-instrumentation \
+            --locked
+          cargo clippy -p runnel-scheduler --all-targets --no-default-features \
+            --features deterministic-checkpoint-instrumentation,m5-run-observer-instrumentation \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets --no-default-features \
+            --features deterministic-checkpoint-instrumentation,m5-run-observer-instrumentation \
+            --locked
+          cargo clippy -p runnel-scheduler --all-targets --no-default-features \
+            --features actor-stress-instrumentation,m5-run-observer-instrumentation \
+            --locked -- -D warnings
+          cargo test -p runnel-scheduler --all-targets --no-default-features \
+            --features actor-stress-instrumentation,m5-run-observer-instrumentation \
+            --locked
       - name: Smoke-test the closed M4 evidence protocol
         run: |
           cargo build --locked -p runnel-kernels --bin runnel-kernel-bench \
@@ -131,7 +169,7 @@ jobs:
 
   oracle:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -147,6 +185,46 @@ jobs:
         run: python -m oracle.generate --check
       - name: Verify committed adapter-v2 oracle vectors
         run: python -m oracle.generate --check --spec fixtures/tiny-v2/spec.json
+      - name: Verify committed adapter-v3 oracle vectors
+        run: python -m oracle.generate --check --spec fixtures/tiny-v3/spec.json
+      - name: Verify committed sampling vectors
+        run: python -m oracle.sampling --check
+      - name: Verify committed scheduler stress inputs
+        run: python -m oracle.scheduler --check
+      - name: Cross-check the bounded actor semantic golden
+        run: |
+          exchange_dir="$(mktemp -d /dev/shm/runnel-actor-golden.XXXXXX)"
+          test "$(stat -c %a "$exchange_dir")" = 700
+          python -m oracle.actor_transcript \
+            fixtures/scheduler/actor-golden-v1.json \
+            --expected-digest fixtures/scheduler/actor-golden-v1.sha256 \
+            --transcript "$exchange_dir/committed-transcript.bin"
+          RUNNEL_ACTOR_GOLDEN_CAPTURE="$exchange_dir/capture.json" \
+            cargo test -p runnel-scheduler --test actor_script \
+              --no-default-features --features actor-stress-instrumentation \
+              deterministic_actor_semantic_golden_is_bounded_and_structurally_sound \
+              --locked
+          python -m oracle.actor_transcript "$exchange_dir/capture.json" \
+            --expected-digest fixtures/scheduler/actor-golden-v1.sha256 \
+            --transcript "$exchange_dir/python-transcript.bin" --validate-model
+          cmp "$exchange_dir/committed-transcript.bin" \
+            "$exchange_dir/python-transcript.bin"
+          RUNNEL_ACTOR_PYTHON_TRANSCRIPT="$exchange_dir/python-transcript.bin" \
+            cargo test -p runnel-scheduler --test actor_script \
+              --no-default-features --features actor-stress-instrumentation \
+              deterministic_actor_semantic_golden_is_bounded_and_structurally_sound \
+              --locked
+      - name: Cross-check the genuine actor race histories
+        run: |
+          race_dir="$(mktemp -d /dev/shm/runnel-actor-race.XXXXXX)"
+          test "$(stat -c %a "$race_dir")" = 700
+          RUNNEL_ACTOR_RACE_CAPTURE="$race_dir/capture.json" \
+            cargo test -p runnel-scheduler --test actor_script \
+              --no-default-features --features actor-stress-instrumentation \
+              race::tests::genuine_actor_race_capture_runs_exactly_32_fresh_repetitions \
+              --locked -- --exact
+          test "$(stat -c %a "$race_dir/capture.json")" = 600
+          python -m oracle.actor_race_verify "$race_dir/capture.json"
       - name: Test the independent oracle
         run: python -m unittest discover -s oracle/tests -v
 

@@ -80,6 +80,14 @@ pub enum KernelError {
     SizeOverflow {
         buffer: BufferRole,
     },
+    AllocationFailure {
+        buffer: BufferRole,
+        requested_bytes: usize,
+    },
+    WorkspaceRowsExceedMaximum {
+        max_rows: usize,
+        requested_rows: usize,
+    },
     MatrixLengthMismatch {
         expected_words: usize,
         actual_words: usize,
@@ -141,6 +149,20 @@ impl fmt::Display for KernelError {
                 )
             }
             Self::SizeOverflow { buffer } => write!(formatter, "{buffer} size overflows usize"),
+            Self::AllocationFailure {
+                buffer,
+                requested_bytes,
+            } => write!(
+                formatter,
+                "failed to reserve {requested_bytes} bytes for {buffer}"
+            ),
+            Self::WorkspaceRowsExceedMaximum {
+                max_rows,
+                requested_rows,
+            } => write!(
+                formatter,
+                "workspace maximum is {max_rows} rows, requested {requested_rows}"
+            ),
             Self::MatrixLengthMismatch {
                 expected_words,
                 actual_words,

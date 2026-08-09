@@ -68,13 +68,15 @@ Adapter/tokenizer versions and vocabulary size are positive. Their IDs match
 most 128 unique ASCII identifier keys and unsigned-integer values. An adapter
 must reject unknown, missing, zero, inconsistent, or over-limit dimensions.
 
-The supported adapter ID is `runnel.tiny-causal-moe`, versions 1 and 2. Both
-versions have a model map containing exactly `context_length`,
+The supported adapter ID is `runnel.tiny-causal-moe`, versions 1, 2, and 3.
+All versions have a model map containing exactly `context_length`,
 `expert_hidden_size`, `hidden_size`, `num_experts`, `num_heads`, `num_layers`,
 `top_k`, and `vocab_size`. All are positive; `top_k <= num_experts`,
 `hidden_size % num_heads == 0`, and both vocabulary values are equal. Both
-versions use the frozen tiny topology: context length 16, expert width 12,
-hidden width 8, four experts, two heads, one layer, top two, and vocabulary 32.
+versions 1 and 2 use the frozen tiny topology with context length 16. Version 3
+changes only that cap to 1,024. Every version otherwise requires expert width
+12, hidden width 8, four experts, two heads, one layer, top two, and vocabulary
+32. Cross-version context mixtures are rejected by the parser.
 
 ## Object records and page tables
 

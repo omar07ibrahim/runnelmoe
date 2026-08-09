@@ -246,3 +246,257 @@ independent reviews, host caveats, and claim boundaries are in the
 [M4 review](reviews/M4_REVIEW.md). CI byte-regenerates the summary and both
 figures. Preserve the implementation commit with a merge commit; squashing or
 rebasing would break historical harness custody.
+
+## M5 direct atomic batch-admission verification
+
+The direct synchronous engine batch API is not the Tokio actor command path.
+Its tests cover complete-slice validation, FIFO-prefix pressure parity,
+release-relative and absolute deadline rollback, exact ID/generation rollback,
+semantic reserve exact-fit/one-byte-short construction, holey free-list
+equivalence, stale-control races, inert permit drop, endpoint order, full
+completion/cancellation/reap, and slot/control/endpoint reuse. No command below
+downloads weights or records timing evidence:
+
+```console
+cargo fmt --all -- --check
+cargo clippy -p runnel-scheduler --all-targets --all-features --locked --offline -- -D warnings
+cargo test -p runnel-scheduler --all-targets --all-features --locked --offline
+cargo clippy -p runnel-scheduler --all-targets --no-default-features --locked --offline -- -D warnings
+cargo test -p runnel-scheduler --all-targets --no-default-features --locked --offline
+cargo clippy -p runnel-scheduler --all-targets --no-default-features \
+  --features deterministic-checkpoint-instrumentation --locked --offline -- -D warnings
+cargo test -p runnel-scheduler --all-targets --no-default-features \
+  --features deterministic-checkpoint-instrumentation --locked --offline
+RUSTDOCFLAGS="-D warnings" cargo doc -p runnel-scheduler --no-deps --locked --offline
+```
+
+`SchedulerEngine::<A>::required_batch_admission_reserve_bytes` reports the
+adapter-typed semantic Vec-payload requirement. It intentionally excludes
+allocator metadata and over-allocation; whole-process RSS remains an observed
+quantity. A smaller raw reserve is rejected before shared engine allocation.
+
+## M5 deterministic transaction-checkpoint verification
+
+`deterministic-checkpoint-instrumentation` exposes a hidden test-instrumentation
+API to external integration tests. A concrete `CheckpointPlan` binds at most
+64 directives to one live engine and to the target request generation before
+execution. The engine never calls an injected closure. The plan allocates once
+while preparing, then records fixed-size effects in place; the ordinary
+feature-off step path monomorphizes through the sealed no-checkpoint driver.
+
+The four addressable boundaries are post-router/pre-expert,
+ready-to-commit/pre-publication-plan, composite-permit/pre-final-snapshot, and
+post-final-snapshot/pre-apply. The last boundary deliberately occurs after the
+clock and control values for that position are fixed, so a signal there loses
+to exactly that position. The closed action set is observe, cancel, inclusive
+deadline expiry, and cancel followed by expiry. Generation, engine-domain,
+deadline, duplicate, count, and stale-slot validation all fail closed.
+
+The library matrix checks all three mutating actions at every boundary,
+cancellation precedence, exact state/RNG/output/service prefixes, skipped
+expert work at the earliest boundary, output-blocked cleanup, slot reuse, and
+ownership return. The external tiny-v3 workload additionally freezes 12
+long-prefill requests and three distinct cancellation boundaries without
+downloading weights:
+
+```console
+cargo test -p runnel-scheduler --lib engine_adversarial_tests \
+  --no-default-features --features deterministic-checkpoint-instrumentation \
+  --locked --offline
+cargo test -p runnel-scheduler --test checkpoint_instrumented_public \
+  --no-default-features --features deterministic-checkpoint-instrumentation \
+  --locked --offline
+```
+
+Checkpoint-plan allocation and the integration harness are correctness
+instrumentation and are excluded from M5 timing regions. This gate does not
+claim that the full M5 evidence capture has landed.
+
+## M5 scheduling-policy verification
+
+`SchedulerConfig::new` defaults to the versioned continuous DRR/coalescing
+policy. `with_scheduling_policy` immutably selects the FIFO run-to-completion
+comparison baseline without changing geometry, preallocated wave capacity, or
+logical charges. Focused tests prove exact first-service order, blocked-head
+behavior, non-head cancellation cleanup, atomic common-release admission, and
+greedy/seeded output parity. Closed-round cursor normalization prevents a
+mid-round arrival from occupying the rollover cursor while a member of the
+closed snapshot survives, including through terminal and cancellation removals
+before the next round opens:
+
+```console
+cargo test -p runnel-scheduler --lib ring::tests --locked --offline
+cargo test -p runnel-scheduler --test engine \
+  explicit_policies_have_frozen_names_and_distinct_service_order \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  fifo_and_continuous_policies_preserve_per_request_token_parity \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  fifo_output_blocking_holds_the_head_while_non_head_cancellation_cleans_up \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test policy_replay \
+  direct_first_sixteen_trace_replays_frozen_policy_fairness \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test policy_replay \
+  continuous_arrival_1000_has_no_starvation_or_cleanup_service \
+  --locked --offline -- --exact
+```
+
+The replay target forces the real tiny-v3 scalar backend. It checks the exact
+candidate and FIFO 16-event prefixes plus integer lag/gap/Jain arithmetic. The
+continuous test uses the frozen 1,000-turn admission and sink schedule, checks
+every request/position/phase event against an independent formula, reconciles a
+final origin read, and proves cancellation cleanup adds no service before both
+request and shared ownership reach zero. These are policy/correctness gates,
+not performance evidence. The timed M5 capture harness, measured service rows,
+measured ledger rows, and run-level observer remain outstanding.
+
+## M5 deterministic cooperative-preemption verification
+
+The `resident-step-budget-preemption-v1` mechanism yields resident request
+work at the exact final `waves_per_step` commit. An unfinished request enters
+`Preempted` as part of that commit; the actor gets a command/control
+opportunity, and the next pump
+resolves cancellation and inclusive deadlines before an allocation-free
+resume. Ring membership, service order and credit, adapter state, prompt and
+active reservations, RNG, output endpoints, and ledger ownership remain
+resident. Output blocking, completion, terminal control, and contained adapter
+failures take precedence.
+
+The resume audit is two-pass and linear in slots plus queued and ring members.
+It authenticates slot/request identity, complete ownership, zero applied
+service deficit, absence from the admission queue, and exact resident-member
+cardinality before mutating any phase. Fault injection removes a later member
+and proves that no earlier request partially resumes. Focused gates are:
+
+```console
+cargo test -p runnel-scheduler --test engine \
+  cooperative_preemption_preserves_resident_ownership_and_resumes_exactly \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  preempted_controls_win_before_resume_and_preserve_the_committed_prefix \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  preemption_is_service_trace_and_token_neutral_for_both_policies \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --lib preempted_resume_audit \
+  --locked --offline
+cargo test -p runnel-scheduler --lib \
+  resident_preemption_yields_between_physical_pumps \
+  --locked --offline
+cargo test -p runnel-scheduler --test actor_public --locked --offline
+```
+
+The partition test compares one-wave and four-wave pumps for FIFO and
+continuous scheduling with greedy and independently seeded sampling. It
+requires identical complete service traces, tokens, terminal counts, and
+outcomes. The actor test uses a one-wave pump and completes across multiple
+preemption boundaries without an external wake. The checkpoint and public
+manual-clock suites together cover queued, ready, expert-owned,
+ready-to-commit, output-blocked, and preempted expiry with cancellation
+precedence.
+
+This is control-plane cooperative preemption, not adapter-state swapping or
+memory reclamation. No opaque state serialization/restore ABI exists, and no
+such claim is made. Timed preemption counts remain part of the outstanding M5
+capture.
+
+## M5 bounded service-trace verification
+
+`SchedulerEngine::service_trace_since` returns an allocation-free borrowed
+suffix of the append-only successful-commit prefix. Retain only its returned
+cursor with the same engine, or read from origin for complete evidence; cursors
+are opaque ordinals rather than engine-authentication tokens. The status
+distinguishes an exactly full, complete trace
+from sticky overflow; reading never clears occupancy or changes the static
+`trace_capacity * 128` logical charge. Event `Debug` output redacts request
+identity and position. Callers that need evidence must serialize the final
+healthy prefix before successful shutdown releases the trace storage.
+
+Focused tests cover incremental cursors, the frozen phase boundary, out-of-range
+cursors, exact-full versus overflow, behavioral parity across trace
+limits, cancellation/deadline suppression, post-commit adapter failure, debug
+redaction, and shutdown accounting:
+
+```console
+cargo test -p runnel-scheduler --test engine \
+  public_service_trace_is_incremental_phase_exact_and_debug_redacted \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  trace_overflow_is_sticky_accounted_and_behavior_neutral \
+  --locked --offline -- --exact
+cargo test -p runnel-scheduler --test engine \
+  suppressed_control_decisions_do_not_append_service_events \
+  --locked --offline -- --exact
+```
+
+This is semantic scheduler evidence, not a wall-clock timing source. It omits
+tokens, prompts, sampling state, routes, deadlines, adapter identities, and
+timestamps.
+
+## M5 bounded ledger-trace verification
+
+`SchedulerEngine::ledger_trace_since` returns an allocation-free borrowed
+suffix coupled to the immutable sequence-zero ledger snapshot. Each later
+sequence is one complete, canonically ordered request-owned mutation. Owner
+zero is reserved for the shared initial state; accepted request IDs own every
+positive admission/promotion and negative terminal/reap delta. Exact rollback,
+prepared-admission drop, fit checks, reservation splits, and per-token
+occupancy emit no events and cannot change replayed peaks.
+
+Read from `LedgerTraceCursor::origin()` for a self-contained replay. An
+incremental consumer must keep every returned cursor and the state produced by
+the preceding suffix with the same engine; the repeated initial snapshot does
+not reconstruct events intentionally skipped by a later cursor. A foreign
+ordinal inside a repeated-sequence mutation is rejected rather than returning
+a partial mutation.
+
+The ledger and service arrays each retain `trace_capacity` entries under the
+existing `trace_capacity * 128` combined charge. Their cursors and sticky
+overflow states are independent. A ledger mutation is all-or-nothing: an
+insufficient suffix appends no partial category group and has no effect on
+execution, accounting, or the service prefix. Capture must serialize the final
+request-zero, shared-only replay before successful shutdown destroys both
+arrays; the post-shutdown ordinary snapshot then proves shared and aggregate
+zero.
+
+Run the focused public replay/lifecycle gate with:
+
+```console
+cargo test -p runnel-scheduler --test ledger_trace --locked --offline
+cargo test -p runnel-scheduler --test policy_replay \
+  continuous_arrival_1000_has_no_starvation_or_cleanup_service \
+  --locked --offline -- --exact
+```
+
+The continuous-arrival correctness configuration deliberately has only 1,024
+ledger slots and more than 14,000 durable category deltas, so ledger overflow
+is expected there while its exactly 1,000-event service stream remains healthy.
+Measured M5 rows instead require both 8,192-slot streams to be complete.
+
+## M5 genuine actor-race verification
+
+The feature-gated scheduler race runs exactly 32 fresh two-producer
+repetitions and publishes one bounded capture into a private tmpfs directory.
+The authoritative verifier consumes that Rust capture in one direction: Rust
+does not receive a Python digest, transcript, accepted set, or other derived
+artifact. Run the CI gate exactly with:
+
+```console
+race_dir="$(mktemp -d /dev/shm/runnel-actor-race.XXXXXX)"
+test "$(stat -c %a "$race_dir")" = 700
+RUNNEL_ACTOR_RACE_CAPTURE="$race_dir/capture.json" \
+  cargo test -p runnel-scheduler --test actor_script \
+    --no-default-features --features actor-stress-instrumentation \
+    race::tests::genuine_actor_race_capture_runs_exactly_32_fresh_repetitions \
+    --locked -- --exact
+test "$(stat -c %a "$race_dir/capture.json")" = 600
+python -m oracle.actor_race_verify "$race_dir/capture.json"
+```
+
+The default Python command enables the mandatory independent PyTorch model
+gate and is the only publishable mode. `--no-model` validates structural
+history for diagnosis but reports `NONPUBLISHABLE` and cannot support model
+parity or token-prefix claims. The command above is a correctness gate, not an
+accepted timing result or performance claim.

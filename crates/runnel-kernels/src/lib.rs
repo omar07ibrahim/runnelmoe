@@ -56,18 +56,40 @@ impl<'a> FiniteInput<'a> {
     }
 }
 
-/// Caller-owned scratch reused by prepared GEMVs.
-#[derive(Clone, Debug)]
+/// Caller-owned scratch reused by prepared GEMVs without allocation growth.
+#[derive(Debug)]
 pub struct GemvWorkspace {
     temporary_output: Vec<f32>,
+    max_rows: usize,
 }
 
 impl GemvWorkspace {
-    #[must_use]
-    pub fn new(rows: usize) -> Self {
-        Self {
-            temporary_output: vec![0.0; rows],
-        }
+    /// Reserves scratch for at most `max_rows` output elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::SizeOverflow`] when the byte count cannot be
+    /// represented, or [`KernelError::AllocationFailure`] when the requested
+    /// allocation cannot be reserved. No workspace becomes visible on error.
+    pub fn try_new(max_rows: usize) -> Result<Self, KernelError> {
+        let requested_bytes =
+            max_rows
+                .checked_mul(size_of::<f32>())
+                .ok_or(KernelError::SizeOverflow {
+                    buffer: BufferRole::Workspace,
+                })?;
+        let mut temporary_output = Vec::new();
+        temporary_output.try_reserve_exact(max_rows).map_err(|_| {
+            KernelError::AllocationFailure {
+                buffer: BufferRole::Workspace,
+                requested_bytes,
+            }
+        })?;
+        temporary_output.resize(max_rows, 0.0);
+        Ok(Self {
+            temporary_output,
+            max_rows,
+        })
     }
 
     #[must_use]
@@ -75,15 +97,35 @@ impl GemvWorkspace {
         self.temporary_output.len()
     }
 
-    /// Changes the logical row count while retaining the allocation whenever
-    /// the requested size fits its existing capacity.
+    #[must_use]
+    pub const fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.temporary_output.capacity()
+    }
+
+    /// Changes the logical row count without moving or growing scratch.
     ///
-    /// Prepared operations still require an exact logical row count. Callers
-    /// that need to reuse one maximum-sized allocation across differently
-    /// shaped GEMVs can resize it immediately before each invocation without
-    /// weakening that validation contract.
-    pub fn resize_rows(&mut self, rows: usize) {
+    /// Prepared operations still require an exact logical row count. A row
+    /// count above the maximum declared to [`Self::try_new`] is rejected
+    /// without changing the logical row count or allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::WorkspaceRowsExceedMaximum`] when `rows` is
+    /// above the construction-time maximum.
+    pub fn set_rows(&mut self, rows: usize) -> Result<(), KernelError> {
+        if rows > self.max_rows {
+            return Err(KernelError::WorkspaceRowsExceedMaximum {
+                max_rows: self.max_rows,
+                requested_rows: rows,
+            });
+        }
         self.temporary_output.resize(rows, 0.0);
+        Ok(())
     }
 }
 
@@ -252,4 +294,67 @@ fn validate_finite_output(output: &[f32]) -> Result<(), KernelError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::{BufferRole, GemvWorkspace, KernelError};
+
+    fn allocation_signature(workspace: &GemvWorkspace) -> (*const f32, usize) {
+        (
+            workspace.temporary_output.as_ptr(),
+            workspace.temporary_output.capacity(),
+        )
+    }
+
+    #[test]
+    fn workspace_construction_rejects_overflow_and_impossible_reservation() {
+        assert!(matches!(
+            GemvWorkspace::try_new(usize::MAX),
+            Err(KernelError::SizeOverflow {
+                buffer: BufferRole::Workspace
+            })
+        ));
+
+        let impossible_rows = (isize::MAX as usize / size_of::<f32>()) + 1;
+        let impossible_bytes = impossible_rows * size_of::<f32>();
+        assert!(matches!(
+            GemvWorkspace::try_new(impossible_rows),
+            Err(KernelError::AllocationFailure {
+                buffer: BufferRole::Workspace,
+                requested_bytes,
+            }) if requested_bytes == impossible_bytes
+        ));
+    }
+
+    #[test]
+    fn above_maximum_rejection_preserves_rows_and_allocation() {
+        let mut workspace = GemvWorkspace::try_new(12).unwrap();
+        workspace.set_rows(8).unwrap();
+        let before = allocation_signature(&workspace);
+
+        assert_eq!(
+            workspace.set_rows(13),
+            Err(KernelError::WorkspaceRowsExceedMaximum {
+                max_rows: 12,
+                requested_rows: 13,
+            })
+        );
+        assert_eq!(workspace.rows(), 8);
+        assert_eq!(allocation_signature(&workspace), before);
+    }
+
+    #[test]
+    fn maximum_to_narrow_to_maximum_reuses_one_allocation() {
+        let mut workspace = GemvWorkspace::try_new(12).unwrap();
+        let initial = allocation_signature(&workspace);
+
+        workspace.set_rows(8).unwrap();
+        assert_eq!(workspace.rows(), 8);
+        assert_eq!(allocation_signature(&workspace), initial);
+
+        workspace.set_rows(12).unwrap();
+        assert_eq!(workspace.rows(), 12);
+        assert_eq!(allocation_signature(&workspace), initial);
+    }
 }

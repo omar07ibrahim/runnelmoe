@@ -96,10 +96,59 @@ fn matrix_loads_little_endian_and_rejects_nonfinite_words() {
 }
 
 #[test]
+fn matrix_byte_decode_rejects_truncated_and_overlong_payloads() {
+    assert_eq!(
+        Bf16Matrix::from_le_bytes(1, 1, &[0x80]),
+        Err(KernelError::ByteLengthMismatch {
+            expected_bytes: 2,
+            actual_bytes: 1,
+        })
+    );
+    assert_eq!(
+        Bf16Matrix::from_le_bytes(1, 1, &[0x80, 0x3f, 0x00]),
+        Err(KernelError::ByteLengthMismatch {
+            expected_bytes: 2,
+            actual_bytes: 3,
+        })
+    );
+}
+
+#[test]
+fn matrix_byte_decode_rejects_impossible_geometry_before_reservation() {
+    assert_eq!(
+        Bf16Matrix::from_le_bytes(usize::MAX, 2, &[]),
+        Err(KernelError::SizeOverflow {
+            buffer: runnel_kernels::BufferRole::Weights,
+        })
+    );
+    assert_eq!(
+        Bf16Matrix::from_le_bytes(1, usize::MAX, &[]),
+        Err(KernelError::SizeOverflow {
+            buffer: runnel_kernels::BufferRole::Weights,
+        })
+    );
+}
+
+#[test]
+fn matrix_debug_exposes_metadata_but_redacts_weight_words() {
+    let sentinel = 0x4123_u16;
+    let matrix = Bf16Matrix::from_words(1, 1, vec![sentinel]).unwrap();
+    let debug = format!("{matrix:?}");
+
+    assert!(debug.contains("rows: 1"));
+    assert!(debug.contains("columns: 1"));
+    assert!(debug.contains("storage_words: 1"));
+    assert!(debug.contains("word_offset: 0"));
+    assert!(debug.contains("payload: \"<redacted>\""));
+    assert!(!debug.contains(&format!("{sentinel}")));
+    assert!(!debug.contains(&format!("0x{sentinel:04x}")));
+}
+
+#[test]
 fn owned_prefix_exposes_only_the_exact_logical_matrix() {
     let storage = vec![0x7f80, 0x3f80, 0xc000].into_boxed_slice();
     let allocation_address = storage.as_ptr() as usize;
-    let matrix = Bf16Matrix::from_storage(1, 2, storage, 1).unwrap();
+    let matrix = Bf16Matrix::from_storage(1, 2, storage.into_vec(), 1).unwrap();
     let logical_address = matrix.words().as_ptr() as usize;
 
     assert_eq!(logical_address - allocation_address, size_of::<u16>());

@@ -1,0 +1,731 @@
+{
+  "categorical_cases": [
+    {
+      "id": "unit-zero",
+      "input": {
+        "candidates": [
+          {
+            "token_id": 7,
+            "weight_f64_hex": "0x1.0000000000000p+0"
+          },
+          {
+            "token_id": 3,
+            "weight_f64_hex": "0x1.0000000000000p+0"
+          }
+        ],
+        "unit_f64_hex": "0x0.0p+0"
+      },
+      "output": {
+        "chosen_token_id": 7,
+        "cumulative_f64_hex": [
+          "0x1.0000000000000p-1",
+          "0x1.0000000000000p+0"
+        ],
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "unit-nextafter-zero",
+      "input": {
+        "candidates": [
+          {
+            "token_id": 7,
+            "weight_f64_hex": "0x1.0000000000000p+0"
+          },
+          {
+            "token_id": 3,
+            "weight_f64_hex": "0x1.0000000000000p+0"
+          }
+        ],
+        "unit_f64_hex": "0x0.0000000000001p-1022"
+      },
+      "output": {
+        "chosen_token_id": 7,
+        "cumulative_f64_hex": [
+          "0x1.0000000000000p-1",
+          "0x1.0000000000000p+0"
+        ],
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "unit-half-strict-boundary",
+      "input": {
+        "candidates": [
+          {
+            "token_id": 7,
+            "weight_f64_hex": "0x1.0000000000000p+0"
+          },
+          {
+            "token_id": 3,
+            "weight_f64_hex": "0x1.0000000000000p+0"
+          }
+        ],
+        "unit_f64_hex": "0x1.0000000000000p-1"
+      },
+      "output": {
+        "chosen_token_id": 3,
+        "cumulative_f64_hex": [
+          "0x1.0000000000000p-1",
+          "0x1.0000000000000p+0"
+        ],
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "unit-nextafter-one",
+      "input": {
+        "candidates": [
+          {
+            "token_id": 7,
+            "weight_f64_hex": "0x1.0000000000000p+0"
+          },
+          {
+            "token_id": 3,
+            "weight_f64_hex": "0x1.0000000000000p+0"
+          }
+        ],
+        "unit_f64_hex": "0x1.fffffffffffffp-1"
+      },
+      "output": {
+        "chosen_token_id": 3,
+        "cumulative_f64_hex": [
+          "0x1.0000000000000p-1",
+          "0x1.0000000000000p+0"
+        ],
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "final-sum-one-ulp-low-fallback",
+      "input": {
+        "candidates": [
+          {
+            "token_id": 7,
+            "weight_f64_hex": "0x1.0000000000000p+3"
+          },
+          {
+            "token_id": 3,
+            "weight_f64_hex": "0x1.2000000000000p+3"
+          },
+          {
+            "token_id": 11,
+            "weight_f64_hex": "0x1.2000000000000p+3"
+          },
+          {
+            "token_id": 5,
+            "weight_f64_hex": "0x1.2000000000000p+3"
+          }
+        ],
+        "unit_f64_hex": "0x1.fffffffffffffp-1"
+      },
+      "output": {
+        "chosen_token_id": 5,
+        "cumulative_f64_hex": [
+          "0x1.d41d41d41d41dp-3",
+          "0x1.f15f15f15f15ep-2",
+          "0x1.7c57c57c57c57p-1",
+          "0x1.fffffffffffffp-1"
+        ],
+        "used_rounding_fallback": true
+      }
+    }
+  ],
+  "float_encoding": "f32-bits-hex-input_f64-float-hex-diagnostics",
+  "invalid_cases": [
+    {
+      "expected_error": "invalid_request",
+      "id": "empty-logits",
+      "input": {
+        "id": "empty-logits",
+        "logit_f32_bits": [],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "logit-qnan",
+      "input": {
+        "id": "logit-qnan",
+        "logit_f32_bits": [
+          "0x7fc00000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "logit-positive-infinity",
+      "input": {
+        "id": "logit-positive-infinity",
+        "logit_f32_bits": [
+          "0x7f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "logit-negative-infinity",
+      "input": {
+        "id": "logit-negative-infinity",
+        "logit_f32_bits": [
+          "0xff800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "temperature-zero",
+      "input": {
+        "id": "temperature-zero",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x00000000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "temperature-negative",
+      "input": {
+        "id": "temperature-negative",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0xbf800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "temperature-qnan",
+      "input": {
+        "id": "temperature-qnan",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x7fc00000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "temperature-infinity",
+      "input": {
+        "id": "temperature-infinity",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x7f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "top-k-zero",
+      "input": {
+        "id": "top-k-zero",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 0,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "top-k-above-vocab",
+      "input": {
+        "id": "top-k-above-vocab",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 3,
+        "top_p_f32_bits": "0x3f800000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "top-p-zero",
+      "input": {
+        "id": "top-p-zero",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x00000000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "top-p-above-one",
+      "input": {
+        "id": "top-p-above-one",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f800001"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "top-p-qnan",
+      "input": {
+        "id": "top-p-qnan",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x7fc00000"
+      }
+    },
+    {
+      "expected_error": "invalid_request",
+      "id": "top-p-infinity",
+      "input": {
+        "id": "top-p-infinity",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x3f800000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x7f800000"
+      }
+    }
+  ],
+  "rng_cases": [
+    {
+      "id": "state-zero",
+      "state_after_hex": "0x9e3779b97f4a7c15",
+      "state_before_hex": "0x0000000000000000",
+      "unit_f64_hex": "0x1.c4415072f63b9p-1",
+      "word_hex": "0xe220a8397b1dcdaf"
+    },
+    {
+      "id": "state-one",
+      "state_after_hex": "0x9e3779b97f4a7c16",
+      "state_before_hex": "0x0000000000000001",
+      "unit_f64_hex": "0x1.22145bd91204bp-1",
+      "word_hex": "0x910a2dec89025cc1"
+    },
+    {
+      "id": "state-representative",
+      "state_after_hex": "0x9f5abf2108f64a04",
+      "state_before_hex": "0x0123456789abcdef",
+      "unit_f64_hex": "0x1.57a3807a48fa8p-4",
+      "word_hex": "0x157a3807a48faa9d"
+    },
+    {
+      "id": "state-max",
+      "state_after_hex": "0x9e3779b97f4a7c14",
+      "state_before_hex": "0xffffffffffffffff",
+      "unit_f64_hex": "0x1.c9b2e2ee36ca5p-1",
+      "word_hex": "0xe4d971771b652c20"
+    }
+  ],
+  "sample_cases": [
+    {
+      "id": "stable-logit-ties",
+      "input": {
+        "id": "stable-logit-ties",
+        "logit_f32_bits": [
+          "0x3f800000",
+          "0x40000000",
+          "0x40000000",
+          "0x00000000"
+        ],
+        "state_before_hex": "0x0000000000000000",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 4,
+        "top_p_f32_bits": "0x3f800000"
+      },
+      "output": {
+        "categorical_cumulative_f64_hex": [
+          "0x1.9912f016b1180p-2",
+          "0x1.9912f016b1180p-1",
+          "0x1.e451a5515a763p-1",
+          "0x1.0000000000000p+0"
+        ],
+        "chosen_token_id": 0,
+        "ordered_token_ids": [
+          1,
+          2,
+          0,
+          3
+        ],
+        "random_unit_f64_hex": "0x1.c4415072f63b9p-1",
+        "random_word_hex": "0xe220a8397b1dcdaf",
+        "retained_sum_f64_hex": "0x1.4069571019604p+1",
+        "retained_token_ids": [
+          1,
+          2,
+          0,
+          3
+        ],
+        "scaled_logits_f64_hex": [
+          "0x1.0000000000000p+1",
+          "0x1.0000000000000p+1",
+          "0x1.0000000000000p+0",
+          "0x0.0p+0"
+        ],
+        "softmax_total_f64_hex": "0x1.4069571019604p+1",
+        "softmax_weights_f64_hex": [
+          "0x1.0000000000000p+0",
+          "0x1.0000000000000p+0",
+          "0x1.78b56362cef38p-2",
+          "0x1.152aaa3bf81ccp-3"
+        ],
+        "state_after_hex": "0x9e3779b97f4a7c15",
+        "top_k_token_ids": [
+          1,
+          2,
+          0,
+          3
+        ],
+        "top_p_threshold_f64_hex": "0x1.4069571019604p+1",
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "top-k-one",
+      "input": {
+        "id": "top-k-one",
+        "logit_f32_bits": [
+          "0xbf800000",
+          "0x40400000",
+          "0x40000000"
+        ],
+        "state_before_hex": "0x0000000000000001",
+        "temperature_f32_bits": "0x40000000",
+        "top_k": 1,
+        "top_p_f32_bits": "0x3dcccccd"
+      },
+      "output": {
+        "categorical_cumulative_f64_hex": [
+          "0x1.0000000000000p+0"
+        ],
+        "chosen_token_id": 1,
+        "ordered_token_ids": [
+          1,
+          2,
+          0
+        ],
+        "random_unit_f64_hex": "0x1.22145bd91204bp-1",
+        "random_word_hex": "0x910a2dec89025cc1",
+        "retained_sum_f64_hex": "0x1.0000000000000p+0",
+        "retained_token_ids": [
+          1
+        ],
+        "scaled_logits_f64_hex": [
+          "0x1.8000000000000p+0"
+        ],
+        "softmax_total_f64_hex": "0x1.0000000000000p+0",
+        "softmax_weights_f64_hex": [
+          "0x1.0000000000000p+0"
+        ],
+        "state_after_hex": "0x9e3779b97f4a7c16",
+        "top_k_token_ids": [
+          1
+        ],
+        "top_p_threshold_f64_hex": "0x1.99999a0000000p-4",
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "top-p-half-equality",
+      "input": {
+        "id": "top-p-half-equality",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x00000000"
+        ],
+        "state_before_hex": "0x0123456789abcdef",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f000000"
+      },
+      "output": {
+        "categorical_cumulative_f64_hex": [
+          "0x1.0000000000000p+0"
+        ],
+        "chosen_token_id": 0,
+        "ordered_token_ids": [
+          0,
+          1
+        ],
+        "random_unit_f64_hex": "0x1.57a3807a48fa8p-4",
+        "random_word_hex": "0x157a3807a48faa9d",
+        "retained_sum_f64_hex": "0x1.0000000000000p+0",
+        "retained_token_ids": [
+          0
+        ],
+        "scaled_logits_f64_hex": [
+          "0x0.0p+0",
+          "0x0.0p+0"
+        ],
+        "softmax_total_f64_hex": "0x1.0000000000000p+1",
+        "softmax_weights_f64_hex": [
+          "0x1.0000000000000p+0",
+          "0x1.0000000000000p+0"
+        ],
+        "state_after_hex": "0x9f5abf2108f64a04",
+        "top_k_token_ids": [
+          0,
+          1
+        ],
+        "top_p_threshold_f64_hex": "0x1.0000000000000p+0",
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "top-p-half-neighbor-below",
+      "input": {
+        "id": "top-p-half-neighbor-below",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x00000000"
+        ],
+        "state_before_hex": "0x0123456789abcdf0",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3effffff"
+      },
+      "output": {
+        "categorical_cumulative_f64_hex": [
+          "0x1.0000000000000p+0"
+        ],
+        "chosen_token_id": 0,
+        "ordered_token_ids": [
+          0,
+          1
+        ],
+        "random_unit_f64_hex": "0x1.300852f986e99p-1",
+        "random_word_hex": "0x9804297cc374ca1a",
+        "retained_sum_f64_hex": "0x1.0000000000000p+0",
+        "retained_token_ids": [
+          0
+        ],
+        "scaled_logits_f64_hex": [
+          "0x0.0p+0",
+          "0x0.0p+0"
+        ],
+        "softmax_total_f64_hex": "0x1.0000000000000p+1",
+        "softmax_weights_f64_hex": [
+          "0x1.0000000000000p+0",
+          "0x1.0000000000000p+0"
+        ],
+        "state_after_hex": "0x9f5abf2108f64a05",
+        "top_k_token_ids": [
+          0,
+          1
+        ],
+        "top_p_threshold_f64_hex": "0x1.fffffe0000000p-1",
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "top-p-half-neighbor-above",
+      "input": {
+        "id": "top-p-half-neighbor-above",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x00000000"
+        ],
+        "state_before_hex": "0x0123456789abcdf1",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 2,
+        "top_p_f32_bits": "0x3f000001"
+      },
+      "output": {
+        "categorical_cumulative_f64_hex": [
+          "0x1.0000000000000p-1",
+          "0x1.0000000000000p+0"
+        ],
+        "chosen_token_id": 1,
+        "ordered_token_ids": [
+          0,
+          1
+        ],
+        "random_unit_f64_hex": "0x1.5f1b2aa477d99p-1",
+        "random_word_hex": "0xaf8d95523beccaa2",
+        "retained_sum_f64_hex": "0x1.0000000000000p+1",
+        "retained_token_ids": [
+          0,
+          1
+        ],
+        "scaled_logits_f64_hex": [
+          "0x0.0p+0",
+          "0x0.0p+0"
+        ],
+        "softmax_total_f64_hex": "0x1.0000000000000p+1",
+        "softmax_weights_f64_hex": [
+          "0x1.0000000000000p+0",
+          "0x1.0000000000000p+0"
+        ],
+        "state_after_hex": "0x9f5abf2108f64a06",
+        "top_k_token_ids": [
+          0,
+          1
+        ],
+        "top_p_threshold_f64_hex": "0x1.0000020000000p+0",
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "smallest-positive-temperature",
+      "input": {
+        "id": "smallest-positive-temperature",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0x80000001",
+          "0x80000002"
+        ],
+        "state_before_hex": "0xffffffffffffffff",
+        "temperature_f32_bits": "0x00000001",
+        "top_k": 3,
+        "top_p_f32_bits": "0x3f800000"
+      },
+      "output": {
+        "categorical_cumulative_f64_hex": [
+          "0x1.549a766a06790p-1",
+          "0x1.d1e783412fa84p-1",
+          "0x1.fffffffffffffp-1"
+        ],
+        "chosen_token_id": 1,
+        "ordered_token_ids": [
+          0,
+          1,
+          2
+        ],
+        "random_unit_f64_hex": "0x1.c9b2e2ee36ca5p-1",
+        "random_word_hex": "0xe4d971771b652c20",
+        "retained_sum_f64_hex": "0x1.80d2ae2032c08p+0",
+        "retained_token_ids": [
+          0,
+          1,
+          2
+        ],
+        "scaled_logits_f64_hex": [
+          "0x0.0p+0",
+          "-0x1.0000000000000p+0",
+          "-0x1.0000000000000p+1"
+        ],
+        "softmax_total_f64_hex": "0x1.80d2ae2032c08p+0",
+        "softmax_weights_f64_hex": [
+          "0x1.0000000000000p+0",
+          "0x1.78b56362cef38p-2",
+          "0x1.152aaa3bf81ccp-3"
+        ],
+        "state_after_hex": "0x9e3779b97f4a7c14",
+        "top_k_token_ids": [
+          0,
+          1,
+          2
+        ],
+        "top_p_threshold_f64_hex": "0x1.80d2ae2032c08p+0",
+        "used_rounding_fallback": false
+      }
+    },
+    {
+      "id": "underflowed-nonmaximum-weight",
+      "input": {
+        "id": "underflowed-nonmaximum-weight",
+        "logit_f32_bits": [
+          "0x00000000",
+          "0xbf800000",
+          "0xc47a0000"
+        ],
+        "state_before_hex": "0xf0e1d2c3b4a59687",
+        "temperature_f32_bits": "0x3f800000",
+        "top_k": 3,
+        "top_p_f32_bits": "0x3f800000"
+      },
+      "output": {
+        "categorical_cumulative_f64_hex": [
+          "0x1.764d4f5d5a2bdp-1",
+          "0x1.0000000000000p+0"
+        ],
+        "chosen_token_id": 0,
+        "ordered_token_ids": [
+          0,
+          1,
+          2
+        ],
+        "random_unit_f64_hex": "0x1.52a0e7e8b6efdp-1",
+        "random_word_hex": "0xa95073f45b77edb4",
+        "retained_sum_f64_hex": "0x1.5e2d58d8b3bcep+0",
+        "retained_token_ids": [
+          0,
+          1
+        ],
+        "scaled_logits_f64_hex": [
+          "0x0.0p+0",
+          "-0x1.0000000000000p+0",
+          "-0x1.f400000000000p+9"
+        ],
+        "softmax_total_f64_hex": "0x1.5e2d58d8b3bcep+0",
+        "softmax_weights_f64_hex": [
+          "0x1.0000000000000p+0",
+          "0x1.78b56362cef38p-2",
+          "0x0.0p+0"
+        ],
+        "state_after_hex": "0x8f194c7d33f0129c",
+        "top_k_token_ids": [
+          0,
+          1,
+          2
+        ],
+        "top_p_threshold_f64_hex": "0x1.5e2d58d8b3bcep+0",
+        "used_rounding_fallback": false
+      }
+    }
+  ],
+  "schema": "runnel.sampling-vectors/1",
+  "specification": "adr-0007-seeded-sampling-v1",
+  "vector_id": "sha256:76a258c07a32e1a2dc61ad5d4d59827cfca469372e25b052bcf1f0bde38d6ccb"
+}

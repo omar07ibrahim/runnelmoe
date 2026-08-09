@@ -306,6 +306,37 @@ fn adapter_versions_are_closed_independently_of_the_rmoa_version() {
         2
     );
 
+    let version_three = version_one
+        .replacen(
+            "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":1}",
+            "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":3}",
+            1,
+        )
+        .replacen("\"context_length\":16", "\"context_length\":1024", 1);
+    assert_eq!(
+        Manifest::parse(version_three.as_bytes())
+            .unwrap()
+            .adapter
+            .version,
+        3
+    );
+
+    let mixed_v3 = version_one.replacen(
+        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":1}",
+        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":3}",
+        1,
+    );
+    assert!(matches!(
+        Manifest::parse(mixed_v3.as_bytes()),
+        Err(FormatError::Schema { ref path, .. }) if path == "$.model.context_length"
+    ));
+
+    let mixed_v2 = version_two.replacen("\"context_length\":16", "\"context_length\":1024", 1);
+    assert!(matches!(
+        Manifest::parse(mixed_v2.as_bytes()),
+        Err(FormatError::Schema { ref path, .. }) if path == "$.model.context_length"
+    ));
+
     let zero = version_one.replacen(
         "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":1}",
         "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":0}",
@@ -318,7 +349,7 @@ fn adapter_versions_are_closed_independently_of_the_rmoa_version() {
 
     let unsupported = version_one.replacen(
         "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":1}",
-        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":3}",
+        "\"adapter\":{\"id\":\"runnel.tiny-causal-moe\",\"version\":4}",
         1,
     );
     assert!(matches!(

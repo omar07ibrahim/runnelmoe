@@ -410,6 +410,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "runnel-scheduler"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "runnel-fixture",
+ "runnel-format",
+ "runnel-runtime",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "runnel-sim"
 version = "0.1.0"
 dependencies = [

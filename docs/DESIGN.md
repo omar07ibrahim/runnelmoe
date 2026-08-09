@@ -23,7 +23,8 @@ Default fixture dimensions are intentionally hand-inspectable: vocabulary 32,
 hidden width 8, one decoder block, four experts, top two selected, expert width
 12, and a short context cap. Weights are deterministically formula-generated
 from tensor ID and row-major index; there is no seed and no downloaded data.
-Seeded sampling is deliberately deferred to the scheduler/serving milestones.
+The M5 runtime provides deterministic seeded sampling primitives; scheduler
+integration and the serving policy surface remain milestone work.
 
 Tiny-v1 deliberately has no positional encoding. In this one-layer fixture,
 the final-token result is therefore invariant to permutations of the preceding
@@ -206,15 +207,166 @@ waiter owns only its waiter and prospective-lease reservations, so it may
 return after withdrawing them; any now-unwanted cache-owned physical load stays
 charged until its worker completion releases the page-pool reservation.
 
-The multi-request scheduler will use request-owned RNG state, stable request
-IDs, bounded queues, token-boundary preemption, and deficit-based service.
-Expert coalescing can reorder compute internally only when scatter restores
-the adapter's specified per-sequence semantics.
+The M5 scheduler contract is frozen in
+[ADR-0007](adr/0007-transactional-paged-scheduling.md) and is being implemented
+in independently testable vertical slices. The completed state slice supports
+adapter v3, checked request-bounded page layouts, eager fallible page
+allocation, nonwrapping model/state/transaction identities, and allocation-free
+K/V commit permits. Compatibility calls compute against an unpublished bound
+candidate, so a failed first token leaves the caller's unbound shell unchanged.
+
+Tiny-model construction validates the complete closed 22-tensor role, shape,
+and dtype table before requesting payload bytes. The direct verified-artifact
+path decodes borrowed slices without transient tensor copies; ordered staging,
+f32/BF16 decode buffers, shapes, and expert arrays reserve fallibly. Model
+identity is assigned only after every weight has validated and all owned
+storage exists, so injected failure at any reservation cannot publish or
+consume an identity. The callback-based store boundary remains responsible for
+fallibly producing its owned byte vector before returning it to the runtime.
+
+Tiny adapter v3 retains the generated tiny equations and compact BF16 experts
+but raises the frozen synthetic context cap to 1,024. Its token-major K/V state
+uses 16-token pages charged at full admitted capacity. Stable three-pass
+streaming attention allocates no score vector proportional to context. The
+fixture and boundary tests exercise multi-page mechanics only; this is not a
+large-model performance claim. A fallibly preallocated Rust sampler now
+implements the frozen SplitMix64/top-k/top-p arithmetic and is checked against
+an independently generated Python vector set; preview does not publish RNG
+state. Its public layout reports exact candidate payload and one rounded
+ledger charge without exposing the private candidate representation. The
+public `DecoderAdapter` is a trusted model-extension boundary that splits token
+work into prepare, owned expert tasks, validated contributions, deterministic
+rank-order finish, and a single-use state commit. It exposes fixed vocabulary
+and stop-token policy, and its task iterator contract requires contiguous
+router ranks. Complete model/state/revision/position/transaction identity
+follows every phase; external implementations construct checked, nonzero
+identity tags, but those tags are not capabilities. Conforming adapters keep
+their binding inside model-derived task and contribution payloads opaque, and
+the scheduler still validates the complete envelope at every boundary. A
+higher-ranked synchronous callback prevents a validated commit capability from
+escaping into an outer future; all fallible work precedes its allocation-free,
+return-free apply. The fixed 192-byte tiny-adapter scratch is reused through
+the full 1,024-position context without growth. The synchronous scheduler now
+composes adapter state, policy service credit, RNG, output, phase, and trace
+publication at one non-yielding boundary. It uses bounded FIFO admission, an
+immutable retained-round scheduling policy, expert-sorted waves, per-request
+output backpressure, exact category ownership,
+generation-bound atomic request controls, and prevalidated release permits for
+terminal/reap/shutdown cleanup. Durable request acquisition and release permits
+also publish one owner-attributed ledger-evidence mutation at those lifecycle
+boundaries; provisional rollback restores historical peaks and remains absent
+from the evidence stream. Reusable contribution lanes are prearmed with the
+complete slot-generation, request, scheduler transaction, adapter identity,
+rank, and expert authorization; the same identity is rechecked before expert
+execution and scatter, so a stale completion cannot fill a later wave's lane.
+A live monotonic-clock and control snapshot is taken
+inside the adapter's validated commit callback; suppression drops both
+unapplied permits before terminal cleanup, so that position publishes no state,
+RNG, output, trace, or service-credit debit. A generation-tagged endpoint lock
+is acquired before sampling and remains held across that callback. After the
+adapter returns, the scheduler classifies any post-callback failure and then
+infallibly publishes the optional output and independent terminal result from
+the same guard. Endpoint and control lifecycle guards make admission and reap
+cross-registry transitions rollback-safe. Deterministic gated tests exercise
+late cancellation, inclusive expiry, precedence, credit recovery, stale slot
+reuse, endpoint saturation, disconnect, and lifecycle rollback. An opt-in
+sealed checkpoint plan covers the four transaction boundaries from
+post-router/pre-expert through post-final-snapshot/pre-apply with cancel,
+inclusive-expiry, and ordered combined actions. It is engine- and
+generation-bound, allocates only during bounded preparation, redacts targets,
+and adds no callback or dynamic-dispatch path to ordinary execution. The
+concurrent actor uses a preallocated generation-tagged submission table,
+ready-commit FIFO, direct request controls/endpoints, origin-relative Tokio
+deadlines, and one awaited blocking engine pump at a time. Responded commands
+retain their slots until consumed or abandoned, and cooperative shutdown waits
+for command claims and live endpoint ownership before destructive teardown. The
+resident deterministic-preemption gate yields at the exact configured pump
+budget, resolves controls before resume, preserves ring and ledger ownership,
+and is trace/token neutral across step partitions. Manual-clock tests cover
+queued, ready, expert-owned, ready-to-commit, output-blocked, and preempted
+states. This mechanism does not evict opaque adapter state; authenticated
+state snapshot/restore remains a future ABI boundary. The run-level timing
+observer and accepted evidence remain incomplete until the rest of M5 lands.
+Weights remain eagerly resident in M5, so live cache-leased expert execution
+remains an explicit system gap.
+
+The service trace is a bounded semantic commit log, not a timer. Its public
+direct-engine surface borrows an immutable suffix from an opaque ordinal cursor;
+the caller must retain that cursor with the same engine, or read from origin for
+complete evidence. Reads never allocate, drain, reset, or alter ledger
+ownership. Events contain
+only the opaque request ID, zero-based position, and stable phase bit
+(`0=prefill`, `1=decode`). The final prompt position is prefill even when it
+publishes the first output. Exact capacity remains a complete prefix until one
+more successful commit cannot be retained; that event makes overflow sticky,
+invalidates evidence completeness, and never changes model behavior. Successful
+shutdown destroys both independently bounded trace arrays and releases their
+combined fixed shared charge, so capture must finish before shutdown.
+
+The paired ledger trace is an independently bounded semantic ownership log.
+Sequence zero contains the exact post-construction shared snapshot. Later
+sequences contain every nonzero category delta in one durable request-owned
+acquire or release, canonically ordered by numeric request owner and the closed
+category ID. Atomic batch publication repeats one sequence across all accepted
+owners; active promotion, terminal cleanup, and reap each produce their own
+sequence. Reservation splits, fit checks, provisional attempts, exact
+rollbacks, and per-position occupancy are not ledger mutations. Reads borrow
+an immutable suffix and include both the initial snapshot and independent
+health metadata. If the next complete mutation does not fit, none of its events
+are retained and ledger overflow becomes sticky without changing accounting or
+the service trace. Each configured trace index retains one 64-byte service slot
+and one 64-byte ledger slot under the unchanged combined 128-byte logical
+charge. Capture must replay request ownership to zero before shutdown; shutdown
+then drops both arrays before releasing static shared ownership, whose final
+zero is proven by the ordinary ledger snapshot.
+
+Two versioned policies share that one transaction path and one validated
+resource envelope. `deficit-continuous-expert-coalesce-v1` is the default: a
+round contains every eligible member and may select up to the configured wave
+width. When a round closes, a bounded rollover marker points the next scan at
+the first cyclic survivor from that membership snapshot, if one remains. It is
+re-normalized through terminal and cancellation removals before the next round
+opens, so a mid-round arrival cannot occupy the rollover cursor. The scan then
+follows ordinary cyclic membership order; the marker performs no dynamic
+allocation.
+`fifo-single-request-run-to-completion-v1` is the M5 measurement
+baseline: a round contains only the oldest active FIFO member, so reopening
+rounds repeatedly selects that request until removal, while other accepted
+requests remain promoted and charged. An output-blocked head is intentionally
+not bypassed by this baseline; cancellation and deadline resolution still scan
+and terminalize non-head records without giving them model service. Policy
+selection changes neither validated geometry nor static logical charges.
+
+The synchronous tiny-v3 scalar policy replay checks the exact first-16 traces
+and recomputes lag, runnable gap, and Jain arithmetic without floating point.
+Its separate 1,000-turn continuous-arrival test admits one new churner per
+turn, requires exactly one healthy service event, reconciles the final full
+trace from origin, and proves the anchor completes at turn 352 with no gap over
+15 other commits. Ordered endpoint acknowledgement and cancellation cleanup
+perform no extra model service and return request and shared ownership to zero.
+This is a deterministic correctness gate, not timing evidence.
+
+Direct multi-request ingress is a separate two-phase engine transaction. It
+validates the full nonempty offer slice before resource selection, admits only
+the maximal FIFO prefix, and holds exclusive engine fields plus accepted
+endpoint locks while unpublished. Prompt and output allocations are owned by
+one aggregate provisional request reservation; metadata Vec payloads are
+bounded by the maximum of the payload, control-permit, and endpoint-permit
+phases and checked against the raw admission reserve at typed engine
+construction. This is semantic requested capacity, not allocator overhead or
+RSS. Dropping the guard destroys charged physical payloads before ledger
+rollback. Commit first checks the monotonic release timestamp and every offer's
+deadline, then has no allocation or error path while assigning contiguous IDs,
+publishing generation-bound controls/endpoints and queued records, and stamping
+one `admitted_ns`. A compact first-ID/count/single-error result reconstructs
+accepted and rejected iterators without retaining heap buffers. This API does
+not promote work and is not an actor batch command.
 
 ## Error model
 
-Public operations return stable categories while retaining an internal source
-chain:
+Public operations return stable categories. Internal source chains are retained
+only when they are bounded and content-safe; the scheduler deliberately
+discards raw adapter and sampler sources at its public boundary:
 
 | Category | Examples | Retry |
 | --- | --- | --- |
@@ -232,9 +384,11 @@ host paths. HTTP mapping will be documented with M6.
 
 ## Observability
 
-Trace events use monotonic timestamps, stable request pseudonyms, page/object
-IDs, byte counts, reason, queue/wait/compute durations, cache decision, and
-outcome. Prompt and generated content are absent by default. Metrics use
+Operational data-plane traces use monotonic timestamps, stable request
+pseudonyms, page/object IDs, byte counts, reason, queue/wait/compute durations,
+cache decision, and outcome. The semantic scheduler service log described
+above is explicitly untimed. Prompt and generated content are absent by
+default. Metrics use
 bounded labels; object, expert, and request IDs remain in sampled traces rather
 than Prometheus labels.
 

@@ -90,11 +90,29 @@ close the implementation, correctness, and custody gates.
 
 ## M5 — state and multi-request scheduling
 
+- [x] The transaction boundary, paged-state layout, deterministic DRR policy,
+  sampling stream, memory ledger, KPI hierarchy, fixed workload matrix, and
+  conservative claim rules are preregistered in
+  [ADR-0007](adr/0007-transactional-paged-scheduling.md).
 - [ ] Chunked prefill and bounded paged state preserve single-request parity.
-- [ ] Continuous batching, expert coalescing, deterministic preemption,
-  cancellation, backpressure, and seeded sampling pass stress tests.
+- [x] Continuous batching, expert coalescing, resident deterministic
+  preemption, cancellation, backpressure, and seeded sampling pass stress
+  tests.
+- [x] The sealed harness-owned run observer is allocation-bounded before
+  release, reconciles exact internal timing milestones with service and ledger
+  evidence, and is behavior-neutral under both policies and feature boundaries.
+- [ ] The ordered closed-schema 26-row correctness producer and hostile-input
+  verifier pass before any timing capture begins.
 - [ ] Evidence reports TTFT, prefill/decode throughput, p50/p95, fairness, and
   observed memory ceilings.
+
+M5 timing is evidence, not an acceptance condition. The hard gates are exact
+per-request semantics, the frozen numerical tolerance, transaction rollback,
+complete logical-ledger identities, bounded queues, deterministic sampling and
+trace replay, cancellation/deadline cleanup, and maximum service lag/runnable
+gap. Tiny adapter v3 extends the generated fixture to 1,024 positions solely
+to exercise multi-page state and streaming attention; it is not a large-model
+or natural-language performance claim.
 
 ## M6 — production surface
 
@@ -106,6 +124,9 @@ close the implementation, correctness, and custody gates.
 
 ## M7 — audited release
 
+- [ ] The release path integrates scheduler expert work with authenticated M2
+  cache leases under one fixed budget; eager tiny weights are not presented as
+  end-to-end out-of-core execution.
 - [ ] Original generated-from-source diagrams, identity, docs site, benchmark
   dashboard, runnable demo, report, and interview walkthrough are complete.
 - [ ] Clean-clone verification and all CI checks pass; links and claims are

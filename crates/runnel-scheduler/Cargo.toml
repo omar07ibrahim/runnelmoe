@@ -1,0 +1,32 @@
+[package]
+name = "runnel-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["native-avx2"]
+actor-stress-instrumentation = []
+deterministic-checkpoint-instrumentation = []
+m5-run-observer-instrumentation = []
+native-avx2 = ["runnel-runtime/native-avx2"]
+
+[dependencies]
+runnel-runtime = { path = "../runnel-runtime", default-features = false }
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+runnel-fixture = { path = "../runnel-fixture" }
+runnel-format = { path = "../runnel-format" }
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

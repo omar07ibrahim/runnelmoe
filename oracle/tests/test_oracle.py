@@ -9,7 +9,12 @@ from unittest import mock
 
 import torch
 
-from oracle.generate import _assert_close, build_vectors, greedy_generate
+from oracle.generate import (
+    _assert_close,
+    build_vectors,
+    check_vectors,
+    greedy_generate,
+)
 from oracle.runnel_oracle import (
     TinyMoEOracle,
     TinyTokenizer,
@@ -23,6 +28,7 @@ from oracle.runnel_oracle import (
 ROOT = Path(__file__).resolve().parents[2]
 SPEC_PATH = ROOT / "fixtures" / "tiny" / "spec.json"
 V2_SPEC_PATH = ROOT / "fixtures" / "tiny-v2" / "spec.json"
+V3_SPEC_PATH = ROOT / "fixtures" / "tiny-v3" / "spec.json"
 
 
 class OracleTests(unittest.TestCase):
@@ -34,6 +40,8 @@ class OracleTests(unittest.TestCase):
         cls.model = TinyMoEOracle(cls.spec)
         cls.v2_spec = load_fixture_spec(V2_SPEC_PATH)
         cls.v2_model = TinyMoEOracle(cls.v2_spec)
+        cls.v3_spec = load_fixture_spec(V3_SPEC_PATH)
+        cls.v3_model = TinyMoEOracle(cls.v3_spec)
 
     def test_tokenizer_contract(self) -> None:
         text = "abcdefghijklmnopqrstuvwxyz .,?"
@@ -117,7 +125,9 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(metadata["storage"]["f32_nonexpert_bytes"], 3_296)
         self.assertEqual(metadata["storage"]["round_trip_changed_elements"], 0)
 
-    def test_v2_executes_twelve_storage_conversions_and_v1_executes_none(self) -> None:
+    def test_compact_versions_execute_twelve_conversions_and_v1_executes_none(
+        self,
+    ) -> None:
         target = "oracle.runnel_oracle.model.bf16_storage_round_trip"
         with mock.patch(target, wraps=bf16_storage_round_trip) as conversion:
             TinyMoEOracle(self.spec)
@@ -125,6 +135,29 @@ class OracleTests(unittest.TestCase):
         with mock.patch(target, wraps=bf16_storage_round_trip) as conversion:
             TinyMoEOracle(self.v2_spec)
             self.assertEqual(conversion.call_count, 12)
+        with mock.patch(target, wraps=bf16_storage_round_trip) as conversion:
+            TinyMoEOracle(self.v3_spec)
+            self.assertEqual(conversion.call_count, 12)
+
+    def test_v3_retains_v2_numerics_with_a_larger_context_contract(self) -> None:
+        self.assertEqual(self.v2_model.context_length, 16)
+        self.assertEqual(self.v3_model.context_length, 1_024)
+        self.assertEqual(
+            [tensor.storage_dtype for tensor in self.v3_spec.tensors],
+            [tensor.storage_dtype for tensor in self.v2_spec.tensors],
+        )
+        for role, version_two_weight in self.v2_model.weights.items():
+            self.assertTrue(torch.equal(self.v3_model.weights[role], version_two_weight))
+
+        vectors = build_vectors(V3_SPEC_PATH)
+        metadata = vectors["golden_metadata.json"]
+        self.assertEqual(metadata["adapter"]["version"], 3)
+        self.assertEqual(metadata["artifact"]["object_length"], 5_600)
+        self.assertEqual(
+            vectors["golden_tokens.json"]["fixture"],
+            "runnel-tiny-causal-moe-v3",
+        )
+        check_vectors(V3_SPEC_PATH)
 
     def test_stable_top_k_breaks_ties_by_expert_id(self) -> None:
         scores = torch.tensor([[2.0, 3.0, 3.0, 1.0], [-0.0, 0.0, 0.0, -0.0]])
@@ -143,16 +176,17 @@ class OracleTests(unittest.TestCase):
     def test_generation_is_repeatable(self) -> None:
         self.assertEqual(build_vectors(SPEC_PATH), build_vectors(SPEC_PATH))
         self.assertEqual(build_vectors(V2_SPEC_PATH), build_vectors(V2_SPEC_PATH))
+        self.assertEqual(build_vectors(V3_SPEC_PATH), build_vectors(V3_SPEC_PATH))
         with self.assertRaisesRegex(AssertionError, "non-finite"):
             _assert_close(float("nan"), 0.0, "test", 1e-5, 1e-4)
 
     def test_fixture_loader_accepts_only_frozen_versions_and_dtypes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             invalid_version = json.loads(SPEC_PATH.read_text(encoding="utf-8"))
-            invalid_version["fixture_version"] = 3
+            invalid_version["fixture_version"] = 4
             path = Path(temporary) / "version.json"
             path.write_text(json.dumps(invalid_version), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "must be 1 or 2"):
+            with self.assertRaisesRegex(ValueError, "must be 1, 2, or 3"):
                 load_fixture_spec(path)
 
             invalid_dtype = json.loads(V2_SPEC_PATH.read_text(encoding="utf-8"))
@@ -160,6 +194,13 @@ class OracleTests(unittest.TestCase):
             path = Path(temporary) / "dtype.json"
             path.write_text(json.dumps(invalid_dtype), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "storage dtype"):
+                load_fixture_spec(path)
+
+            invalid_context = json.loads(V3_SPEC_PATH.read_text(encoding="utf-8"))
+            invalid_context["model"]["context_length"] = 16
+            path = Path(temporary) / "context.json"
+            path.write_text(json.dumps(invalid_context), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "model dimensions"):
                 load_fixture_spec(path)
 
     def test_context_admission_matches_runtime(self) -> None:

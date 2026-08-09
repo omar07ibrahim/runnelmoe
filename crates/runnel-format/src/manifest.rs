@@ -358,6 +358,7 @@ fn validate_schema(document: &JsonValue, limits: Limits) -> Result<Manifest, For
     let adapter = parse_adapter(required(root, "adapter", "$")?)?;
     let model = parse_model(required(root, "model", "$")?)?;
     let tokenizer = parse_tokenizer(required(root, "tokenizer", "$")?)?;
+    validate_tiny_adapter_model(&adapter, &model)?;
     if tokenizer.vocab_size != model.vocab_size {
         return schema("$.tokenizer.vocab_size", "must equal $.model.vocab_size");
     }
@@ -388,7 +389,7 @@ fn parse_adapter(value: &JsonValue) -> Result<Adapter, FormatError> {
         required(object, "version", "$.adapter")?,
         "$.adapter.version",
     )?;
-    if !matches!(version, 1 | 2) {
+    if !matches!(version, 1..=3) {
         return schema("$.adapter.version", "unsupported tiny adapter version");
     }
     Ok(Adapter {
@@ -451,6 +452,40 @@ fn parse_model(value: &JsonValue) -> Result<TinyModel, FormatError> {
         return schema("$.model.hidden_size", "must be divisible by num_heads");
     }
     Ok(model)
+}
+
+fn validate_tiny_adapter_model(adapter: &Adapter, model: &TinyModel) -> Result<(), FormatError> {
+    let expected_context = match adapter.version {
+        1 | 2 => 16,
+        3 => 1_024,
+        _ => unreachable!("adapter version was checked before model validation"),
+    };
+    let expected = [
+        (
+            model.context_length,
+            expected_context,
+            "$.model.context_length",
+        ),
+        (model.expert_hidden_size, 12, "$.model.expert_hidden_size"),
+        (model.hidden_size, 8, "$.model.hidden_size"),
+        (model.num_experts, 4, "$.model.num_experts"),
+        (model.num_heads, 2, "$.model.num_heads"),
+        (model.num_layers, 1, "$.model.num_layers"),
+        (model.top_k, 2, "$.model.top_k"),
+        (model.vocab_size, 32, "$.model.vocab_size"),
+    ];
+    for (actual, expected, path) in expected {
+        if actual != expected {
+            return schema(
+                path,
+                &format!(
+                    "adapter version {} requires the frozen value {expected}",
+                    adapter.version
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_objects(value: &JsonValue, limits: Limits) -> Result<Vec<ObjectRecord>, FormatError> {

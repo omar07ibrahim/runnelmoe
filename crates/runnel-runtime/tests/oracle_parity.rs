@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 use runnel_fixture::FixtureArtifact;
 use runnel_format::{Artifact, Limits};
 use runnel_kernels::Capabilities;
-use runnel_runtime::{BackendRequest, TinyModel, TinyTokenizer};
+use runnel_runtime::{BackendRequest, RuntimeError, TinyModel, TinyTokenizer};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -233,4 +233,62 @@ fn avx2_v2_runtime_matches_committed_bf16_pytorch_oracle_when_available() {
         &FixtureArtifact::build_v2(),
         BackendRequest::Avx2,
     );
+}
+
+#[test]
+fn scalar_v3_runtime_matches_committed_pytorch_oracle() {
+    assert_runtime_matches_committed_oracle(
+        "tiny-v3",
+        &FixtureArtifact::build_v3(),
+        BackendRequest::Scalar,
+    );
+}
+
+#[test]
+fn avx2_v3_runtime_matches_committed_pytorch_oracle_when_available() {
+    if !Capabilities::detected().avx2_available() {
+        return;
+    }
+    assert_runtime_matches_committed_oracle(
+        "tiny-v3",
+        &FixtureArtifact::build_v3(),
+        BackendRequest::Avx2,
+    );
+}
+
+#[test]
+fn v3_p1024_crosses_every_page_and_rejects_position_1025_atomically() {
+    let model = fixture_model(&FixtureArtifact::build_v3(), BackendRequest::Scalar);
+    let layout = model.state_layout(1_024, 16).unwrap();
+    assert_eq!(layout.page_count(), 64);
+    let mut state = model.new_sequence_state(layout).unwrap();
+    let identity = state.state_id().unwrap();
+
+    for position in 0..1_024 {
+        let token = if position == 0 {
+            1
+        } else {
+            [14, 16, 6][(position - 1) % 3]
+        };
+        let output = model.forward_token(&mut state, token).unwrap();
+        assert_eq!(output.input_token, token);
+        let one_based = position + 1;
+        if [1, 15, 16, 17, 255, 256, 257, 1_023, 1_024].contains(&one_based) {
+            assert_eq!(state.len(), one_based);
+            assert_eq!(state.revision(), one_based as u64);
+            assert!(state.history().key_at(position).is_some());
+            assert!(state.history().value_at(position).is_some());
+        }
+    }
+
+    let first_key = state.history().key_at(0).unwrap().to_vec();
+    let last_key = state.history().key_at(1_023).unwrap().to_vec();
+    let error = model.forward_token(&mut state, 14).unwrap_err();
+    assert_eq!(error, RuntimeError::ContextLimit { limit: 1_024 });
+    assert_eq!(state.state_id(), Some(identity));
+    assert_eq!(state.revision(), 1_024);
+    assert_eq!(state.len(), 1_024);
+    assert_eq!(state.history().key_at(0).unwrap(), first_key);
+    assert_eq!(state.history().key_at(1_023).unwrap(), last_key);
+    assert!(state.history().key_at(1_024).is_none());
 }

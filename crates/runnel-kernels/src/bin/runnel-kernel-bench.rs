@@ -522,7 +522,9 @@ impl WorkerBuffers {
         let staged_rows = if staged_elements == 0 { 0 } else { spec.rows };
         Ok(Self {
             output: F32Storage::zeros(spec.rows, cell.layout),
-            workspace: GemvWorkspace::new(spec.rows),
+            workspace: GemvWorkspace::try_new(spec.rows).map_err(|error| {
+                BenchError::new(format!("workspace allocation failed: {error}"))
+            })?,
             staged_matrix: vec![0.0; staged_elements],
             staged_temporary: vec![0.0; staged_rows],
         })
@@ -991,8 +993,11 @@ fn correctness_output(
             };
             let prepared = PreparedGemv::new(&generated.matrix, input, request)
                 .map_err(|error| BenchError::new(format!("dispatch failed: {error}")))?;
+            let mut workspace = GemvWorkspace::try_new(generated.spec.rows).map_err(|error| {
+                BenchError::new(format!("workspace allocation failed: {error}"))
+            })?;
             prepared
-                .run(&mut GemvWorkspace::new(generated.spec.rows), &mut output)
+                .run(&mut workspace, &mut output)
                 .map_err(|error| BenchError::new(format!("kernel failed: {error}")))?;
         }
         Implementation::StagedF32 => {
@@ -3092,7 +3097,7 @@ mod tests {
 
         let input = FiniteInput::new(generated.input.as_slice()).unwrap();
         let prepared = PreparedGemv::new(&generated.matrix, input, BackendRequest::Scalar).unwrap();
-        let mut workspace = GemvWorkspace::new(specification.rows);
+        let mut workspace = GemvWorkspace::try_new(specification.rows).unwrap();
         let mut output = vec![0.0; specification.rows];
         let attempt = run_prepared_calls(
             &prepared,
