@@ -757,23 +757,84 @@ MODEL_CONTRACTS = {
 }
 
 
+CURRENT_MODEL_CONTRACT_COHORT = "pytorch-2.13.0+cpu"
+M4_20260803_MODEL_CONTRACT_COHORT = "m4-20260803-pytorch-2.7.1+cpu"
 M4_20260803_GIT_COMMIT = "035d217baf0901809fa02bf0a5c11c1a490198c2"
-M4_20260803_MODEL_CONTRACTS = copy.deepcopy(MODEL_CONTRACTS)
-M4_20260803_MODEL_CONTRACTS["tiny-v1-preservation"]["goldens"][
-    "metadata_sha256"
-] = "9c358629ccb1bdf704abf4625199cbde1afe1bf3108de01aef424e6643e1bec1"
-M4_20260803_MODEL_CONTRACTS["tiny-v2-scalar"]["goldens"][
-    "metadata_sha256"
-] = "43d32b9bcfc00f0f34f04a99d930ca25edb4c1f4372064021439f35cbd211e3c"
-M4_20260803_MODEL_CONTRACTS["tiny-v2-avx2"]["goldens"][
-    "metadata_sha256"
-] = "43d32b9bcfc00f0f34f04a99d930ca25edb4c1f4372064021439f35cbd211e3c"
+M4_20260803_MODEL_CONTRACTS = {
+    "tiny-v1-preservation": {
+        "adapter_version": 1,
+        "representation": "f32",
+        "requested_backend": "f32-preservation",
+        "fixture": {
+            "artifact_id": "sha256:e49321cefc980ab59cd449341edfc624ccfc4b0b703cd175184e056d296d9ed3",
+            "object_digest": "sha256:6b2b8a1bbb2854084b1e1fe1e5787a9cfdb021b397e774fc7dbef79ac9d24bf6",
+            "object_length": 7_904,
+            "page_table_digest": "sha256:29383b56a150f9e5705f3666ca7707f21bc3fbd663ffd7249f4ecb938da6a62d",
+            "page_table_length": 96,
+        },
+        "goldens": {
+            "logits_sha256": "0578cfbe25a8fffbc0bcf46dd02f13de70ad9cfb0611efddd7ab4124eb2e7ab1",
+            "routes_sha256": "e1e2a2b4e209a57932f75898ad2b7e073a5cb9601f4e3375f2a6ad844aae78f1",
+            "tokens_sha256": "81c168e3b067f86861babda66ee92a06e6f3a236d2d992751eb166eb45e9f6bf",
+            "metadata_sha256": "9c358629ccb1bdf704abf4625199cbde1afe1bf3108de01aef424e6643e1bec1",
+        },
+    },
+    "tiny-v2-scalar": {
+        "adapter_version": 2,
+        "representation": "bf16-experts",
+        "requested_backend": "forced-scalar",
+        "fixture": {
+            "artifact_id": "sha256:606baa0c1082b369632b5dd000d30dc51ae20321b2c032ef3395aaa0bfd7c76c",
+            "object_digest": "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab",
+            "object_length": 5_600,
+            "page_table_digest": "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
+            "page_table_length": 96,
+        },
+        "goldens": {
+            "logits_sha256": "e06577a39618b0bdef46bb28c4a73d3f131aa86ea8a53c85727af8ed0cdf89f2",
+            "routes_sha256": "2c048aeb63a8290e370750aabef79bc0b0c6fbc818e7beb1026b4c28ed63a73c",
+            "tokens_sha256": "0a7368aa11bfe986afae53e3b72a644e48d4e7d9c3f8e3cefb247a8b6d4d521e",
+            "metadata_sha256": "43d32b9bcfc00f0f34f04a99d930ca25edb4c1f4372064021439f35cbd211e3c",
+        },
+    },
+    "tiny-v2-avx2": {
+        "adapter_version": 2,
+        "representation": "bf16-experts",
+        "requested_backend": "forced-avx2",
+        "fixture": {
+            "artifact_id": "sha256:606baa0c1082b369632b5dd000d30dc51ae20321b2c032ef3395aaa0bfd7c76c",
+            "object_digest": "sha256:275f985b05a85d4f85d78fc290c10c9d39e9169c46449f4d3a3ed6513a8965ab",
+            "object_length": 5_600,
+            "page_table_digest": "sha256:7d660764b861f97afbc800efb361bdd59ac38fdea5fc424c62f9fb6a30b2896c",
+            "page_table_length": 96,
+        },
+        "goldens": {
+            "logits_sha256": "e06577a39618b0bdef46bb28c4a73d3f131aa86ea8a53c85727af8ed0cdf89f2",
+            "routes_sha256": "2c048aeb63a8290e370750aabef79bc0b0c6fbc818e7beb1026b4c28ed63a73c",
+            "tokens_sha256": "0a7368aa11bfe986afae53e3b72a644e48d4e7d9c3f8e3cefb247a8b6d4d521e",
+            "metadata_sha256": "43d32b9bcfc00f0f34f04a99d930ca25edb4c1f4372064021439f35cbd211e3c",
+        },
+    },
+}
+MODEL_CONTRACTS_BY_COHORT = {
+    CURRENT_MODEL_CONTRACT_COHORT: MODEL_CONTRACTS,
+    M4_20260803_MODEL_CONTRACT_COHORT: M4_20260803_MODEL_CONTRACTS,
+}
 
 
-def _model_contracts_for_commit(commit: str) -> Mapping[str, Mapping[str, Any]]:
+def _model_contract_cohort_for_commit(commit: str) -> str:
     if commit == M4_20260803_GIT_COMMIT:
-        return M4_20260803_MODEL_CONTRACTS
-    return MODEL_CONTRACTS
+        return M4_20260803_MODEL_CONTRACT_COHORT
+    return CURRENT_MODEL_CONTRACT_COHORT
+
+
+def _model_contracts_for_cohort(
+    cohort: str,
+) -> Mapping[str, Mapping[str, Any]]:
+    try:
+        return MODEL_CONTRACTS_BY_COHORT[cohort]
+    except KeyError as error:
+        raise EvidenceError("unknown model contract cohort") from error
 
 
 def expected_correctness_checks() -> list[tuple[str, str, str | None, str]]:
@@ -881,8 +942,9 @@ def _validate_kernel_diagnostics(
 def validate_correctness(
     values: Sequence[Mapping[str, Any]],
     *,
-    model_contracts: Mapping[str, Mapping[str, Any]] = MODEL_CONTRACTS,
+    model_contract_cohort: str = CURRENT_MODEL_CONTRACT_COHORT,
 ) -> list[dict[str, Any]]:
+    model_contracts = _model_contracts_for_cohort(model_contract_cohort)
     expected = expected_correctness_checks()
     if len(values) != len(expected):
         raise EvidenceError(
@@ -1648,10 +1710,14 @@ def build_summary(
     cases_digest: str,
     correctness_digest: str,
     observations_digest: str,
+    model_contract_cohort: str = CURRENT_MODEL_CONTRACT_COHORT,
     bootstrap_resamples: int = BOOTSTRAP_RESAMPLES,
 ) -> dict[str, Any]:
     rows = validate_dataset(observations)
-    correctness_rows = validate_correctness(correctness)
+    correctness_rows = validate_correctness(
+        correctness,
+        model_contract_cohort=model_contract_cohort,
+    )
     all_correct = correctness_passed(correctness_rows)
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -3299,9 +3365,10 @@ def verify_directory(path: Path, deadline: float | None = None) -> dict[str, Any
     if files["cases.jsonl"] != _jsonl_bytes(cases):
         raise EvidenceError("cases.jsonl is not canonical JSONL")
     correctness_values = parse_jsonl_bytes(files["correctness.jsonl"], "correctness.jsonl")
+    model_contract_cohort = _model_contract_cohort_for_commit(experiment["git_commit"])
     correctness = validate_correctness(
         correctness_values,
-        model_contracts=_model_contracts_for_commit(experiment["git_commit"]),
+        model_contract_cohort=model_contract_cohort,
     )
     if files["correctness.jsonl"] != _jsonl_bytes(correctness):
         raise EvidenceError("correctness.jsonl is not canonical JSONL")
@@ -3323,6 +3390,7 @@ def verify_directory(path: Path, deadline: float | None = None) -> dict[str, Any
         cases_digest=_artifact_digest(files["cases.jsonl"]),
         correctness_digest=_artifact_digest(files["correctness.jsonl"]),
         observations_digest=_artifact_digest(files["observations.jsonl"]),
+        model_contract_cohort=model_contract_cohort,
     )
     if files["summary.json"] != _json_file_bytes(expected_summary):
         raise EvidenceError("summary.json differs from raw-ledger regeneration")

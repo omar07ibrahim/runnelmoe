@@ -353,23 +353,33 @@ class JsonContractTests(unittest.TestCase):
 
     def test_historical_oracle_hash_cohort_is_exact_and_not_mixable(self) -> None:
         legacy = correctness_rows()
+        contracts = evidence._model_contracts_for_cohort(
+            evidence.M4_20260803_MODEL_CONTRACT_COHORT
+        )
         for row in legacy[-3:]:
             check_id = row["check_id"]
-            row["metrics"]["goldens"] = copy.deepcopy(
-                evidence.M4_20260803_MODEL_CONTRACTS[check_id]["goldens"]
-            )
+            row["metrics"]["goldens"] = copy.deepcopy(contracts[check_id]["goldens"])
         evidence.validate_correctness(
             legacy,
-            model_contracts=evidence.M4_20260803_MODEL_CONTRACTS,
+            model_contract_cohort=evidence.M4_20260803_MODEL_CONTRACT_COHORT,
         )
-        self.assertIs(
-            evidence._model_contracts_for_commit(evidence.M4_20260803_GIT_COMMIT),
-            evidence.M4_20260803_MODEL_CONTRACTS,
+        self.assertEqual(
+            evidence._model_contract_cohort_for_commit(
+                evidence.M4_20260803_GIT_COMMIT
+            ),
+            evidence.M4_20260803_MODEL_CONTRACT_COHORT,
         )
-        self.assertIs(
-            evidence._model_contracts_for_commit("a" * 40),
-            evidence.MODEL_CONTRACTS,
+        self.assertEqual(
+            evidence._model_contract_cohort_for_commit("a" * 40),
+            evidence.CURRENT_MODEL_CONTRACT_COHORT,
         )
+        with self.assertRaisesRegex(
+            evidence.EvidenceError, "unknown model contract cohort"
+        ):
+            evidence.validate_correctness(
+                correctness_rows(),
+                model_contract_cohort="untrusted-mixed-cohort",
+            )
 
         mixed = copy.deepcopy(legacy)
         check_id = mixed[-1]["check_id"]
@@ -379,7 +389,7 @@ class JsonContractTests(unittest.TestCase):
         with self.assertRaisesRegex(evidence.EvidenceError, "wrong oracle evidence"):
             evidence.validate_correctness(
                 mixed,
-                model_contracts=evidence.M4_20260803_MODEL_CONTRACTS,
+                model_contract_cohort=evidence.M4_20260803_MODEL_CONTRACT_COHORT,
             )
 
     def test_typed_avx2_unsupported_row_is_retained_without_false_proofs(self) -> None:
@@ -812,9 +822,24 @@ class CaptureContractTests(unittest.TestCase):
 
 
 class CustodyAndRegenerationTests(unittest.TestCase):
-    def build_artifacts(self) -> dict[str, bytes]:
+    def build_artifacts(
+        self,
+        *,
+        commit: str = "a" * 40,
+        model_contract_cohort: str = evidence.CURRENT_MODEL_CONTRACT_COHORT,
+    ) -> dict[str, bytes]:
         cases = evidence.validate_cases(case_rows())
-        correctness = evidence.validate_correctness(correctness_rows())
+        correctness_input = correctness_rows()
+        model_contracts = evidence._model_contracts_for_cohort(model_contract_cohort)
+        for row in correctness_input[-3:]:
+            check_id = row["check_id"]
+            row["metrics"]["goldens"] = copy.deepcopy(
+                model_contracts[check_id]["goldens"]
+            )
+        correctness = evidence.validate_correctness(
+            correctness_input,
+            model_contract_cohort=model_contract_cohort,
+        )
         observations = evidence.validate_dataset(observation_rows())
         cases_bytes = evidence._jsonl_bytes(cases)
         correctness_bytes = evidence._jsonl_bytes(correctness)
@@ -825,6 +850,7 @@ class CustodyAndRegenerationTests(unittest.TestCase):
             cases_digest=evidence._artifact_digest(cases_bytes),
             correctness_digest=evidence._artifact_digest(correctness_bytes),
             observations_digest=evidence._artifact_digest(observations_bytes),
+            model_contract_cohort=model_contract_cohort,
         )
         snapshot = {name: 0 for name in evidence.RESOURCE_KEYS}
         topology = [
@@ -874,7 +900,7 @@ class CustodyAndRegenerationTests(unittest.TestCase):
         }
         experiment = evidence.build_experiment(
             captured_at="2026-08-03T12:34:56Z",
-            commit="a" * 40,
+            commit=commit,
             kernel_binary_sha256="d" * 64,
             model_binary_sha256="e" * 64,
             artifacts={name: evidence._artifact_digest(data) for name, data in artifacts.items()},
@@ -898,6 +924,18 @@ class CustodyAndRegenerationTests(unittest.TestCase):
                 result = evidence.verify_directory(root)
             self.assertEqual(result["observation_rows"], 780)
             self.assertEqual(result["complete_cells"], 13)
+
+    def test_historical_oracle_cohort_byte_regenerates(self) -> None:
+        artifacts = self.build_artifacts(
+            commit=evidence.M4_20260803_GIT_COMMIT,
+            model_contract_cohort=evidence.M4_20260803_MODEL_CONTRACT_COHORT,
+        )
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            root = Path(directory)
+            self.write_tree(root, artifacts)
+            with mock.patch.object(evidence, "_verify_commit_harness_sha256"):
+                result = evidence.verify_directory(root)
+        self.assertEqual(result["git_commit"], evidence.M4_20260803_GIT_COMMIT)
 
     def test_tampered_summary_and_unknown_file_are_rejected(self) -> None:
         artifacts = self.build_artifacts()
