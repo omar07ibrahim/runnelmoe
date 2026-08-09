@@ -351,6 +351,37 @@ class JsonContractTests(unittest.TestCase):
         with self.assertRaisesRegex(evidence.EvidenceError, "wrong oracle evidence"):
             evidence.validate_correctness(rows)
 
+    def test_historical_oracle_hash_cohort_is_exact_and_not_mixable(self) -> None:
+        legacy = correctness_rows()
+        for row in legacy[-3:]:
+            check_id = row["check_id"]
+            row["metrics"]["goldens"] = copy.deepcopy(
+                evidence.M4_20260803_MODEL_CONTRACTS[check_id]["goldens"]
+            )
+        evidence.validate_correctness(
+            legacy,
+            model_contracts=evidence.M4_20260803_MODEL_CONTRACTS,
+        )
+        self.assertIs(
+            evidence._model_contracts_for_commit(evidence.M4_20260803_GIT_COMMIT),
+            evidence.M4_20260803_MODEL_CONTRACTS,
+        )
+        self.assertIs(
+            evidence._model_contracts_for_commit("a" * 40),
+            evidence.MODEL_CONTRACTS,
+        )
+
+        mixed = copy.deepcopy(legacy)
+        check_id = mixed[-1]["check_id"]
+        mixed[-1]["metrics"]["goldens"] = copy.deepcopy(
+            evidence.MODEL_CONTRACTS[check_id]["goldens"]
+        )
+        with self.assertRaisesRegex(evidence.EvidenceError, "wrong oracle evidence"):
+            evidence.validate_correctness(
+                mixed,
+                model_contracts=evidence.M4_20260803_MODEL_CONTRACTS,
+            )
+
     def test_typed_avx2_unsupported_row_is_retained_without_false_proofs(self) -> None:
         rows = correctness_rows()
         row = rows[-1]

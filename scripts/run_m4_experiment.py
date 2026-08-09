@@ -715,7 +715,7 @@ MODEL_CONTRACTS = {
             "logits_sha256": "0578cfbe25a8fffbc0bcf46dd02f13de70ad9cfb0611efddd7ab4124eb2e7ab1",
             "routes_sha256": "e1e2a2b4e209a57932f75898ad2b7e073a5cb9601f4e3375f2a6ad844aae78f1",
             "tokens_sha256": "81c168e3b067f86861babda66ee92a06e6f3a236d2d992751eb166eb45e9f6bf",
-            "metadata_sha256": "9c358629ccb1bdf704abf4625199cbde1afe1bf3108de01aef424e6643e1bec1",
+            "metadata_sha256": "d3758aebb051dbe3b415b0a6bb8e14482b412046dbbe9e6b949abfada6c07aa4",
         },
     },
     "tiny-v2-scalar": {
@@ -733,7 +733,7 @@ MODEL_CONTRACTS = {
             "logits_sha256": "e06577a39618b0bdef46bb28c4a73d3f131aa86ea8a53c85727af8ed0cdf89f2",
             "routes_sha256": "2c048aeb63a8290e370750aabef79bc0b0c6fbc818e7beb1026b4c28ed63a73c",
             "tokens_sha256": "0a7368aa11bfe986afae53e3b72a644e48d4e7d9c3f8e3cefb247a8b6d4d521e",
-            "metadata_sha256": "43d32b9bcfc00f0f34f04a99d930ca25edb4c1f4372064021439f35cbd211e3c",
+            "metadata_sha256": "9997277ef66168f132621559a8cb17e55581715707a87e92906e5425b85bb4a3",
         },
     },
     "tiny-v2-avx2": {
@@ -751,10 +751,29 @@ MODEL_CONTRACTS = {
             "logits_sha256": "e06577a39618b0bdef46bb28c4a73d3f131aa86ea8a53c85727af8ed0cdf89f2",
             "routes_sha256": "2c048aeb63a8290e370750aabef79bc0b0c6fbc818e7beb1026b4c28ed63a73c",
             "tokens_sha256": "0a7368aa11bfe986afae53e3b72a644e48d4e7d9c3f8e3cefb247a8b6d4d521e",
-            "metadata_sha256": "43d32b9bcfc00f0f34f04a99d930ca25edb4c1f4372064021439f35cbd211e3c",
+            "metadata_sha256": "9997277ef66168f132621559a8cb17e55581715707a87e92906e5425b85bb4a3",
         },
     },
 }
+
+
+M4_20260803_GIT_COMMIT = "035d217baf0901809fa02bf0a5c11c1a490198c2"
+M4_20260803_MODEL_CONTRACTS = copy.deepcopy(MODEL_CONTRACTS)
+M4_20260803_MODEL_CONTRACTS["tiny-v1-preservation"]["goldens"][
+    "metadata_sha256"
+] = "9c358629ccb1bdf704abf4625199cbde1afe1bf3108de01aef424e6643e1bec1"
+M4_20260803_MODEL_CONTRACTS["tiny-v2-scalar"]["goldens"][
+    "metadata_sha256"
+] = "43d32b9bcfc00f0f34f04a99d930ca25edb4c1f4372064021439f35cbd211e3c"
+M4_20260803_MODEL_CONTRACTS["tiny-v2-avx2"]["goldens"][
+    "metadata_sha256"
+] = "43d32b9bcfc00f0f34f04a99d930ca25edb4c1f4372064021439f35cbd211e3c"
+
+
+def _model_contracts_for_commit(commit: str) -> Mapping[str, Mapping[str, Any]]:
+    if commit == M4_20260803_GIT_COMMIT:
+        return M4_20260803_MODEL_CONTRACTS
+    return MODEL_CONTRACTS
 
 
 def expected_correctness_checks() -> list[tuple[str, str, str | None, str]]:
@@ -859,7 +878,11 @@ def _validate_kernel_diagnostics(
     return max_ratio
 
 
-def validate_correctness(values: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def validate_correctness(
+    values: Sequence[Mapping[str, Any]],
+    *,
+    model_contracts: Mapping[str, Mapping[str, Any]] = MODEL_CONTRACTS,
+) -> list[dict[str, Any]]:
     expected = expected_correctness_checks()
     if len(values) != len(expected):
         raise EvidenceError(
@@ -959,7 +982,7 @@ def validate_correctness(values: Sequence[Mapping[str, Any]]) -> list[dict[str, 
                 )
         else:
             _exact_keys(metrics, MODEL_METRIC_KEYS, f"{context}.metrics")
-            contract = MODEL_CONTRACTS[check_id]
+            contract = model_contracts[check_id]
             adapter_version = _positive_uint(
                 metrics["adapter_version"], f"{context}.metrics.adapter_version", 2
             )
@@ -3276,7 +3299,10 @@ def verify_directory(path: Path, deadline: float | None = None) -> dict[str, Any
     if files["cases.jsonl"] != _jsonl_bytes(cases):
         raise EvidenceError("cases.jsonl is not canonical JSONL")
     correctness_values = parse_jsonl_bytes(files["correctness.jsonl"], "correctness.jsonl")
-    correctness = validate_correctness(correctness_values)
+    correctness = validate_correctness(
+        correctness_values,
+        model_contracts=_model_contracts_for_commit(experiment["git_commit"]),
+    )
     if files["correctness.jsonl"] != _jsonl_bytes(correctness):
         raise EvidenceError("correctness.jsonl is not canonical JSONL")
     observation_values = parse_jsonl_bytes(files["observations.jsonl"], "observations.jsonl")
